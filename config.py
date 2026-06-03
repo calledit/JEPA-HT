@@ -4,20 +4,20 @@ import torch
 
 @dataclass
 class Config:
-    # Architecture — fixed to match GPT-2 Small embedding space
-    d_model: int = 768
-    vocab_size: int = 50257
-    window_size: int = 4
-    stride: int = 3
+    # Architecture
+    d_model: int = 512
+    vocab_size: int = 256           # byte vocabulary
+    window_size: int = 4            # window size for levels 1+
+    stride: int = 3                 # stride for levels 1+
     n_levels: int = 4
 
-    # Masking
-    # In the first layer we give the model 4 tokens so at a mask ratio of 25% an entire token of info can be lost.
-    # In text a Full token of loss may change the meaning of the text to the oposite. So we must pick a mask ratio below 25%
-    # to garantee that the full meaning can be restored
+    # Level-0 byte encoder (ByteHourglassEncoder)
+    level0_window_size: int = 4096  # bytes per level-0 window (= sequence length for level-0 training)
+    level0_batch_size: int = 512     # batch size for level-0 training phases
+    level0_mask_ratio: float = 0.65 # fraction of byte tokens masked at level 0
 
-    #Throw away 300% of the meaning of a full token
-    mask_ratio: float = (1/window_size) * 3.0
+    # Masking for levels 1+ (dimension-level masking)
+    mask_ratio: float = (1/4) * 3.0
 
     # Adaptive EMA: decay scales with smoothed pred_loss.
     # pred_loss=0 → ema_decay_start; pred_loss≥ema_pred_loss_target → 1.0 (frozen target)
@@ -29,10 +29,9 @@ class Config:
     # VICReg weights — warmup values used before the switch steps, then full values after
     lambda_v_warmup: float = 25.0
     lambda_v: float = 15.0
-    lambda_v_warmup_steps: int = 10_000 #185_000 #You techincally dont need variation loss after a while UNLESS somthing perturbs the training. Might as well just keep it on incase something happens
+    lambda_v_warmup_steps: int = 10_000
 
-    #A latent space with uncorrealted dimensions is nice to have but not a nesesity
-    lambda_c_warmup: float = (d_model/2048)
+    lambda_c_warmup: float = 0.25   # 512/2048
     lambda_c: float = 0.0
     lambda_c_warmup_steps: int = 15_000
 
@@ -43,14 +42,15 @@ class Config:
     # Decoder loss weights
     decoder_recon_weight: float = 1.0
     decoder_semantic_weight: float = 0.01
-    decoder_ce_weight: float = 1.0   # cross-entropy weight for level-0 decoder token recovery
-    decoder_ce_tokens: int = 50000     # max tokens sampled per step for CE loss (cost control)
+    decoder_ce_weight: float = 1.0   # cross-entropy weight for level-0 decoder byte recovery
+    decoder_ce_tokens: int = 16384   # max byte positions sampled per step for CE loss (cost control)
     decoder_ce_start_step: int = 5_000  # step at which CE loss activates for level-0 decoder
     lambda_overlap: float = 0.0
 
-    # Sequence — 1024 tokens gives 341→113→37→12 windows at levels 1–4
-    sequence_length: int = 1024
-    batch_size: int = 8
+    # Sequence length for level-1+ training (must be a multiple of level0_window_size)
+    # 32768 bytes = 8 level-0 chunks → 2 windows at level 1 (window_size=4, stride=3)
+    sequence_length: int = 32768
+    batch_size: int = 4
 
     # Optimizer
     lr: float = 3e-4

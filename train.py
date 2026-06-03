@@ -12,26 +12,7 @@ from torch.utils.data import DataLoader
 
 from config import Config
 from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP, ContextEncoder, vicreg_components
-from data import build_dataset
-
-
-# ── GPT-2 embeddings ─────────────────────────────────────────────────────────
-
-def load_gpt2_embeddings(device: torch.device) -> torch.Tensor:
-    from transformers import GPT2Model
-    print("Loading GPT-2 token embeddings...")
-    gpt2 = GPT2Model.from_pretrained("gpt2")
-    wte = gpt2.wte.weight.detach().clone().to(device)
-    del gpt2
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    print(f"  wte: {wte.shape}  (frozen)")
-    return wte  # [50257, 768]
-
-
-def get_token_embeddings(token_ids: torch.Tensor, wte: torch.Tensor) -> torch.Tensor:
-    # token_ids: [B, T] → [B, T, 768]
-    return F.embedding(token_ids, wte)
+from data import build_dataset, _FINEWEB_VAL_DOCS
 
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
@@ -72,12 +53,19 @@ def save_checkpoint(hierarchy, optimizer, step, phase_idx, docs_consumed, cfg):
 def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHierarchy:
     cfg = ckpt["cfg"]
     hierarchy = JEPAHierarchy(cfg).to(device)
-    for _ in range(ckpt["n_encoder_levels"]):
-        hierarchy.levels.append(JEPALevel(cfg.d_model, cfg.window_size).to(device))
     token_decoder_levels = ckpt.get("token_decoder_levels", [])
+    for i in range(ckpt["n_encoder_levels"]):
+        if i == 0:
+            lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size)
+        else:
+            mask_dim = cfg.window_size * cfg.d_model
+            lvl = JEPALevel(cfg.d_model, cfg.window_size, mask_dim)
+        hierarchy.levels.append(lvl.to(device))
     for key in ckpt["decoder_keys"]:
         if int(key) in token_decoder_levels:
-            hierarchy.decoders[key] = TokenDecoderMLP(cfg.d_model, cfg.window_size, cfg.vocab_size).to(device)
+            hierarchy.decoders[key] = TokenDecoderMLP(
+                cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
+            ).to(device)
         else:
             hierarchy.decoders[key] = DecoderMLP(cfg.d_model, cfg.window_size).to(device)
     hierarchy.load_state_dict(ckpt["hierarchy_state"])
@@ -87,14 +75,9 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def eval_encoder(level_idx, hierarchy, wte, val_data, cfg, probe=None):
-    """Returns (pred, var, cov, drift, new_probe).
-
-    probe: (token_ids [B,T], embs [B*N_w, D]) saved from the previous eval, or None.
-    drift: MSE between probe embeddings then vs now (unmasked), nan if no probe yet.
-    new_probe: tuple to pass as probe on the next call.
-    """
-    device = wte.device
+def eval_encoder(level_idx, hierarchy, val_data, cfg, probe=None):
+    """Returns (pred, var, cov, drift, new_probe)."""
+    device = val_data.device
     T = cfg.sequence_length
     n_chunks = len(val_data) // T
     if n_chunks < cfg.eval_batch_size:
@@ -109,51 +92,72 @@ def eval_encoder(level_idx, hierarchy, wte, val_data, cfg, probe=None):
         idxs = torch.randint(n_chunks, (cfg.eval_batch_size,))
         batch = torch.stack([val_data[j * T : j * T + T] for j in idxs]).to(device)
 
-        token_embs = get_token_embeddings(batch, wte)
-        prev_embs = hierarchy.encode_to_level(token_embs, level_idx)
-        windows = hierarchy.extract_windows(prev_embs)
-        B, N_w, _ws, _D = windows.shape
-        flat_full = windows.reshape(B * N_w, ws * D)
+        if level_idx == 0:
+            ws0 = cfg.level0_window_size
+            B, L = batch.shape
+            N = L // ws0
+            flat_ids = batch[:, :N * ws0].reshape(B * N, ws0)
+            BN = flat_ids.shape[0]
+            target_out = jepa_level.target_enc(flat_ids)
+            token_mask = hierarchy.apply_token_mask(BN, device)
+            context_emb = jepa_level.context_enc(flat_ids, token_mask=token_mask)
+            pred_out = jepa_level.predictor(context_emb, token_mask)
+        else:
+            prev_embs = hierarchy.encode_to_level(batch, level_idx)
+            windows = hierarchy.extract_windows(prev_embs)
+            B, N_w, _ws, _D = windows.shape
+            flat_full = windows.reshape(B * N_w, ws * D)
 
-        target_out = jepa_level.target_enc(flat_full)
-        masked, mask = hierarchy.apply_dim_mask(windows)
-        flat_masked = masked.reshape(B * N_w, ws * D)
-        flat_mask = mask.reshape(B * N_w, ws * D)
-        context_emb = jepa_level.context_enc(flat_masked)
-        context_out = jepa_level.predictor(context_emb, flat_mask)
+            target_out = jepa_level.target_enc(flat_full)
+            masked, mask = hierarchy.apply_dim_mask(windows)
+            flat_masked = masked.reshape(B * N_w, ws * D)
+            flat_mask = mask.reshape(B * N_w, ws * D)
+            context_emb = jepa_level.context_enc(flat_masked)
+            pred_out = jepa_level.predictor(context_emb, flat_mask)
 
-        total_pred += F.mse_loss(context_out, target_out).item()
+        total_pred += F.mse_loss(context_emb if level_idx == 0 else context_emb,
+                                 target_out).item()
+        total_pred += F.mse_loss(pred_out, target_out).item()
         vl, cl = vicreg_components(context_emb, cfg.lambda_c)
         total_var += vl.item()
         total_cov += cl.item()
 
-    # ── Representation drift ──────────────────────────────────────────────────
-    # Use a fixed probe batch with NO masking so drift reflects only model change.
+    # Representation drift
     drift = float("nan")
     idxs = torch.randint(n_chunks, (cfg.eval_batch_size,))
     probe_batch = torch.stack([val_data[j * T : j * T + T] for j in idxs]).to(device)
-    probe_token_embs = get_token_embeddings(probe_batch, wte)
-    probe_prev = hierarchy.encode_to_level(probe_token_embs, level_idx)
-    probe_windows = hierarchy.extract_windows(probe_prev)
-    B, N_w, _ws, _D = probe_windows.shape
-    probe_embs_now = jepa_level.context_enc(probe_windows.reshape(B * N_w, ws * D))
+
+    if level_idx == 0:
+        ws0 = cfg.level0_window_size
+        Bp, Lp = probe_batch.shape
+        Np = Lp // ws0
+        flat_probe = probe_batch[:, :Np * ws0].reshape(Bp * Np, ws0)
+        probe_embs_now = jepa_level.context_enc(flat_probe)
+    else:
+        probe_prev = hierarchy.encode_to_level(probe_batch, level_idx)
+        probe_windows = hierarchy.extract_windows(probe_prev)
+        B, N_w, _ws, _D = probe_windows.shape
+        probe_embs_now = jepa_level.context_enc(probe_windows.reshape(B * N_w, ws * D))
 
     if probe is not None:
         probe_ids_saved, probe_embs_saved = probe
-        token_embs_saved = get_token_embeddings(probe_ids_saved, wte)
-        prev_saved = hierarchy.encode_to_level(token_embs_saved, level_idx)
-        windows_saved = hierarchy.extract_windows(prev_saved)
-        B2, N_w2, _ws, _D = windows_saved.shape
-        embs_now_for_saved = jepa_level.context_enc(windows_saved.reshape(B2 * N_w2, ws * D))
+        if level_idx == 0:
+            # probe_ids_saved is already flat [B*N, level0_window_size]
+            embs_now_for_saved = jepa_level.context_enc(probe_ids_saved)
+        else:
+            prev_saved = hierarchy.encode_to_level(probe_ids_saved, level_idx)
+            windows_saved = hierarchy.extract_windows(prev_saved)
+            B2, N_w2, _ws, _D = windows_saved.shape
+            embs_now_for_saved = jepa_level.context_enc(windows_saved.reshape(B2 * N_w2, ws * D))
         drift = (1 - F.cosine_similarity(embs_now_for_saved, probe_embs_saved, dim=-1)).mean().item()
 
-    new_probe = (probe_batch, probe_embs_now)
-    return total_pred / n_eval, total_var / n_eval, total_cov / n_eval, drift, new_probe
+    new_probe = (flat_probe if level_idx == 0 else probe_batch, probe_embs_now)
+    return total_pred / (2 * n_eval), total_var / n_eval, total_cov / n_eval, drift, new_probe
 
 
 @torch.no_grad()
-def eval_decoder(level_idx, hierarchy, wte, val_data, cfg) -> tuple[float, float, float]:
-    device = wte.device
+def eval_decoder(level_idx, hierarchy, val_data, cfg) -> tuple[float, float, float]:
+    device = val_data.device
     T = cfg.sequence_length
     n_chunks = len(val_data) // T
     if n_chunks < cfg.eval_batch_size:
@@ -168,20 +172,20 @@ def eval_decoder(level_idx, hierarchy, wte, val_data, cfg) -> tuple[float, float
         idxs = torch.randint(n_chunks, (cfg.eval_batch_size,))
         batch = torch.stack([val_data[j * T : j * T + T] for j in idxs]).to(device)
 
-        token_embs = get_token_embeddings(batch, wte)
-        embs_N = hierarchy.encode_to_level(token_embs, level_idx + 1)
-
+        embs_N = hierarchy.encode_to_level(batch, level_idx + 1)
         B, L_N, _ = embs_N.shape
 
         if level_idx == 0:
-            logits = decoder(embs_N.reshape(B * L_N, D))  # [B*L_N, ws, vocab]
-            token_targets = torch.stack([
-                batch[:, i * cfg.stride : i * cfg.stride + ws]
-                for i in range(L_N)
-            ], dim=1).reshape(B * L_N * ws)
-            total_recon += F.cross_entropy(logits.reshape(B * L_N * ws, cfg.vocab_size), token_targets).item()
+            logits = decoder(embs_N.reshape(B * L_N, D))  # [B*L_N, ws0, vocab]
+            # targets: byte IDs for each level-0 window
+            byte_windows = hierarchy.extract_byte_windows(batch)  # [B, N_w0, ws0]
+            token_targets = byte_windows.reshape(B * L_N * cfg.level0_window_size)
+            total_recon += F.cross_entropy(
+                logits.reshape(B * L_N * cfg.level0_window_size, cfg.vocab_size),
+                token_targets
+            ).item()
         else:
-            embs_N1 = hierarchy.encode_to_level(token_embs, level_idx)
+            embs_N1 = hierarchy.encode_to_level(batch, level_idx)
             decoded = decoder(embs_N.reshape(B * L_N, D)).reshape(B, L_N, ws, D)
             target_windows = torch.stack([
                 embs_N1[:, i * cfg.stride : i * cfg.stride + ws, :]
@@ -212,11 +216,12 @@ def get_lr(step: int, cfg) -> float:
 # ── Training phases ───────────────────────────────────────────────────────────
 
 def train_encoder_level(
-    level_idx, hierarchy, wte, loader, val_data, cfg,
+    level_idx, hierarchy, loader, val_data, cfg,
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
 ):
-    device = wte.device
+    device = val_data.device
     ws, D = cfg.window_size, cfg.d_model
+    is_level0 = (level_idx == 0)
 
     jepa_level = hierarchy.levels[level_idx]
     optimizer = torch.optim.AdamW(
@@ -229,10 +234,17 @@ def train_encoder_level(
     pred_sum = var_sum = cov_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
-    pred_loss_ema = cfg.ema_pred_loss_target  # start at target so decay begins at 1.0 and opens up
-    repr_probe = None  # (token_ids, embs) saved from last eval for drift tracking
-    var_loss_active = True  # start enabled; hysteresis will disable once variance is healthy
+    pred_loss_ema = cfg.ema_pred_loss_target
+    repr_probe = None
+    var_loss_active = True
     t0 = t_last_log = time.time()
+    # Per-stage timing accumulators (seconds)
+    t_data_sum = t_target_sum = t_context_sum = t_backward_sum = 0.0
+
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        return time.time()
 
     print(f"\n=== Encoder level {level_idx + 1} / {cfg.n_levels} (phase {phase_idx}) ===")
     if step > 0:
@@ -243,21 +255,47 @@ def train_encoder_level(
             if step >= cfg.encoder_iters_per_level:
                 break
 
-            batch = batch.to(device)  # [B, T]
+            t0_data = _sync()
+            batch = batch.to(device)  # [B, T] byte IDs
+            t0_target = _sync()
+            t_data_sum += t0_target - t0_data
 
-            with torch.no_grad():
-                token_embs = get_token_embeddings(batch, wte)
-                prev_embs = hierarchy.encode_to_level(token_embs, level_idx)
-                windows = hierarchy.extract_windows(prev_embs)   # [B, N_w, ws, D]
-                B, N_w, _ws, _D = windows.shape
-                flat_full = windows.reshape(B * N_w, ws * D)
-                target_out = jepa_level.forward_target(flat_full) # [B*N_w, D]
+            autocast = torch.autocast(device_type=device.type, dtype=torch.bfloat16)
 
-            masked, mask = hierarchy.apply_dim_mask(windows)
-            flat_mask = mask.reshape(B * N_w, ws * D)
-            flat_masked = masked.reshape(B * N_w, ws * D)
-            context_emb = jepa_level.context_enc(flat_masked)         # encoder output — VICReg here
-            pred_out = jepa_level.predictor(context_emb, flat_mask)   # predictor output — JEPA loss here
+            if is_level0:
+                # batch is [B, level0_window_size] — each sample is one sequence, no windowing
+                B = batch.shape[0]
+
+                with torch.no_grad(), autocast:
+                    target_out = jepa_level.forward_target(batch)  # [B, D]
+
+                t0_context = _sync()
+                t_target_sum += t0_context - t0_target
+
+                token_mask = hierarchy.apply_token_mask(B, device)
+                with autocast:
+                    context_emb = jepa_level.context_enc(batch, token_mask=token_mask)
+                    pred_out = jepa_level.predictor(context_emb, token_mask)
+            else:
+                with torch.no_grad(), autocast:
+                    prev_embs = hierarchy.encode_to_level(batch, level_idx)
+                    windows = hierarchy.extract_windows(prev_embs)   # [B, N_w, ws, D]
+                    B, N_w, _ws, _D = windows.shape
+                    flat_full = windows.reshape(B * N_w, ws * D)
+                    target_out = jepa_level.forward_target(flat_full)
+
+                t0_context = _sync()
+                t_target_sum += t0_context - t0_target
+
+                masked, mask = hierarchy.apply_dim_mask(windows)
+                flat_mask = mask.reshape(B * N_w, ws * D)
+                flat_masked = masked.reshape(B * N_w, ws * D)
+                with autocast:
+                    context_emb = jepa_level.context_enc(flat_masked)
+                    pred_out = jepa_level.predictor(context_emb, flat_mask)
+
+            t0_backward = _sync()
+            t_context_sum += t0_backward - t0_context
 
             lv_base = cfg.lambda_v if step >= cfg.lambda_v_warmup_steps else cfg.lambda_v_warmup
             lc = cfg.lambda_c if step >= cfg.lambda_c_warmup_steps else cfg.lambda_c_warmup
@@ -289,6 +327,10 @@ def train_encoder_level(
                 ema_decay = cfg.ema_decay_start + (1.0 - cfg.ema_decay_start) * min(pred_loss_ema / cfg.ema_pred_loss_target, 1.0)
             jepa_level.update_ema(ema_decay)
 
+            t_end = _sync()
+            t_backward_sum += t_end - t0_backward
+            step_ms = (t_end - t0_data) * 1000
+
             step += 1
             tokens_since_log += B * cfg.sequence_length
             pred_sum += pred_loss.item()
@@ -296,15 +338,33 @@ def train_encoder_level(
             cov_sum += cov_loss.item()
             loss_count += 1
 
+            print(
+                f"  step {step:6d} | {step_ms:6.0f}ms | "
+                f"data {(t0_target-t0_data)*1000:.0f}ms "
+                f"target {(t0_context-t0_target)*1000:.0f}ms "
+                f"ctx {(t0_backward-t0_context)*1000:.0f}ms "
+                f"bwd {(t_end-t0_backward)*1000:.0f}ms | "
+                f"pred {pred_loss.item():.4f} var {var_loss.item():.4f}",
+                flush=True,
+            )
+
             if step % cfg.eval_interval == 0:
                 avg_pred = pred_sum / loss_count
                 avg_var = var_sum / loss_count
                 avg_cov = cov_sum / loss_count
                 pred_sum = var_sum = cov_sum = 0.0
+
+                ms = 1000.0 / loss_count
+                t_data_ms    = t_data_sum    * ms
+                t_target_ms  = t_target_sum  * ms
+                t_context_ms = t_context_sum * ms
+                t_bwd_ms     = t_backward_sum * ms
+                t_step_ms    = (t_data_ms + t_target_ms + t_context_ms + t_bwd_ms)
+                t_data_sum = t_target_sum = t_context_sum = t_backward_sum = 0.0
                 loss_count = 0
 
                 val_pred, val_var, val_cov, drift, repr_probe = eval_encoder(
-                    level_idx, hierarchy, wte, val_data, cfg, probe=repr_probe
+                    level_idx, hierarchy, val_data, cfg, probe=repr_probe
                 )
 
                 elapsed = time.time() - t0
@@ -318,6 +378,13 @@ def train_encoder_level(
                     f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f} | "
                     f"val_pred {val_pred:.4f} | drift {drift_str} | "
                     f"{int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
+                )
+                print(
+                    f"    timing/step: data {t_data_ms:.1f}ms | "
+                    f"target {t_target_ms:.1f}ms | "
+                    f"context {t_context_ms:.1f}ms | "
+                    f"bwd+step {t_bwd_ms:.1f}ms | "
+                    f"total {t_step_ms:.1f}ms"
                 )
                 log_writer.writerow([
                     global_step_offset + step,
@@ -341,29 +408,22 @@ def train_encoder_level(
         if step >= cfg.encoder_iters_per_level:
             break
 
-    save_checkpoint(
-        hierarchy, None, step, phase_idx,
-        train_dataset.docs_consumed, cfg,
-    )
+    save_checkpoint(hierarchy, None, step, phase_idx, train_dataset.docs_consumed, cfg)
     for p in jepa_level.parameters():
         p.requires_grad_(False)
     print(f"  Encoder level {level_idx + 1} frozen.")
 
 
 def train_token_decoder_level(
-    hierarchy, wte, loader, val_data, cfg,
+    hierarchy, loader, val_data, cfg,
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
     resume_optimizer_state=None,
     unfreeze_encoder=False,
 ):
-    """Train the level-0 TokenDecoderMLP with pure cross-entropy loss.
-
-    unfreeze_encoder: if True, gradients flow through the level-0 encoder as well,
-    jointly fine-tuning it for reconstruction.
-    """
+    """Train the level-0 TokenDecoderMLP with cross-entropy loss over bytes."""
     from prodigyopt import Prodigy
-    device = wte.device
-    ws, D = cfg.window_size, cfg.d_model
+    device = val_data.device
+    D = cfg.d_model
 
     decoder = hierarchy.decoders["0"]
     params = list(decoder.parameters())
@@ -404,23 +464,24 @@ def train_token_decoder_level(
             batch = batch.to(device)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                token_embs = get_token_embeddings(batch, wte)
                 if unfreeze_encoder:
-                    embs_N = hierarchy.encode_to_level_with_grad(token_embs, 1)
+                    embs_N = hierarchy.encode_to_level_with_grad(batch, 1)
                 else:
                     with torch.no_grad():
-                        embs_N = hierarchy.encode_to_level(token_embs, 1)
+                        embs_N = hierarchy.encode_to_level(batch, 1)
 
             B, L_N, _ = embs_N.shape
 
-            token_targets = torch.stack([
-                batch[:, i * cfg.stride : i * cfg.stride + ws]
-                for i in range(L_N)
-            ], dim=1).reshape(B * L_N * ws)
+            # Byte targets for each level-0 window
+            byte_windows = hierarchy.extract_byte_windows(batch)  # [B, N_w0, ws0]
+            token_targets = byte_windows.reshape(B * L_N * cfg.level0_window_size)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits = decoder(embs_N.reshape(B * L_N, D))  # [B*L_N, ws, vocab]
-                loss = F.cross_entropy(logits.reshape(B * L_N * ws, cfg.vocab_size), token_targets)
+                logits = decoder(embs_N.reshape(B * L_N, D))  # [B*L_N, ws0, vocab]
+                loss = F.cross_entropy(
+                    logits.reshape(B * L_N * cfg.level0_window_size, cfg.vocab_size),
+                    token_targets,
+                )
 
             optimizer.zero_grad()
             loss.backward()
@@ -440,7 +501,7 @@ def train_token_decoder_level(
                 ce_sum = 0.0
                 loss_count = 0
 
-                val_ce, _, _ = eval_decoder(0, hierarchy, wte, val_data, cfg)
+                val_ce, _, _ = eval_decoder(0, hierarchy, val_data, cfg)
 
                 elapsed = time.time() - t0
                 tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
@@ -479,18 +540,16 @@ def train_token_decoder_level(
 
 
 def train_decoder_level(
-    level_idx, hierarchy, wte, loader, val_data, cfg,
+    level_idx, hierarchy, loader, val_data, cfg,
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
     resume_optimizer_state=None,
 ):
-    device = wte.device
+    device = val_data.device
     ws, D = cfg.window_size, cfg.d_model
 
     from prodigyopt import Prodigy
     decoder = hierarchy.decoders[str(level_idx)]
-    optimizer = Prodigy(
-        decoder.parameters(), lr=1.0, weight_decay=cfg.weight_decay,
-    )
+    optimizer = Prodigy(decoder.parameters(), lr=1.0, weight_decay=cfg.weight_decay)
     if resume_optimizer_state is not None:
         try:
             defaults = optimizer.param_groups[0].copy()
@@ -498,7 +557,6 @@ def train_decoder_level(
             for pg in optimizer.param_groups:
                 for k, v in defaults.items():
                     pg.setdefault(k, v)
-            # verify the per-parameter state is compatible
             for state in optimizer.state.values():
                 if "s" not in state:
                     raise KeyError("s")
@@ -511,7 +569,6 @@ def train_decoder_level(
     recon_sum = sem_sum = ov_sum = ce_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
-    normed_wte = F.normalize(wte, dim=-1) if level_idx == 0 else None
     t0 = t_last_log = time.time()
 
     print(f"\n=== Decoder level {level_idx + 1} / {cfg.n_levels} (phase {phase_idx}) ===")
@@ -526,16 +583,13 @@ def train_decoder_level(
             batch = batch.to(device)
 
             with torch.no_grad():
-                token_embs = get_token_embeddings(batch, wte)
-                embs_N = hierarchy.encode_to_level(token_embs, level_idx + 1)
-                embs_N1 = hierarchy.encode_to_level(token_embs, level_idx)
+                embs_N = hierarchy.encode_to_level(batch, level_idx + 1)
+                embs_N1 = hierarchy.encode_to_level(batch, level_idx)
 
             B, L_N, _ = embs_N.shape
 
-            # Decode each level-N embedding → window of level-(N-1) embeddings
             decoded = decoder(embs_N.reshape(B * L_N, D)).reshape(B, L_N, ws, D)
 
-            # Reconstruction target: [B, L_N, ws, D]
             target_windows = torch.stack([
                 embs_N1[:, i * cfg.stride : i * cfg.stride + ws, :]
                 for i in range(L_N)
@@ -543,45 +597,19 @@ def train_decoder_level(
 
             L_recon = F.mse_loss(decoded, target_windows)
 
-            # Overlap consistency: last position of window i vs first position of window i+1
             if L_N > 1:
                 L_overlap = F.mse_loss(decoded[:, :-1, -1, :], decoded[:, 1:, 0, :])
             else:
                 L_overlap = decoded.new_tensor(0.0)
 
-            # Semantic loss: re-encode decoded window through frozen context encoder.
-            # Skipped at level 0 — reconstruction target IS the raw GPT-2 embeddings,
-            # so recon loss alone is sufficient and semantic would be circular.
-            if level_idx > 0:
-                re_encoded = hierarchy.levels[level_idx].context_enc(
-                    decoded.reshape(B * L_N, ws * D)
-                ).reshape(B, L_N, D)
-                L_semantic = F.mse_loss(re_encoded, embs_N.detach())
-            else:
-                L_semantic = decoded.new_tensor(0.0)
-
-            # Token cross-entropy loss: only at level 0 where targets are vocab tokens.
-            # decoded: [B, L_N, ws, D] → logits via wte → cross-entropy vs true token IDs.
-            if level_idx == 0 and cfg.decoder_ce_weight != 0.0 and step >= cfg.decoder_ce_start_step:
-                all_embs = decoded.reshape(B * L_N * ws, D)
-                token_targets = torch.stack([
-                    batch[:, i * cfg.stride : i * cfg.stride + ws]
-                    for i in range(L_N)
-                ], dim=1).reshape(B * L_N * ws)
-                n_total = all_embs.shape[0]
-                if n_total > cfg.decoder_ce_tokens:
-                    idx = torch.randperm(n_total, device=device)[:cfg.decoder_ce_tokens]
-                    all_embs = all_embs[idx]
-                    token_targets = token_targets[idx]
-                normed_embs = F.normalize(all_embs, dim=-1)
-                L_ce = F.cross_entropy(normed_embs @ normed_wte.T, token_targets)
-            else:
-                L_ce = decoded.new_tensor(0.0)
+            re_encoded = hierarchy.levels[level_idx].context_enc(
+                decoded.reshape(B * L_N, ws * D)
+            ).reshape(B, L_N, D)
+            L_semantic = F.mse_loss(re_encoded, embs_N.detach())
 
             loss = (
                 cfg.decoder_recon_weight * L_recon
                 + cfg.decoder_semantic_weight * L_semantic
-                + cfg.decoder_ce_weight * L_ce
                 + cfg.lambda_overlap * L_overlap
             )
 
@@ -595,20 +623,16 @@ def train_decoder_level(
             recon_sum += L_recon.item()
             sem_sum += L_semantic.item()
             ov_sum += L_overlap.item()
-            ce_sum += L_ce.item()
             loss_count += 1
 
             if step % cfg.eval_interval == 0:
                 avg_recon = recon_sum / loss_count
                 avg_sem = sem_sum / loss_count
                 avg_ov = ov_sum / loss_count
-                avg_ce = ce_sum / loss_count
                 recon_sum = sem_sum = ov_sum = ce_sum = 0.0
                 loss_count = 0
 
-                val_recon, val_sem, val_ov = eval_decoder(
-                    level_idx, hierarchy, wte, val_data, cfg
-                )
+                val_recon, val_sem, val_ov = eval_decoder(level_idx, hierarchy, val_data, cfg)
 
                 elapsed = time.time() - t0
                 tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
@@ -618,7 +642,7 @@ def train_decoder_level(
                 print(
                     f"  dec-{level_idx + 1} {step:6d}/{cfg.decoder_iters_per_level} | "
                     f"recon {avg_recon:.4f} | sem {avg_sem:.4f} | ov {avg_ov:.4f} | "
-                    f"ce {avg_ce:.4f} | val_recon {val_recon:.4f} | "
+                    f"val_recon {val_recon:.4f} | "
                     f"{int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
                 )
                 log_writer.writerow([
@@ -627,7 +651,6 @@ def train_decoder_level(
                     "", "", "", "", "", "",
                     f"{avg_recon:.6f}", f"{avg_sem:.6f}", f"{avg_ov:.6f}",
                     f"{elapsed:.1f}", f"{tok_per_s:.0f}", "",
-                    f"{avg_ce:.6f}",
                 ])
                 log_file.flush()
 
@@ -642,10 +665,7 @@ def train_decoder_level(
         if step >= cfg.decoder_iters_per_level:
             break
 
-    save_checkpoint(
-        hierarchy, None, step, phase_idx,
-        train_dataset.docs_consumed, cfg,
-    )
+    save_checkpoint(hierarchy, None, step, phase_idx, train_dataset.docs_consumed, cfg)
     for p in decoder.parameters():
         p.requires_grad_(False)
     print(f"  Decoder level {level_idx + 1} frozen.")
@@ -658,8 +678,6 @@ def train():
     device = torch.device(cfg.device)
     print(f"Device: {device}")
 
-    # phases[i] = (phase_type, level_idx, total_iters)
-    # Interleaved: enc-0, dec-0, enc-1, dec-1, ...
     phases = [
         phase
         for i in range(cfg.n_levels)
@@ -669,7 +687,6 @@ def train():
         ]
     ]
 
-    # ── Resume or start fresh ─────────────────────────────────────────────────
     resume_phase = 0
     resume_step = 0
     resume_optimizer_state = None
@@ -694,29 +711,30 @@ def train():
         print("No checkpoint found — starting from scratch")
         hierarchy = JEPAHierarchy(cfg).to(device)
 
-    wte = load_gpt2_embeddings(device)
 
     train_dataset, val_data, tokenizer = build_dataset(cfg, skip_docs)
     val_data = val_data.to(device)
 
-    loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        num_workers=0,
-    )
+    # Level-0 training uses short sequences (one chunk per sample, large batch)
+    from data import SequenceDataset, ByteTokenizer
+    from datasets import load_dataset as _hf_load
+    level0_stream = _hf_load("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+    level0_stream = level0_stream.skip(_FINEWEB_VAL_DOCS + skip_docs).shuffle(buffer_size=10_000)
+    level0_dataset = SequenceDataset(level0_stream, ByteTokenizer(), cfg.level0_window_size, cfg.level0_window_size)
+    level0_loader = DataLoader(level0_dataset, batch_size=cfg.level0_batch_size, num_workers=0)
 
-    # Per-level parameter counts (for reference)
+    loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=0)
+
     _enc_params = sum(
         p.numel() for p in ContextEncoder(cfg.d_model, cfg.window_size).parameters()
     )
     _dec_params = sum(
         p.numel() for p in DecoderMLP(cfg.d_model, cfg.window_size).parameters()
     )
-    print(f"Encoder params per level: {_enc_params:,} (×2 for EMA target = {2*_enc_params:,})")
-    print(f"Decoder params per level: {_dec_params:,}")
+    print(f"Encoder params per level (1+): {_enc_params:,}")
+    print(f"Decoder params per level (1+): {_dec_params:,}")
     print(f"Total phases: {len(phases)}  ({cfg.n_levels} encoder + {cfg.n_levels} decoder)")
 
-    # ── CSV log ───────────────────────────────────────────────────────────────
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     log_path = os.path.join(cfg.checkpoint_dir, "training_log.csv")
     write_header = not os.path.exists(log_path)
@@ -733,23 +751,22 @@ def train():
             "repr_drift",
         ])
 
-    # ── Phase loop ────────────────────────────────────────────────────────────
     for phase_idx, (phase_type, level_idx, total_iters) in enumerate(phases):
-        # Global step offset = sum of iters for all phases before this one
-        global_step_offset = sum(
-            iters for _, _, iters in phases[:phase_idx]
-        )
+        global_step_offset = sum(iters for _, _, iters in phases[:phase_idx])
 
         if phase_idx < resume_phase:
-            # Phase already complete — ensure the module is present and frozen
+            mask_dim = cfg.window_size * cfg.d_model
             if phase_type == "encoder" and level_idx >= len(hierarchy.levels):
-                lvl = JEPALevel(cfg.d_model, cfg.window_size).to(device)
+                if level_idx == 0:
+                    lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size)
+                else:
+                    lvl = JEPALevel(cfg.d_model, cfg.window_size, mask_dim)
                 for p in lvl.parameters():
                     p.requires_grad_(False)
-                hierarchy.levels.append(lvl)
+                hierarchy.levels.append(lvl.to(device))
             elif phase_type == "decoder" and str(level_idx) not in hierarchy.decoders:
                 if level_idx == 0:
-                    dec = TokenDecoderMLP(cfg.d_model, cfg.window_size, cfg.vocab_size).to(device)
+                    dec = TokenDecoderMLP(cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size).to(device)
                 else:
                     dec = DecoderMLP(cfg.d_model, cfg.window_size).to(device)
                 for p in dec.parameters():
@@ -759,28 +776,37 @@ def train():
 
         start_step = resume_step if phase_idx == resume_phase else 0
         opt_state = resume_optimizer_state if phase_idx == resume_phase else None
-        resume_step = 0  # only applies on the first resumed phase
+        resume_step = 0
         resume_optimizer_state = None
 
+        active_loader = level0_loader if level_idx == 0 else loader
+        active_dataset = level0_dataset if level_idx == 0 else train_dataset
+
         if phase_type == "encoder":
+            mask_dim = cfg.window_size * cfg.d_model
             if level_idx >= len(hierarchy.levels):
-                hierarchy.levels.append(
-                    JEPALevel(cfg.d_model, cfg.window_size).to(device)
-                )
+                if level_idx == 0:
+                    hierarchy.levels.append(
+                        JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size).to(device)
+                    )
+                else:
+                    hierarchy.levels.append(
+                        JEPALevel(cfg.d_model, cfg.window_size, mask_dim).to(device)
+                    )
             train_encoder_level(
-                level_idx, hierarchy, wte, loader, val_data, cfg,
-                log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
+                level_idx, hierarchy, active_loader, val_data, cfg,
+                log_writer, log_file, start_step, phase_idx, global_step_offset, active_dataset,
             )
 
         else:  # decoder
             if level_idx == 0:
                 if "0" not in hierarchy.decoders:
-                    td = TokenDecoderMLP(cfg.d_model, cfg.window_size, cfg.vocab_size).to(device)
-                    td.init_from_wte(wte)
-                    hierarchy.decoders["0"] = td
+                    hierarchy.decoders["0"] = TokenDecoderMLP(
+                        cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
+                    ).to(device)
                 train_token_decoder_level(
-                    hierarchy, wte, loader, val_data, cfg,
-                    log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
+                    hierarchy, active_loader, val_data, cfg,
+                    log_writer, log_file, start_step, phase_idx, global_step_offset, active_dataset,
                     resume_optimizer_state=opt_state,
                     unfreeze_encoder=False,
                 )
@@ -790,7 +816,7 @@ def train():
                         DecoderMLP(cfg.d_model, cfg.window_size).to(device)
                     )
                 train_decoder_level(
-                    level_idx, hierarchy, wte, loader, val_data, cfg,
+                    level_idx, hierarchy, loader, val_data, cfg,
                     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
                     resume_optimizer_state=opt_state,
                 )

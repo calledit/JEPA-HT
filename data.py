@@ -8,26 +8,22 @@ _FINEWEB_VAL_DOCS = 500
 _FINEWEB_SHUFFLE_BUFFER = 10_000
 
 
-class GPT2Tokenizer:
-    """Wraps tiktoken GPT-2 BPE encoder."""
-    vocab_size = 50257
-
-    def __init__(self):
-        import tiktoken
-        self._enc = tiktoken.get_encoding("gpt2")
-        self.eot_token: int = self._enc.eot_token
+class ByteTokenizer:
+    """Encodes text as raw UTF-8 bytes. Vocabulary is 0–255."""
+    vocab_size = 256
+    eot_token: int = 0  # null byte as document separator
 
     def encode(self, text: str) -> list[int]:
-        return self._enc.encode_ordinary(text)
+        return list(text.encode("utf-8"))
 
     def decode(self, ids) -> str:
-        return self._enc.decode([int(i) for i in ids])
+        return bytes([int(i) for i in ids if i != self.eot_token]).decode("utf-8", errors="replace")
 
 
 class SequenceDataset(IterableDataset):
-    """Yields fixed-length token ID tensors from a HuggingFace streaming dataset."""
+    """Yields fixed-length byte ID tensors from a HuggingFace streaming dataset."""
 
-    def __init__(self, hf_dataset, tokenizer: GPT2Tokenizer, sequence_length: int, window_size: int):
+    def __init__(self, hf_dataset, tokenizer: ByteTokenizer, sequence_length: int, window_size: int):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
@@ -57,7 +53,7 @@ def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
     from datasets import load_dataset
 
     print("Loading FineWeb-Edu (streaming)...")
-    tokenizer = GPT2Tokenizer()
+    tokenizer = ByteTokenizer()
 
     def _stream():
         return load_dataset(
@@ -78,9 +74,9 @@ def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
     )
     if skip_docs:
         print(f"  Skipping {skip_docs:,} previously consumed documents")
-    print(f"  Val: {len(val_tokens):,} tokens | Train: streaming")
+    print(f"  Val: {len(val_tokens):,} bytes | Train: streaming")
 
-    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length, cfg.window_size)
+    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length, cfg.level0_window_size)
     return train_dataset, val_data, tokenizer
 
 
