@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from config import Config
-from model import JEPAHierarchy, JEPALevel, DecoderMLP
+from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP
 from data import GPT2Tokenizer
 
 
@@ -41,8 +41,12 @@ def load_hierarchy(checkpoint_path: str = None, device: str = "cpu"):
     hierarchy = JEPAHierarchy(cfg).to(dev)
     for _ in range(ckpt["n_encoder_levels"]):
         hierarchy.levels.append(JEPALevel(cfg.d_model, cfg.window_size).to(dev))
+    token_decoder_levels = ckpt.get("token_decoder_levels", [])
     for key in ckpt["decoder_keys"]:
-        hierarchy.decoders[key] = DecoderMLP(cfg.d_model, cfg.window_size).to(dev)
+        if int(key) in token_decoder_levels:
+            hierarchy.decoders[key] = TokenDecoderMLP(cfg.d_model, cfg.window_size, cfg.vocab_size).to(dev)
+        else:
+            hierarchy.decoders[key] = DecoderMLP(cfg.d_model, cfg.window_size).to(dev)
     hierarchy.load_state_dict(ckpt["hierarchy_state"])
     hierarchy.eval()
 
@@ -117,6 +121,23 @@ def decode(
 
         decoder = hierarchy.decoders[key]
         B, L_N, _ = current.shape
+
+        if isinstance(decoder, TokenDecoderMLP):
+            # Direct logit prediction — argmax over vocab, no nearest-neighbour needed
+            logits = decoder(current.reshape(B * L_N, D))  # [B*L_N, ws, vocab]
+            ids = logits.argmax(dim=-1)                    # [B*L_N, ws]
+            token_ids = ids.reshape(B, L_N, ws)
+            # Stitch windows back into a flat sequence (take first occurrence at overlaps)
+            L_lower = (L_N - 1) * stride + ws
+            out_ids = current.new_zeros(B, L_lower, dtype=torch.long)
+            filled = torch.zeros(B, L_lower, dtype=torch.bool, device=current.device)
+            for i in range(L_N):
+                start = i * stride
+                mask = ~filled[:, start : start + ws]
+                out_ids[:, start : start + ws][mask] = token_ids[:, i, :][mask]
+                filled[:, start : start + ws] |= True
+            tokenizer = GPT2Tokenizer()
+            return tokenizer.decode(out_ids.squeeze(0).tolist())
 
         decoded = decoder(current.reshape(B * L_N, D))  # [B*L_N, ws, D]
         decoded = decoded.reshape(B, L_N, ws, D)

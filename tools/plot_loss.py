@@ -91,7 +91,7 @@ def main():
 
     colors = cm.plasma(np.linspace(0.1, 0.9, max(n_levels, 1)))
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle("JEPA-HT Training", fontsize=14)
 
     # ── Encoder: JEPA prediction loss ────────────────────────────────────────
@@ -122,8 +122,22 @@ def main():
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.3)
 
-    # ── Decoder: reconstruction & semantic losses ─────────────────────────────
+    # ── Encoder: representation drift ────────────────────────────────────────
     ax = axes[1, 0]
+    if "repr_drift" in enc_df.columns:
+        for lvl in sorted(enc_df["level"].dropna().unique()):
+            sub = enc_df[enc_df["level"] == lvl]
+            c = colors[int(lvl) - 1]
+            plot_line(ax, sub["global_step"], sub["repr_drift"], f"L{int(lvl)}", c, args)
+    add_phase_boundaries(ax, enc_df)
+    ax.set_title("Encoder — Representation Drift (MSE vs prev eval, unmasked)")
+    ax.set_ylabel("MSE")
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # ── Decoder: reconstruction & semantic losses ─────────────────────────────
+    ax = axes[1, 1]
     for lvl in sorted(dec_df["level"].dropna().unique()):
         sub = dec_df[dec_df["level"] == lvl]
         c = colors[int(lvl) - 1]
@@ -137,7 +151,7 @@ def main():
     ax.grid(True, alpha=0.3)
 
     # ── Decoder: overlap consistency ──────────────────────────────────────────
-    ax = axes[1, 1]
+    ax = axes[2, 0]
     for lvl in sorted(dec_df["level"].dropna().unique()):
         sub = dec_df[dec_df["level"] == lvl]
         c = colors[int(lvl) - 1]
@@ -149,8 +163,11 @@ def main():
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
+    axes[2, 1].set_visible(False)
+
     for ax in axes.flat:
-        ax.set_xlabel("Global step")
+        if ax.get_visible():
+            ax.set_xlabel("Global step")
     plt.tight_layout()
     plt.show()
 

@@ -65,12 +65,77 @@ class DecoderMLP(nn.Module):
         return self.net(x).reshape(x.shape[0], self.window_size, self.d_model)
 
 
+class TokenDecoderMLP(nn.Module):
+    """Level-0 decoder: maps level-1 embeddings directly to token logits.
+
+    [N, d_model] → [N, window_size, vocab_size]
+    Initialized from the frozen GPT-2 embedding table for a warm start.
+    """
+
+    def __init__(self, d_model: int = 768, window_size: int = 4, vocab_size: int = 50257):
+        super().__init__()
+        self.window_size = window_size
+        self.net = nn.Sequential(
+            nn.Linear(d_model, 1536, bias=False),
+            nn.GELU(),
+            nn.Linear(1536, 2304, bias=False),
+            nn.GELU(),
+            nn.Linear(2304, window_size * d_model, bias=False),
+        )
+        self.to_logits = nn.Linear(d_model, vocab_size, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def init_from_wte(self, wte: torch.Tensor):
+        with torch.no_grad():
+            self.to_logits.weight.copy_(wte)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, d_model] → [N, window_size, vocab_size]
+        embs = self.net(x).reshape(x.shape[0], self.window_size, -1)  # [N, ws, d_model]
+        return self.to_logits(embs)
+
+
+class Predictor(nn.Module):
+    """Small MLP that maps context encoding + mask → predicted target encoding.
+
+    Receives the context encoder output and a projection of the binary mask
+    (1 = dimension was dropped, 0 = kept) so it knows exactly what was missing.
+    """
+
+    def __init__(self, d_model: int = 768, window_size: int = 4):
+        super().__init__()
+        mask_dim = window_size * d_model
+        self.mask_proj = nn.Linear(mask_dim, d_model, bias=False)
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2, 512, bias=False),
+            nn.GELU(),
+            nn.Linear(512, d_model, bias=False),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, context: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # context: [N, d_model], mask: [N, window_size * d_model] float (0/1)
+        mask_emb = self.mask_proj(mask)
+        return self.net(torch.cat([context, mask_emb], dim=-1))
+
+
 class JEPALevel(nn.Module):
-    """One JEPA encoder level: context encoder trained by gradient + EMA target encoder."""
+    """One JEPA encoder level: context encoder + predictor trained by gradient, EMA target encoder."""
 
     def __init__(self, d_model: int = 768, window_size: int = 4):
         super().__init__()
         self.context_enc = ContextEncoder(d_model, window_size)
+        self.predictor = Predictor(d_model, window_size)
         self.target_enc = copy.deepcopy(self.context_enc)
         for p in self.target_enc.parameters():
             p.requires_grad_(False)
@@ -87,9 +152,14 @@ class JEPALevel(nn.Module):
         """JEPA training: target encoder receives full (unmasked) window."""
         return self.target_enc(x)
 
+    def forward_context(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """JEPA training: context encoder + predictor, with grad."""
+        context = self.context_enc(x)
+        return self.predictor(context, mask)
+
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Frozen inference: context encoder, no gradient."""
+        """Frozen inference: context encoder only, no predictor, no gradient."""
         return self.context_enc(x)
 
 
@@ -114,10 +184,14 @@ class JEPAHierarchy(nn.Module):
         windows = embs.unfold(1, ws, st)
         return windows.permute(0, 1, 3, 2).contiguous()
 
-    def apply_dim_mask(self, windows: torch.Tensor) -> torch.Tensor:
-        """Zero out mask_ratio fraction of dimensions per embedding."""
-        mask = torch.rand_like(windows) < self.cfg.mask_ratio
-        return windows.masked_fill(mask, 0.0)
+    def apply_dim_mask(self, windows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Zero out mask_ratio fraction of dimensions per embedding.
+
+        Returns (masked_windows, mask) where mask is float 1.0 = dropped, 0.0 = kept,
+        shape [B, N_w, ws, D] — same shape as windows.
+        """
+        mask = (torch.rand_like(windows) < self.cfg.mask_ratio).float()
+        return windows * (1.0 - mask), mask
 
     @torch.no_grad()
     def encode_to_level(self, token_embs: torch.Tensor, level: int) -> torch.Tensor:
@@ -137,15 +211,26 @@ class JEPAHierarchy(nn.Module):
             embs = out.reshape(B, N_w, D)
         return embs
 
+    def encode_to_level_with_grad(self, token_embs: torch.Tensor, level: int) -> torch.Tensor:
+        """Same as encode_to_level but with gradients — for joint encoder+decoder training."""
+        embs = token_embs
+        ws, D = self.cfg.window_size, self.cfg.d_model
+        for n in range(level):
+            N_w = self.extract_windows(embs).shape[1]
+            windows = self.extract_windows(embs)
+            flat = windows.reshape(embs.shape[0] * N_w, ws * D)
+            out = self.levels[n].context_enc(flat)    # bypass @no_grad encode()
+            embs = out.reshape(embs.shape[0], N_w, D)
+        return embs
+
 
 # ── Loss functions ────────────────────────────────────────────────────────────
 
 def vicreg_components(
     z: torch.Tensor,
-    lambda_v: float = 25.0,
     lambda_c: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (variance_loss, covariance_loss) with weights applied.
+    """Returns (variance_loss, covariance_loss) unscaled — apply lambdas at the call site.
 
     z: [N, d_model] batch of embeddings.
     """
@@ -155,14 +240,17 @@ def vicreg_components(
     std = torch.sqrt(z.var(dim=0) + 1e-4)
     var_loss = F.relu(1.0 - std).mean()
 
-    cov = (z.T @ z) / (N - 1)
-    off_diag = cov.pow(2)
-    off_diag.fill_diagonal_(0.0)
-    cov_loss = off_diag.sum() / D
+    if lambda_c != 0.0:
+        cov = (z.T @ z) / (N - 1)
+        off_diag = cov.pow(2)
+        off_diag.fill_diagonal_(0.0)
+        cov_loss = off_diag.sum() / D
+    else:
+        cov_loss = z.new_tensor(0.0)
 
-    return lambda_v * var_loss, lambda_c * cov_loss
+    return var_loss, cov_loss
 
 
 def vicreg_loss(z: torch.Tensor, lambda_v: float = 25.0, lambda_c: float = 1.0) -> torch.Tensor:
-    var, cov = vicreg_components(z, lambda_v, lambda_c)
-    return var + cov
+    var, cov = vicreg_components(z, lambda_c)
+    return lambda_v * var + lambda_c * cov

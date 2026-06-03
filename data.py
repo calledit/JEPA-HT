@@ -27,10 +27,11 @@ class GPT2Tokenizer:
 class SequenceDataset(IterableDataset):
     """Yields fixed-length token ID tensors from a HuggingFace streaming dataset."""
 
-    def __init__(self, hf_dataset, tokenizer: GPT2Tokenizer, sequence_length: int):
+    def __init__(self, hf_dataset, tokenizer: GPT2Tokenizer, sequence_length: int, window_size: int):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
+        self.window_size = window_size
         self.docs_consumed = 0
 
     def __iter__(self):
@@ -45,7 +46,7 @@ class SequenceDataset(IterableDataset):
         buf: list[int] = []
         for doc in dataset:
             buf.extend(self.tokenizer.encode(doc["text"]))
-            buf.append(self.tokenizer.eot_token)
+            buf.extend([self.tokenizer.eot_token] * self.window_size)
             self.docs_consumed += 1
             while len(buf) >= self.sequence_length:
                 yield torch.tensor(buf[: self.sequence_length], dtype=torch.long)
@@ -79,7 +80,7 @@ def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
         print(f"  Skipping {skip_docs:,} previously consumed documents")
     print(f"  Val: {len(val_tokens):,} tokens | Train: streaming")
 
-    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length)
+    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length, cfg.window_size)
     return train_dataset, val_data, tokenizer
 
 
