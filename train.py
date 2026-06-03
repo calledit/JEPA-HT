@@ -721,7 +721,7 @@ def train():
     from datasets import load_dataset as _hf_load
     level0_stream = _hf_load("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
     level0_stream = level0_stream.skip(_FINEWEB_VAL_DOCS + skip_docs).shuffle(buffer_size=10_000)
-    level0_dataset = SequenceDataset(level0_stream, ByteTokenizer(), cfg.level0_window_size, cfg.level0_window_size)
+    level0_dataset = SequenceDataset(level0_stream, ByteTokenizer(), cfg.level0_window_size, skip_docs=skip_docs)
     level0_loader = DataLoader(level0_dataset, batch_size=cfg.level0_batch_size, num_workers=0)
 
     loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=0)

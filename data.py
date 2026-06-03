@@ -21,14 +21,18 @@ class ByteTokenizer:
 
 
 class SequenceDataset(IterableDataset):
-    """Yields fixed-length byte ID tensors from a HuggingFace streaming dataset."""
+    """Yields fixed-length byte ID tensors from a HuggingFace streaming dataset.
 
-    def __init__(self, hf_dataset, tokenizer: ByteTokenizer, sequence_length: int, window_size: int):
+    Each yielded tensor starts at the beginning of a document chunk — never at
+    padding zeros. Docs shorter than sequence_length are zero-padded at the end.
+    Docs longer than sequence_length are split into non-overlapping chunks.
+    """
+
+    def __init__(self, hf_dataset, tokenizer: ByteTokenizer, sequence_length: int, skip_docs: int = 0):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
-        self.window_size = window_size
-        self.docs_consumed = 0
+        self.docs_consumed = skip_docs
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -39,14 +43,16 @@ class SequenceDataset(IterableDataset):
                 index=worker_info.id,
             )
 
-        buf: list[int] = []
         for doc in dataset:
-            buf.extend(self.tokenizer.encode(doc["text"]))
-            buf.extend([self.tokenizer.eot_token] * self.window_size)
+            raw = self.tokenizer.encode(doc["text"])
+            if not raw:
+                continue
             self.docs_consumed += 1
-            while len(buf) >= self.sequence_length:
-                yield torch.tensor(buf[: self.sequence_length], dtype=torch.long)
-                del buf[: self.sequence_length]
+            for start in range(0, len(raw), self.sequence_length):
+                chunk = raw[start : start + self.sequence_length]
+                if len(chunk) < self.sequence_length:
+                    chunk = chunk + [self.tokenizer.eot_token] * (self.sequence_length - len(chunk))
+                yield torch.tensor(chunk, dtype=torch.long)
 
 
 def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
@@ -76,7 +82,7 @@ def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
         print(f"  Skipping {skip_docs:,} previously consumed documents")
     print(f"  Val: {len(val_tokens):,} bytes | Train: streaming")
 
-    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length, cfg.level0_window_size)
+    train_dataset = SequenceDataset(train_stream, tokenizer, cfg.sequence_length, skip_docs=skip_docs)
     return train_dataset, val_data, tokenizer
 
 

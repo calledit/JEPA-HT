@@ -64,7 +64,7 @@ class Config:
     grad_clip: float = 1.0
 
     # Training iterations per level
-    encoder_iters_per_level: int = 470_000
+    encoder_iters_per_level: int = 970_000
     decoder_iters_per_level: int = 125_000
 
     # Evaluation
