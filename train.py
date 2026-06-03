@@ -309,6 +309,11 @@ def train_encoder_level(
                 var_loss_active = False
             lv = lv_base if var_loss_active else 0.0
 
+            # Cap covariance contribution to at most half the prediction loss
+            cov_val = cov_loss.item()
+            if lc > 0 and cov_val > 0:
+                lc = min(lc, 0.5 * pred_loss.item() / cov_val)
+
             loss = pred_loss + lv * var_loss + lc * cov_loss
 
             optimizer.zero_grad()
@@ -338,15 +343,15 @@ def train_encoder_level(
             cov_sum += cov_loss.item()
             loss_count += 1
 
-            print(
-                f"  step {step:6d} | {step_ms:6.0f}ms | "
-                f"data {(t0_target-t0_data)*1000:.0f}ms "
-                f"target {(t0_context-t0_target)*1000:.0f}ms "
-                f"ctx {(t0_backward-t0_context)*1000:.0f}ms "
-                f"bwd {(t_end-t0_backward)*1000:.0f}ms | "
-                f"pred {pred_loss.item():.4f} var {var_loss.item():.4f}",
-                flush=True,
-            )
+            # print(
+            #     f"  step {step:6d} | {step_ms:6.0f}ms | "
+            #     f"data {(t0_target-t0_data)*1000:.0f}ms "
+            #     f"target {(t0_context-t0_target)*1000:.0f}ms "
+            #     f"ctx {(t0_backward-t0_context)*1000:.0f}ms "
+            #     f"bwd {(t_end-t0_backward)*1000:.0f}ms | "
+            #     f"pred {pred_loss.item():.4f} var {var_loss.item():.4f}",
+            #     flush=True,
+            # )
 
             if step % cfg.eval_interval == 0:
                 avg_pred = pred_sum / loss_count
@@ -378,13 +383,6 @@ def train_encoder_level(
                     f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f} | "
                     f"val_pred {val_pred:.4f} | drift {drift_str} | "
                     f"{int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
-                )
-                print(
-                    f"    timing/step: data {t_data_ms:.1f}ms | "
-                    f"target {t_target_ms:.1f}ms | "
-                    f"context {t_context_ms:.1f}ms | "
-                    f"bwd+step {t_bwd_ms:.1f}ms | "
-                    f"total {t_step_ms:.1f}ms"
                 )
                 log_writer.writerow([
                     global_step_offset + step,

@@ -13,7 +13,7 @@ class Config:
 
     # Level-0 byte encoder (ByteHourglassEncoder)
     level0_window_size: int = 4096  # bytes per level-0 window (= sequence length for level-0 training)
-    level0_batch_size: int = 512     # batch size for level-0 training phases
+    level0_batch_size: int = 128     # batch size for level-0 training phases
     level0_mask_ratio: float = 0.65 # fraction of byte tokens masked at level 0
 
     # Masking for levels 1+ (dimension-level masking)
@@ -31,9 +31,11 @@ class Config:
     lambda_v: float = 15.0
     lambda_v_warmup_steps: int = 10_000
 
-    lambda_c_warmup: float = 0.25   # 512/2048
-    lambda_c: float = 0.0
-    lambda_c_warmup_steps: int = 15_000
+    # Non colinearity is not vital for the latent space but it is nice to have. Pushing for
+    # it also makes sure that all scalars in the latent space is used. Which should in theory make training faster. Since more gradient can flow back.
+    lambda_c_warmup: float = 0.1   # 512/2048
+    lambda_c: float = 0.00
+    lambda_c_warmup_steps: int = 40_000 # We assume that a foundation of non colinearity has been built up by step 40 000
 
     # Hysteresis thresholds for auto-enabling/disabling variance loss
     var_loss_enable_threshold: float = 0.0015

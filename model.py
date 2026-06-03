@@ -22,9 +22,7 @@ class SparseAttnMergeLayer(nn.Module):
         self.d_head = d_in // n_heads
         self.block_size = block_size
         self.norm = nn.LayerNorm(d_in)
-        self.q_proj = nn.Linear(d_in, d_in, bias=False)
-        self.k_proj = nn.Linear(d_in, d_in, bias=False)
-        self.v_proj = nn.Linear(d_in, d_in, bias=False)
+        self.qkv = nn.Linear(d_in, 3 * d_in, bias=False)
         self.out_proj = nn.Linear(d_in, d_in, bias=False)
         self._init_weights()
 
@@ -39,12 +37,9 @@ class SparseAttnMergeLayer(nn.Module):
         H, dh, bs = self.n_heads, self.d_head, self.block_size
         nb = L // bs  # number of non-overlapping blocks
 
-        nx = self.norm(x)
-        # Reshape into blocks so attention is local within each block
-        nx_b = nx.reshape(B * nb, bs, D)
-        q = self.q_proj(nx_b).reshape(B * nb, bs, H, dh).transpose(1, 2)
-        k = self.k_proj(nx_b).reshape(B * nb, bs, H, dh).transpose(1, 2)
-        v = self.v_proj(nx_b).reshape(B * nb, bs, H, dh).transpose(1, 2)
+        nx_b = self.norm(x).reshape(B * nb, bs, D)
+        q, k, v = self.qkv(nx_b).reshape(B * nb, bs, 3, H, dh).unbind(2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         x = x + self.out_proj(attn_out)
@@ -66,9 +61,7 @@ class ShrinkAttnLayer(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_in // n_heads
         self.norm1 = nn.LayerNorm(d_in)
-        self.q_proj = nn.Linear(d_in, d_in, bias=False)
-        self.k_proj = nn.Linear(d_in, d_in, bias=False)
-        self.v_proj = nn.Linear(d_in, d_in, bias=False)
+        self.qkv = nn.Linear(d_in, 3 * d_in, bias=False)
         self.out_proj = nn.Linear(d_in, d_in, bias=False)
         self.norm2 = nn.LayerNorm(d_in)
         self.proj_down = nn.Linear(d_in, d_out, bias=False)
@@ -82,10 +75,9 @@ class ShrinkAttnLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, L, d_in] → [B, L, d_out]
         B, L, D = x.shape
-        nx = self.norm1(x)
-        q = self.q_proj(nx).reshape(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        k = self.k_proj(nx).reshape(B, L, self.n_heads, self.d_head).transpose(1, 2)
-        v = self.v_proj(nx).reshape(B, L, self.n_heads, self.d_head).transpose(1, 2)
+        H, dh = self.n_heads, self.d_head
+        q, k, v = self.qkv(self.norm1(x)).reshape(B, L, 3, H, dh).unbind(2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         x = x + self.out_proj(attn_out)
@@ -94,7 +86,7 @@ class ShrinkAttnLayer(nn.Module):
 
 # Sparse stage specs: (d_in, n_heads, block_size) — seq_len halves each stage via concat-merge
 # 4096→2048→1024→512→256 tokens, dim 16→32→64→128→256
-_SPARSE_STAGES = [(16, 4, 128), (32, 4, 128), (64, 8, 128), (128, 8, 128)]
+_SPARSE_STAGES = [(16, 1, 128), (32, 2, 128), (64, 4, 128), (128, 8, 128)]
 
 # Shrink stage specs: (d_in, n_heads, d_out) — all at 256 tokens, full attention
 # 256→128→64→32→16→4→1, then flatten 256×1 → MLP → d_model
