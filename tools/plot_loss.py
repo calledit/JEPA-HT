@@ -49,19 +49,19 @@ def load_log(path):
     return df
 
 
-def plot_line(ax, x, y, label, color, args):
+def plot_line(ax, x, y, label, color, args, linestyle="-"):
     y = np.array(y, dtype=float)
     mask = ~np.isnan(y)
     x, y = np.array(x)[mask], y[mask]
     if len(y) == 0:
         return
-    ax.plot(x, y, alpha=0.2, color=color, linewidth=0.7)
+    ax.plot(x, y, alpha=0.2, color=color, linewidth=0.7, linestyle=linestyle)
     if len(y) >= args.smooth:
         s = smooth(y, args.smooth)
         sx = x[args.smooth - 1 :]
-        ax.plot(sx, s, color=color, linewidth=1.8, label=label)
+        ax.plot(sx, s, color=color, linewidth=1.8, label=label, linestyle=linestyle)
     else:
-        ax.plot(x, y, color=color, linewidth=1.8, label=label)
+        ax.plot(x, y, color=color, linewidth=1.8, label=label, linestyle=linestyle)
 
 
 def add_phase_boundaries(ax, df):
@@ -100,7 +100,7 @@ def main():
         sub = enc_df[enc_df["level"] == lvl]
         c = colors[int(lvl) - 1]
         plot_line(ax, sub["global_step"], sub["pred_loss"],     f"L{int(lvl)} train", c, args)
-        plot_line(ax, sub["global_step"], sub["val_pred_loss"], f"L{int(lvl)} val",   c, args)
+        plot_line(ax, sub["global_step"], sub["val_pred_loss"], f"L{int(lvl)} val",   c, args, "--")
     add_phase_boundaries(ax, enc_df)
     ax.set_title("Encoder — JEPA Prediction Loss (MSE, lower = better)")
     ax.set_ylabel("MSE")

@@ -56,7 +56,7 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
     token_decoder_levels = ckpt.get("token_decoder_levels", [])
     for i in range(ckpt["n_encoder_levels"]):
         if i == 0:
-            lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size)
+            lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size, cfg.level0_dim_mask_mean)
         else:
             mask_dim = cfg.window_size * cfg.d_model
             lvl = JEPALevel(cfg.d_model, cfg.window_size, mask_dim)
@@ -218,6 +218,7 @@ def get_lr(step: int, cfg) -> float:
 def train_encoder_level(
     level_idx, hierarchy, loader, val_data, cfg,
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
+    docs_consumed_fn=None,
 ):
     device = val_data.device
     ws, D = cfg.window_size, cfg.d_model
@@ -399,14 +400,14 @@ def train_encoder_level(
             if ckpt_interval > last_ckpt_interval:
                 save_checkpoint(
                     hierarchy, optimizer, step, phase_idx,
-                    train_dataset.docs_consumed, cfg,
+                    docs_consumed_fn(), cfg,
                 )
                 last_ckpt_interval = ckpt_interval
 
         if step >= cfg.encoder_iters_per_level:
             break
 
-    save_checkpoint(hierarchy, None, step, phase_idx, train_dataset.docs_consumed, cfg)
+    save_checkpoint(hierarchy, None, step, phase_idx, docs_consumed_fn(), cfg)
     for p in jepa_level.parameters():
         p.requires_grad_(False)
     print(f"  Encoder level {level_idx + 1} frozen.")
@@ -417,6 +418,7 @@ def train_token_decoder_level(
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
     resume_optimizer_state=None,
     unfreeze_encoder=False,
+    docs_consumed_fn=None,
 ):
     """Train the level-0 TokenDecoderMLP with cross-entropy loss over bytes."""
     from prodigyopt import Prodigy
@@ -524,14 +526,14 @@ def train_token_decoder_level(
             if ckpt_interval > last_ckpt_interval:
                 save_checkpoint(
                     hierarchy, optimizer, step, phase_idx,
-                    train_dataset.docs_consumed, cfg,
+                    docs_consumed_fn(), cfg,
                 )
                 last_ckpt_interval = ckpt_interval
 
         if step >= cfg.decoder_iters_per_level:
             break
 
-    save_checkpoint(hierarchy, None, step, phase_idx, train_dataset.docs_consumed, cfg)
+    save_checkpoint(hierarchy, None, step, phase_idx, docs_consumed_fn(), cfg)
     for p in decoder.parameters():
         p.requires_grad_(False)
     print("  Token decoder frozen.")
@@ -541,6 +543,7 @@ def train_decoder_level(
     level_idx, hierarchy, loader, val_data, cfg,
     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
     resume_optimizer_state=None,
+    docs_consumed_fn=None,
 ):
     device = val_data.device
     ws, D = cfg.window_size, cfg.d_model
@@ -656,14 +659,14 @@ def train_decoder_level(
             if ckpt_interval > last_ckpt_interval:
                 save_checkpoint(
                     hierarchy, optimizer, step, phase_idx,
-                    train_dataset.docs_consumed, cfg,
+                    docs_consumed_fn(), cfg,
                 )
                 last_ckpt_interval = ckpt_interval
 
         if step >= cfg.decoder_iters_per_level:
             break
 
-    save_checkpoint(hierarchy, None, step, phase_idx, train_dataset.docs_consumed, cfg)
+    save_checkpoint(hierarchy, None, step, phase_idx, docs_consumed_fn(), cfg)
     for p in decoder.parameters():
         p.requires_grad_(False)
     print(f"  Decoder level {level_idx + 1} frozen.")
@@ -756,7 +759,7 @@ def train():
             mask_dim = cfg.window_size * cfg.d_model
             if phase_type == "encoder" and level_idx >= len(hierarchy.levels):
                 if level_idx == 0:
-                    lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size)
+                    lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size, cfg.level0_dim_mask_mean)
                 else:
                     lvl = JEPALevel(cfg.d_model, cfg.window_size, mask_dim)
                 for p in lvl.parameters():
@@ -785,18 +788,21 @@ def train():
             if level_idx >= len(hierarchy.levels):
                 if level_idx == 0:
                     hierarchy.levels.append(
-                        JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size).to(device)
+                        JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size, cfg.level0_dim_mask_mean).to(device)
                     )
                 else:
                     hierarchy.levels.append(
                         JEPALevel(cfg.d_model, cfg.window_size, mask_dim).to(device)
                     )
+            docs_consumed_fn = lambda: max(level0_dataset.docs_consumed, train_dataset.docs_consumed)
             train_encoder_level(
                 level_idx, hierarchy, active_loader, val_data, cfg,
                 log_writer, log_file, start_step, phase_idx, global_step_offset, active_dataset,
+                docs_consumed_fn=docs_consumed_fn,
             )
 
         else:  # decoder
+            docs_consumed_fn = lambda: max(level0_dataset.docs_consumed, train_dataset.docs_consumed)
             if level_idx == 0:
                 if "0" not in hierarchy.decoders:
                     hierarchy.decoders["0"] = TokenDecoderMLP(
@@ -807,6 +813,7 @@ def train():
                     log_writer, log_file, start_step, phase_idx, global_step_offset, active_dataset,
                     resume_optimizer_state=opt_state,
                     unfreeze_encoder=False,
+                    docs_consumed_fn=docs_consumed_fn,
                 )
             else:
                 if str(level_idx) not in hierarchy.decoders:
@@ -817,6 +824,7 @@ def train():
                     level_idx, hierarchy, loader, val_data, cfg,
                     log_writer, log_file, start_step, phase_idx, global_step_offset, train_dataset,
                     resume_optimizer_state=opt_state,
+                    docs_consumed_fn=docs_consumed_fn,
                 )
 
         log_file.flush()

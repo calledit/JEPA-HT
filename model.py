@@ -108,9 +108,10 @@ class ByteHourglassEncoder(nn.Module):
     out byte embeddings before the transformer.
     """
 
-    def __init__(self, d_model: int = 512, window_size: int = 4096):
+    def __init__(self, d_model: int = 512, window_size: int = 4096, dim_mask_mean: float = 0.9):
         super().__init__()
         self.window_size = window_size
+        self.dim_mask_exp = (1.0 - dim_mask_mean) / dim_mask_mean  # exponent for r=u^exp → E[r]=dim_mask_mean
         self.embedding = nn.Embedding(256, 16)
         self.pos_embedding = nn.Embedding(window_size, 16)
 
@@ -149,7 +150,21 @@ class ByteHourglassEncoder(nn.Module):
         x = self.embedding(byte_ids) + self.pos_embedding(positions)  # [N, L, 16]
 
         if token_mask is not None:
-            x = x * (1.0 - token_mask.unsqueeze(-1))
+            # Detach embedding for masked tokens so the embedding table doesn't
+            # receive gradient through the JEPA loss at masked positions.
+            m = token_mask.unsqueeze(-1)                          # [N, L, 1]
+            x = x.detach() * m + x * (1.0 - m)
+
+            # Per-token random dim masking: sample r~Uniform(1/16,1) per token,
+            # then Bernoulli-zero that fraction of the 16 dims.
+            # Guarantee at least 1 dim is always zeroed per masked token.
+            r = torch.rand(x.shape[0], x.shape[1], 1, device=x.device).pow(self.dim_mask_exp)
+            noise = torch.rand_like(x)
+            dim_mask = (noise < r).float()
+            no_dim = (dim_mask.sum(-1, keepdim=True) == 0)
+            forced = torch.zeros_like(dim_mask).scatter_(-1, noise.argmin(-1, keepdim=True), 1.0)
+            dim_mask = torch.where(no_dim, forced, dim_mask) * m  # [N, L, 16]
+            x = x * (1.0 - dim_mask)
 
         for layer in self.sparse_layers:
             x = layer(x)   # [N, L/2, 2D] each pass
@@ -288,11 +303,11 @@ class JEPALevel(nn.Module):
             p.requires_grad_(False)
 
     @classmethod
-    def make_level0(cls, d_model: int, window_size: int) -> "JEPALevel":
+    def make_level0(cls, d_model: int, window_size: int, dim_mask_mean: float = 0.9) -> "JEPALevel":
         """Construct a level-0 JEPALevel with ByteHourglassEncoder."""
         obj = object.__new__(cls)
         nn.Module.__init__(obj)
-        obj.context_enc = ByteHourglassEncoder(d_model, window_size)
+        obj.context_enc = ByteHourglassEncoder(d_model, window_size, dim_mask_mean)
         obj.predictor = Predictor(d_model, mask_dim=window_size)  # mask is [N, window_size]
         obj.target_enc = copy.deepcopy(obj.context_enc)
         for p in obj.target_enc.parameters():

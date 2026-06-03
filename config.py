@@ -14,7 +14,8 @@ class Config:
     # Level-0 byte encoder (ByteHourglassEncoder)
     level0_window_size: int = 4096  # bytes per level-0 window (= sequence length for level-0 training)
     level0_batch_size: int = 128     # batch size for level-0 training phases
-    level0_mask_ratio: float = 0.65 # fraction of byte tokens masked at level 0
+    level0_mask_ratio: float = 0.75 # fraction of byte tokens masked at level 0
+    level0_dim_mask_mean: float = 0.96 # average fraction of dims zeroed per masked token
 
     # Masking for levels 1+ (dimension-level masking)
     mask_ratio: float = (1/4) * 3.0
@@ -58,12 +59,12 @@ class Config:
     lr: float = 3e-4
     lr_warmup_steps: int = 2_000    # linear warmup from 0 → lr
     lr_end_decay_step: int = 450_000  # step at which lr_min is reached; held flat after
-    lr_min: float = 1e-4            # cosine decay floor
+    lr_min: float = 3e-4            # cosine decay floor
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 
     # Training iterations per level
-    encoder_iters_per_level: int = 270_000
+    encoder_iters_per_level: int = 470_000
     decoder_iters_per_level: int = 125_000
 
     # Evaluation
