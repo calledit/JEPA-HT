@@ -48,6 +48,45 @@ class SparseAttnMergeLayer(nn.Module):
         return x.reshape(B, L // 2, 2 * D)
 
 
+class SparseAttnExpandLayer(nn.Module):
+    """Block-local self-attention followed by split-expand.
+
+    Inverse of SparseAttnMergeLayer.
+    [B, L, d_in] → [B, L*2, d_in//2]
+    """
+
+    def __init__(self, d_in: int, n_heads: int, block_size: int = 128):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_in // n_heads
+        self.block_size = block_size
+        self.norm = nn.LayerNorm(d_in)
+        self.qkv = nn.Linear(d_in, 3 * d_in, bias=False)
+        self.out_proj = nn.Linear(d_in, d_in, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, d_in] → [B, L*2, d_in//2]
+        B, L, D = x.shape
+        H, dh, bs = self.n_heads, self.d_head, self.block_size
+        nb = L // bs
+
+        nx_b = self.norm(x).reshape(B * nb, bs, D)
+        q, k, v = self.qkv(nx_b).reshape(B * nb, bs, 3, H, dh).unbind(2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        x = x + self.out_proj(attn_out)
+
+        # Split-expand: double seq length, halve dim
+        return x.reshape(B, L * 2, D // 2)
+
+
 class ShrinkAttnLayer(nn.Module):
     """Full bidirectional attention (with residual) + linear projection down: d_in → d_out.
 
@@ -84,6 +123,41 @@ class ShrinkAttnLayer(nn.Module):
         return self.proj_down(self.norm2(x))  # no residual: dim changes
 
 
+class GrowAttnLayer(nn.Module):
+    """Full bidirectional attention (with residual) + linear projection up: d_in → d_out.
+
+    Inverse of ShrinkAttnLayer.
+    [B, L, d_in] → [B, L, d_out]
+    """
+
+    def __init__(self, d_in: int, n_heads: int, d_out: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_in // n_heads
+        self.norm1 = nn.LayerNorm(d_in)
+        self.qkv = nn.Linear(d_in, 3 * d_in, bias=False)
+        self.out_proj = nn.Linear(d_in, d_in, bias=False)
+        self.norm2 = nn.LayerNorm(d_in)
+        self.proj_up = nn.Linear(d_in, d_out, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, L, d_in] → [B, L, d_out]
+        B, L, D = x.shape
+        H, dh = self.n_heads, self.d_head
+        q, k, v = self.qkv(self.norm1(x)).reshape(B, L, 3, H, dh).unbind(2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        x = x + self.out_proj(attn_out)
+        return self.proj_up(self.norm2(x))  # no residual: dim changes
+
+
 # Sparse stage specs: (d_in, n_heads, block_size) — seq_len halves each stage via concat-merge
 # 4096→2048→1024→512→256 tokens, dim 16→32→64→128→256
 _SPARSE_STAGES = [(16, 1, 128), (32, 2, 128), (64, 4, 128), (128, 8, 128)]
@@ -91,6 +165,14 @@ _SPARSE_STAGES = [(16, 1, 128), (32, 2, 128), (64, 4, 128), (128, 8, 128)]
 # Shrink stage specs: (d_in, n_heads, d_out) — all at 256 tokens, full attention
 # 256→128→64→32→16→4→1, then flatten 256×1 → MLP → d_model
 _SHRINK_STAGES = [(256, 8, 128), (128, 4, 64), (64, 4, 32), (32, 4, 16), (16, 4, 4), (4, 2, 2)]
+
+# Grow stage specs (inverse of _SHRINK_STAGES): all at 256 tokens, dim expands each layer
+# 4→16→32→64→128→256 per-token dim (MLP outputs directly to d=4, skipping d=2 stage)
+_GROW_STAGES = [(4, 2, 16), (16, 4, 32), (32, 4, 64), (64, 4, 128), (128, 8, 256)]
+
+# Expand stage specs (inverse of _SPARSE_STAGES): block-local attention then split doubles seq
+# 256→512→1024→2048→4096 tokens, dim 256→128→64→32→16
+_EXPAND_STAGES = [(256, 8, 128), (128, 8, 128), (64, 4, 128), (32, 2, 128)]
 
 
 class ByteHourglassEncoder(nn.Module):
@@ -185,6 +267,61 @@ class ByteHourglassEncoder(nn.Module):
             x = layer(x)
         x = x.flatten(1)
         return self.mlp(x)
+
+
+class ByteHourglassDecoder(nn.Module):
+    """Decodes a d_model-dim embedding back to raw byte logits.
+
+    Inverse of ByteHourglassEncoder:
+      MLP(d_model → 1024 → 512) → reshape [N, 256, 2]
+      → 6 × GrowAttnLayer (full attention at 256 tokens, dim: 2→4→16→32→64→128→256)
+      → 4 × SparseAttnExpandLayer (block-local attn, split: 256→512→1024→2048→4096 tokens)
+      → Linear(16 → vocab_size) → [N, 4096, vocab_size]
+    """
+
+    def __init__(self, d_model: int = 512, window_size: int = 4096, vocab_size: int = 256):
+        super().__init__()
+        self.window_size = window_size
+
+        expand_tokens = window_size // (2 ** len(_EXPAND_STAGES))  # = 256
+        grow_in_dim = _GROW_STAGES[0][0]                           # = 4
+        mlp_out = expand_tokens * grow_in_dim                      # = 1024
+
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_out, bias=False),
+            nn.GELU(),
+        )
+        self.expand_tokens = expand_tokens
+        self.grow_in_dim = grow_in_dim
+
+        self.grow_layers = nn.ModuleList([
+            GrowAttnLayer(d_in, n_heads, d_out)
+            for d_in, n_heads, d_out in _GROW_STAGES
+        ])
+
+        self.expand_layers = nn.ModuleList([
+            SparseAttnExpandLayer(d_in, n_heads, block_size)
+            for d_in, n_heads, block_size in _EXPAND_STAGES
+        ])
+
+        byte_dim = _SPARSE_STAGES[0][0]  # = 16
+        self.to_logits = nn.Linear(byte_dim, vocab_size, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [N, d_model] → [N, window_size, vocab_size]
+        x = self.mlp(z)                                                   # [N, 512]
+        x = x.reshape(x.shape[0], self.expand_tokens, self.grow_in_dim)  # [N, 256, 2]
+        for layer in self.grow_layers:
+            x = layer(x)   # dim grows, seq stays 256
+        for layer in self.expand_layers:
+            x = layer(x)   # seq doubles, dim halves
+        return self.to_logits(x)                                          # [N, 4096, vocab_size]
 
 
 # ── Higher-level MLP components ───────────────────────────────────────────────

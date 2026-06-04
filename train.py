@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP, ContextEncoder, vicreg_components
+from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP, ByteHourglassDecoder, ContextEncoder, vicreg_components
 from data import build_dataset, _FINEWEB_VAL_DOCS
 
 
@@ -42,6 +42,7 @@ def save_checkpoint(hierarchy, optimizer, step, phase_idx, docs_consumed, cfg):
         "n_encoder_levels": len(hierarchy.levels),
         "decoder_keys": list(hierarchy.decoders.keys()),
         "token_decoder_levels": [int(k) for k, v in hierarchy.decoders.items() if isinstance(v, TokenDecoderMLP)],
+        "byte_hourglass_decoder_levels": [int(k) for k, v in hierarchy.decoders.items() if isinstance(v, ByteHourglassDecoder)],
         "docs_consumed": docs_consumed,
         "cfg": cfg,
     }
@@ -54,6 +55,7 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
     cfg = ckpt["cfg"]
     hierarchy = JEPAHierarchy(cfg).to(device)
     token_decoder_levels = ckpt.get("token_decoder_levels", [])
+    byte_hourglass_decoder_levels = ckpt.get("byte_hourglass_decoder_levels", [])
     for i in range(ckpt["n_encoder_levels"]):
         if i == 0:
             lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size, cfg.level0_dim_mask_mean)
@@ -62,7 +64,12 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
             lvl = JEPALevel(cfg.d_model, cfg.window_size, mask_dim)
         hierarchy.levels.append(lvl.to(device))
     for key in ckpt["decoder_keys"]:
-        if int(key) in token_decoder_levels:
+        level = int(key)
+        if level in byte_hourglass_decoder_levels:
+            hierarchy.decoders[key] = ByteHourglassDecoder(
+                cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
+            ).to(device)
+        elif level in token_decoder_levels:
             hierarchy.decoders[key] = TokenDecoderMLP(
                 cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
             ).to(device)
@@ -230,9 +237,20 @@ def train_encoder_level(
         lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
 
+    # Level-0 co-trains a ByteHourglassDecoder on target encoder output
+    decoder = decoder_optimizer = None
+    if is_level0:
+        if "0" not in hierarchy.decoders:
+            hierarchy.decoders["0"] = ByteHourglassDecoder(
+                cfg.d_model, cfg.level0_window_size, cfg.vocab_size
+            ).to(device)
+        decoder = hierarchy.decoders["0"]
+        from prodigyopt import Prodigy
+        decoder_optimizer = Prodigy(decoder.parameters(), lr=1.0, weight_decay=cfg.weight_decay)
+
     step = start_step
     last_ckpt_interval = step // cfg.checkpoint_interval
-    pred_sum = var_sum = cov_sum = 0.0
+    pred_sum = var_sum = cov_sum = recon_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
     pred_loss_ema = cfg.ema_pred_loss_target
@@ -333,6 +351,20 @@ def train_encoder_level(
                 ema_decay = cfg.ema_decay_start + (1.0 - cfg.ema_decay_start) * min(pred_loss_ema / cfg.ema_pred_loss_target, 1.0)
             jepa_level.update_ema(ema_decay)
 
+            # Decoder step: reconstruct bytes from target encoder output
+            if decoder is not None:
+                with autocast:
+                    byte_logits = decoder(target_out.detach())
+                    recon_loss = F.cross_entropy(
+                        byte_logits.reshape(-1, cfg.vocab_size),
+                        batch.reshape(-1).long(),
+                    )
+                decoder_optimizer.zero_grad()
+                recon_loss.backward()
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), cfg.grad_clip)
+                decoder_optimizer.step()
+                recon_sum += recon_loss.item()
+
             t_end = _sync()
             t_backward_sum += t_end - t0_backward
             step_ms = (t_end - t0_data) * 1000
@@ -358,7 +390,8 @@ def train_encoder_level(
                 avg_pred = pred_sum / loss_count
                 avg_var = var_sum / loss_count
                 avg_cov = cov_sum / loss_count
-                pred_sum = var_sum = cov_sum = 0.0
+                avg_recon = recon_sum / loss_count if decoder is not None else float("nan")
+                pred_sum = var_sum = cov_sum = recon_sum = 0.0
 
                 ms = 1000.0 / loss_count
                 t_data_ms    = t_data_sum    * ms
@@ -379,18 +412,20 @@ def train_encoder_level(
                 tokens_since_log = 0
 
                 drift_str = f"{drift:.6f}" if not math.isnan(drift) else "nan"
+                recon_str = f" | ce {avg_recon:.4f}" if decoder is not None else ""
                 print(
                     f"  enc-{level_idx + 1} {step:6d}/{cfg.encoder_iters_per_level} | "
-                    f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f} | "
+                    f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f}{recon_str} | "
                     f"val_pred {val_pred:.4f} | drift {drift_str} | "
                     f"{int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
                 )
+                recon_log = f"{avg_recon:.6f}" if decoder is not None else ""
                 log_writer.writerow([
                     global_step_offset + step,
                     phase_idx, "encoder", level_idx + 1, step,
                     f"{avg_pred:.6f}", f"{avg_var:.6f}", f"{avg_cov:.6f}",
                     f"{val_pred:.6f}", f"{val_var:.6f}", f"{val_cov:.6f}",
-                    "", "", "",
+                    recon_log, "", "",
                     f"{elapsed:.1f}", f"{tok_per_s:.0f}",
                     drift_str,
                 ])

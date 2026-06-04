@@ -35,7 +35,7 @@ class Config:
     # Non colinearity is not vital for the latent space but it is nice to have. Pushing for
     # it also makes sure that all scalars in the latent space is used. Which should in theory make training faster. Since more gradient can flow back.
     lambda_c_warmup: float = 0.1   # 512/2048
-    lambda_c: float = 0.005
+    lambda_c: float = 0.0
     lambda_c_warmup_steps: int = 40_000 # We assume that a foundation of non colinearity has been built up by step 40 000
     lambda_c_loss_cap: float = 0.01  # cap cov contribution to at most this fraction of pred_loss
 
