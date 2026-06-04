@@ -15,7 +15,7 @@ class Config:
     level0_window_size: int = 4096  # bytes per level-0 window (= sequence length for level-0 training)
     level0_batch_size: int = 128     # batch size for level-0 training phases
     level0_mask_ratio: float = 0.75 # fraction of byte tokens masked at level 0
-    level0_dim_mask_mean: float = 0.96 # average fraction of dims zeroed per masked token
+    level0_dim_mask_mean: float = 0.80 # average fraction of dims zeroed per masked token
 
     # Masking for levels 1+ (dimension-level masking)
     mask_ratio: float = (1/4) * 3.0
@@ -35,8 +35,9 @@ class Config:
     # Non colinearity is not vital for the latent space but it is nice to have. Pushing for
     # it also makes sure that all scalars in the latent space is used. Which should in theory make training faster. Since more gradient can flow back.
     lambda_c_warmup: float = 0.1   # 512/2048
-    lambda_c: float = 0.00
+    lambda_c: float = 0.005
     lambda_c_warmup_steps: int = 40_000 # We assume that a foundation of non colinearity has been built up by step 40 000
+    lambda_c_loss_cap: float = 0.01  # cap cov contribution to at most this fraction of pred_loss
 
     # Hysteresis thresholds for auto-enabling/disabling variance loss
     var_loss_enable_threshold: float = 0.0015
@@ -64,7 +65,7 @@ class Config:
     grad_clip: float = 1.0
 
     # Training iterations per level
-    encoder_iters_per_level: int = 970_000
+    encoder_iters_per_level: int = 1970_000
     decoder_iters_per_level: int = 125_000
 
     # Evaluation

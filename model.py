@@ -175,6 +175,17 @@ class ByteHourglassEncoder(nn.Module):
         x = x.flatten(1)    # [N, 256, 2] → [N, 512]
         return self.mlp(x)  # [N, d_model]
 
+    def forward_from_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """Run encoder from pre-computed byte embeddings [N, L, 16], skipping the lookup."""
+        positions = torch.arange(self.window_size, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(positions)
+        for layer in self.sparse_layers:
+            x = layer(x)
+        for layer in self.shrink_layers:
+            x = layer(x)
+        x = x.flatten(1)
+        return self.mlp(x)
+
 
 # ── Higher-level MLP components ───────────────────────────────────────────────
 

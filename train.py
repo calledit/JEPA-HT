@@ -313,7 +313,7 @@ def train_encoder_level(
             # Cap covariance contribution to at most half the prediction loss
             cov_val = cov_loss.item()
             if lc > 0 and cov_val > 0:
-                lc = min(lc, 0.5 * pred_loss.item() / cov_val)
+                lc = min(lc, cfg.lambda_c_loss_cap * pred_loss.item() / cov_val)
 
             loss = pred_loss + lv * var_loss + lc * cov_loss
 
