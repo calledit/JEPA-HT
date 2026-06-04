@@ -104,6 +104,7 @@ class ShrinkAttnLayer(nn.Module):
         self.out_proj = nn.Linear(d_in, d_in, bias=False)
         self.norm2 = nn.LayerNorm(d_in)
         self.proj_down = nn.Linear(d_in, d_out, bias=False)
+        self.shortcut = nn.Linear(d_in, d_out, bias=False)
         self._init_weights()
 
     def _init_weights(self):
@@ -120,7 +121,7 @@ class ShrinkAttnLayer(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         x = x + self.out_proj(attn_out)
-        return self.proj_down(self.norm2(x))  # no residual: dim changes
+        return self.proj_down(self.norm2(x)) + self.shortcut(x)
 
 
 class GrowAttnLayer(nn.Module):
@@ -139,6 +140,7 @@ class GrowAttnLayer(nn.Module):
         self.out_proj = nn.Linear(d_in, d_in, bias=False)
         self.norm2 = nn.LayerNorm(d_in)
         self.proj_up = nn.Linear(d_in, d_out, bias=False)
+        self.shortcut = nn.Linear(d_in, d_out, bias=False)
         self._init_weights()
 
     def _init_weights(self):
@@ -155,7 +157,7 @@ class GrowAttnLayer(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         x = x + self.out_proj(attn_out)
-        return self.proj_up(self.norm2(x))  # no residual: dim changes
+        return self.proj_up(self.norm2(x)) + self.shortcut(x)
 
 
 # Sparse stage specs: (d_in, n_heads, block_size) — seq_len halves each stage via concat-merge
@@ -275,18 +277,16 @@ class ByteHourglassEncoder(nn.Module):
 
 
 class ByteFunnelDecoder(nn.Module):
-    """Predicts byte embeddings for the first n_chars bytes from a d_model latent.
+    """Predicts byte logits for the first n_chars bytes from a d_model latent.
 
-    Simple MLP funnel: d_model → 512 → 768 → 1024 → (n_chars * byte_embed_dim)
-    Output: [N, n_chars, byte_embed_dim] — predicted byte embeddings.
-    Train with MSE against encoder.embedding(byte_ids[:, :n_chars]).
-    Snap to nearest embedding table entry at inference to recover byte IDs.
+    MLP funnel: d_model → 512 → 768 → 1024 → (n_chars * 256)
+    Output: [N, n_chars, 256] — logits over the byte vocabulary.
+    Train with cross-entropy against the target byte IDs.
     """
 
-    def __init__(self, d_model: int = 512, n_chars: int = 128, byte_embed_dim: int = 16):
+    def __init__(self, d_model: int = 512, n_chars: int = 128):
         super().__init__()
         self.n_chars = n_chars
-        self.byte_embed_dim = byte_embed_dim
         self.net = nn.Sequential(
             nn.Linear(d_model, 512, bias=False),
             nn.GELU(),
@@ -294,7 +294,7 @@ class ByteFunnelDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(768, 1024, bias=False),
             nn.GELU(),
-            nn.Linear(1024, n_chars * byte_embed_dim, bias=False),
+            nn.Linear(1024, n_chars * 256, bias=False),
         )
         self._init_weights()
 
@@ -304,14 +304,12 @@ class ByteFunnelDecoder(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: [N, d_model] → [N, n_chars, byte_embed_dim]
-        return self.net(z).reshape(z.shape[0], self.n_chars, self.byte_embed_dim)
+        # z: [N, d_model] → [N, n_chars, 256]
+        return self.net(z).reshape(z.shape[0], self.n_chars, 256)
 
-    def decode_bytes(self, z: torch.Tensor, emb_weight: torch.Tensor) -> torch.Tensor:
-        """Snap predicted embeddings to nearest byte. Returns [N, n_chars] int64."""
-        pred = self.forward(z).float()                              # [N, n_chars, 16]
-        dists = torch.cdist(pred, emb_weight.float())              # [N, n_chars, 256]
-        return dists.argmin(dim=-1)                                 # [N, n_chars]
+    def decode_bytes(self, z: torch.Tensor) -> torch.Tensor:
+        """Returns predicted byte IDs [N, n_chars] via argmax."""
+        return self.forward(z).argmax(dim=-1)
 
 
 # ── Higher-level MLP components ───────────────────────────────────────────────
@@ -425,6 +423,38 @@ class Predictor(nn.Module):
         return self.net(torch.cat([context, mask_emb], dim=-1))
 
 
+class Level0Predictor(nn.Module):
+    """Predictor for level 0: outputs JEPA prediction + byte logits for the masked final byte.
+
+    Returns (pred [N, d_model], byte_logits [N, 256]).
+    """
+
+    def __init__(self, d_model: int = 512, mask_dim: int = 4096):
+        super().__init__()
+        self.d_model = d_model
+        self.mask_proj = nn.Linear(mask_dim, d_model, bias=False)
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2, 512, bias=False),
+            nn.GELU(),
+            nn.Linear(512, 512, bias=False),
+            nn.GELU(),
+            nn.Linear(512, 512, bias=False),
+            nn.GELU(),
+            nn.Linear(512, d_model + 256, bias=False),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, context: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mask_emb = self.mask_proj(mask)
+        out = self.net(torch.cat([context, mask_emb], dim=-1))
+        return out[:, :self.d_model], out[:, self.d_model:]
+
+
 class JEPALevel(nn.Module):
     """One JEPA encoder level: context encoder + predictor, EMA target encoder.
 
@@ -446,7 +476,7 @@ class JEPALevel(nn.Module):
         obj = object.__new__(cls)
         nn.Module.__init__(obj)
         obj.context_enc = ByteHourglassEncoder(d_model, window_size, dim_mask_mean)
-        obj.predictor = Predictor(d_model, mask_dim=window_size)  # mask is [N, window_size]
+        obj.predictor = Level0Predictor(d_model, mask_dim=window_size)
         obj.target_enc = copy.deepcopy(obj.context_enc)
         for p in obj.target_enc.parameters():
             p.requires_grad_(False)
@@ -468,12 +498,10 @@ class JEPALevel(nn.Module):
 
     def forward_context(self, x: torch.Tensor, mask: torch.Tensor,
                         token_mask: torch.Tensor = None) -> torch.Tensor:
-        """Context encoder + predictor."""
-        if token_mask is not None:
-            context = self.context_enc(x, token_mask=token_mask)
-        else:
-            context = self.context_enc(x)
-        return self.predictor(context, mask)
+        """Context encoder + predictor. Returns prediction only (strips byte logits if present)."""
+        context = self.context_enc(x, token_mask=token_mask) if token_mask is not None else self.context_enc(x)
+        result = self.predictor(context, mask)
+        return result[0] if isinstance(result, tuple) else result
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor, token_mask: torch.Tensor = None) -> torch.Tensor:
@@ -510,6 +538,14 @@ class JEPAHierarchy(nn.Module):
         """
         mask = (torch.rand_like(windows) < self.cfg.mask_ratio).float()
         return windows * (1.0 - mask), mask
+
+    def get_last_content_byte_ids(self, byte_ids: torch.Tensor) -> torch.Tensor:
+        """Returns the byte ID at the last non-null position per sequence [N]."""
+        N, L = byte_ids.shape
+        is_content = (byte_ids != 0).float()
+        positions = torch.arange(L, device=byte_ids.device).float()
+        last_content = (is_content * positions).argmax(dim=1)  # [N]
+        return byte_ids[torch.arange(N, device=byte_ids.device), last_content]
 
     def get_force_full_mask(self, byte_ids: torch.Tensor) -> torch.Tensor:
         """Returns [N, L] float mask (1.0 = zero all dims).

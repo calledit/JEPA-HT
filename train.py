@@ -108,7 +108,7 @@ def eval_encoder(level_idx, hierarchy, val_data, cfg, probe=None):
             force_full = hierarchy.get_force_full_mask(flat_ids)
             token_mask = torch.maximum(token_mask, force_full)
             context_emb = jepa_level.context_enc(flat_ids, token_mask=token_mask, force_full_dim_mask=force_full)
-            pred_out = jepa_level.predictor(context_emb, token_mask)
+            pred_out, _ = jepa_level.predictor(context_emb, token_mask)
         else:
             prev_embs = hierarchy.encode_to_level(batch, level_idx)
             windows = hierarchy.extract_windows(prev_embs)
@@ -183,13 +183,12 @@ def eval_decoder(level_idx, hierarchy, val_data, cfg) -> tuple[float, float, flo
         B, L_N, _ = embs_N.shape
 
         if level_idx == 0:
-            logits = decoder(embs_N.reshape(B * L_N, D))  # [B*L_N, ws0, vocab]
-            # targets: byte IDs for each level-0 window
-            byte_windows = hierarchy.extract_byte_windows(batch)  # [B, N_w0, ws0]
-            token_targets = byte_windows.reshape(B * L_N * cfg.level0_window_size)
+            logits = decoder(embs_N.reshape(B * L_N, D))        # [B*L_N, n_chars, 256]
+            byte_windows = hierarchy.extract_byte_windows(batch) # [B, N_w0, ws0]
+            target_bytes = byte_windows.reshape(B * L_N, cfg.level0_window_size)[:, :decoder.n_chars]
             total_recon += F.cross_entropy(
-                logits.reshape(B * L_N * cfg.level0_window_size, cfg.vocab_size),
-                token_targets
+                logits.reshape(B * L_N * decoder.n_chars, 256),
+                target_bytes.reshape(-1),
             ).item()
         else:
             embs_N1 = hierarchy.encode_to_level(batch, level_idx)
@@ -237,13 +236,8 @@ def train_encoder_level(
         lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
 
-    # Level-0 co-trains a ByteHourglassDecoder on target encoder output
     decoder = decoder_optimizer = None
     if is_level0:
-        if "0" not in hierarchy.decoders:
-            hierarchy.decoders["0"] = ByteHourglassDecoder(
-                cfg.d_model, cfg.level0_window_size, cfg.vocab_size
-            ).to(device)
         if "0" not in hierarchy.decoders or not isinstance(hierarchy.decoders["0"], ByteFunnelDecoder):
             hierarchy.decoders["0"] = ByteFunnelDecoder(cfg.d_model).to(device)
         decoder = hierarchy.decoders["0"]
@@ -252,7 +246,7 @@ def train_encoder_level(
 
     step = start_step
     last_ckpt_interval = step // cfg.checkpoint_interval
-    pred_sum = var_sum = cov_sum = recon_sum = 0.0
+    pred_sum = var_sum = cov_sum = byte_sum = byte_acc_sum = pred_recon_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
     pred_loss_ema = cfg.ema_pred_loss_target
@@ -298,7 +292,7 @@ def train_encoder_level(
                 token_mask = torch.maximum(token_mask, force_full)
                 with autocast:
                     context_emb = jepa_level.context_enc(batch, token_mask=token_mask, force_full_dim_mask=force_full)
-                    pred_out = jepa_level.predictor(context_emb, token_mask)
+                    pred_out, byte_logits = jepa_level.predictor(context_emb, token_mask)
             else:
                 with torch.no_grad(), autocast:
                     prev_embs = hierarchy.encode_to_level(batch, level_idx)
@@ -337,15 +331,37 @@ def train_encoder_level(
             if lc > 0 and cov_val > 0:
                 lc = min(lc, cfg.lambda_c_loss_cap * pred_loss.item() / cov_val)
 
-            loss = pred_loss + lv * var_loss + lc * cov_loss
+            if is_level0:
+                target_bytes = hierarchy.get_last_content_byte_ids(batch)
+                byte_loss = cfg.byte_loss_weight * F.cross_entropy(byte_logits, target_bytes)
+            else:
+                byte_loss = pred_loss.new_tensor(0.0)
+
+            if is_level0 and cfg.decoder_on_predictor and decoder is not None:
+                decoder_target_bytes = batch[:, :decoder.n_chars]      # [B, n_chars]
+                with autocast:
+                    pred_recon = decoder(pred_out)                     # [B, n_chars, 256]
+                    pred_recon_loss = F.cross_entropy(
+                        pred_recon.reshape(-1, 256), decoder_target_bytes.reshape(-1)
+                    )
+                pred_recon_sum += pred_recon_loss.item()
+            else:
+                pred_recon_loss = pred_loss.new_tensor(0.0)
+
+            loss = pred_loss + lv * var_loss + lc * cov_loss + byte_loss + pred_recon_loss
 
             optimizer.zero_grad()
+            if decoder is not None:
+                decoder_optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(jepa_level.context_enc.parameters()) + list(jepa_level.predictor.parameters()),
                 cfg.grad_clip
             )
             optimizer.step()
+            if is_level0 and cfg.decoder_on_predictor and decoder is not None:
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), cfg.grad_clip)
+                decoder_optimizer.step()
             for pg in optimizer.param_groups:
                 pg["lr"] = get_lr(step, cfg)
             pred_loss_ema = cfg.ema_loss_smooth * pred_loss_ema + (1 - cfg.ema_loss_smooth) * pred_loss.item()
@@ -355,19 +371,18 @@ def train_encoder_level(
                 ema_decay = cfg.ema_decay_start + (1.0 - cfg.ema_decay_start) * min(pred_loss_ema / cfg.ema_pred_loss_target, 1.0)
             jepa_level.update_ema(ema_decay)
 
-            # Decoder step: predict byte embeddings for first n_chars bytes
-            if decoder is not None:
-                target_embs = jepa_level.target_enc.embedding(
-                    batch[:, :decoder.n_chars]
-                ).detach()                                          # [B, n_chars, 16]
-                with autocast:
-                    pred_embs = decoder(target_out.detach())        # [B, n_chars, 16]
-                    recon_loss = F.mse_loss(pred_embs, target_embs)
-                decoder_optimizer.zero_grad()
-                recon_loss.backward()
-                torch.nn.utils.clip_grad_norm_(decoder.parameters(), cfg.grad_clip)
-                decoder_optimizer.step()
-                recon_sum += recon_loss.item()
+            if is_level0 and step % 50 == 0:
+                ids = batch[0].cpu().tolist()
+                true_byte = target_bytes[0].item()
+                pred_byte = byte_logits[0].argmax().item()
+                is_content = [b != 0 for b in ids]
+                last_idx = max(i for i, v in enumerate(is_content) if v)
+                context_bytes = ids[max(0, last_idx - 40): last_idx]
+                context_str = bytes(context_bytes).decode("utf-8", errors="replace").replace("\n", "↵")
+                true_char = bytes([true_byte]).decode("utf-8", errors="replace")
+                pred_char = bytes([pred_byte]).decode("utf-8", errors="replace")
+                correct = "✓" if pred_byte == true_byte else "✗"
+                print(f"  [{correct}] ...{context_str}[{true_char}]  pred={repr(pred_char)}", flush=True)
 
             t_end = _sync()
             t_backward_sum += t_end - t0_backward
@@ -378,6 +393,9 @@ def train_encoder_level(
             pred_sum += pred_loss.item()
             var_sum += var_loss.item()
             cov_sum += cov_loss.item()
+            byte_sum += byte_loss.item()
+            if is_level0:
+                byte_acc_sum += (byte_logits.argmax(dim=-1) == target_bytes).float().mean().item()
             loss_count += 1
 
             # print(
@@ -394,8 +412,11 @@ def train_encoder_level(
                 avg_pred = pred_sum / loss_count
                 avg_var = var_sum / loss_count
                 avg_cov = cov_sum / loss_count
-                avg_recon = recon_sum / loss_count if decoder is not None else float("nan")
-                pred_sum = var_sum = cov_sum = recon_sum = 0.0
+                avg_recon = float("nan")
+                avg_byte = byte_sum / loss_count
+                avg_byte_acc = byte_acc_sum / loss_count
+                avg_pred_recon = pred_recon_sum / loss_count
+                pred_sum = var_sum = cov_sum = byte_sum = byte_acc_sum = pred_recon_sum = 0.0
 
                 ms = 1000.0 / loss_count
                 t_data_ms    = t_data_sum    * ms
@@ -417,9 +438,11 @@ def train_encoder_level(
 
                 drift_str = f"{drift:.6f}" if not math.isnan(drift) else "nan"
                 recon_str = f" | ce {avg_recon:.4f}" if decoder is not None else ""
+                byte_str = f" | byte {avg_byte:.4f} ({avg_byte_acc*100:.1f}%)" if is_level0 else ""
+                pred_recon_str = f" | pred_recon {avg_pred_recon:.4f}" if (is_level0 and cfg.decoder_on_predictor) else ""
                 print(
                     f"  enc-{level_idx + 1} {step:6d}/{cfg.encoder_iters_per_level} | "
-                    f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f}{recon_str} | "
+                    f"pred {avg_pred:.4f} | var {avg_var:.4f} | cov {avg_cov:.4f}{recon_str}{byte_str}{pred_recon_str} | "
                     f"val_pred {val_pred:.4f} | drift {drift_str} | "
                     f"{int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
                 )

@@ -34,9 +34,9 @@ class Config:
 
     # Non colinearity is not vital for the latent space but it is nice to have. Pushing for
     # it also makes sure that all scalars in the latent space is used. Which should in theory make training faster. Since more gradient can flow back.
-    lambda_c_warmup: float = 0.1   # 512/2048
+    lambda_c_warmup: float = 0.0   # 512/2048
     lambda_c: float = 0.0
-    lambda_c_warmup_steps: int = 40_000 # We assume that a foundation of non colinearity has been built up by step 40 000
+    lambda_c_warmup_steps: int = 12_000 # We assume that a foundation of non colinearity has been built up by step 40 000
     lambda_c_loss_cap: float = 0.01  # cap cov contribution to at most this fraction of pred_loss
 
     # Hysteresis thresholds for auto-enabling/disabling variance loss
@@ -47,6 +47,8 @@ class Config:
     decoder_recon_weight: float = 1.0
     decoder_semantic_weight: float = 0.01
     decoder_ce_weight: float = 1.0   # cross-entropy weight for level-0 decoder byte recovery
+    byte_loss_weight: float = 0.05    # weight for predictor byte CE loss (final masked byte)
+    decoder_on_predictor: bool = True  # attach decoder to predictor output and add reconstruction loss
     decoder_ce_tokens: int = 16384   # max byte positions sampled per step for CE loss (cost control)
     decoder_ce_start_step: int = 5_000  # step at which CE loss activates for level-0 decoder
     lambda_overlap: float = 0.0
