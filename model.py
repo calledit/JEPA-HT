@@ -160,6 +160,156 @@ class GrowAttnLayer(nn.Module):
         return self.proj_up(self.norm2(x)) + self.shortcut(x)
 
 
+# ── Bidirectional sparse-attention transformer encoder (level 0) ──────────────
+
+class _SparseTransformerBlock(nn.Module):
+    """Pre-norm bidirectional transformer block with blocked local attention.
+
+    Queries in each block of `block_size` tokens attend to the same block plus
+    its immediate left and right neighbours (3×block_size K/V total), giving
+    every token ≥±block_size tokens of context with no attention mask, so
+    Flash Attention can be used throughout.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, ffn_dim: int, block_size: int, seq_len: int):
+        super().__init__()
+        assert seq_len % block_size == 0, "seq_len must be divisible by block_size"
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.block_size = block_size
+        self.n_blocks = seq_len // block_size
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff1 = nn.Linear(d_model, ffn_dim, bias=False)
+        self.ff2 = nn.Linear(ffn_dim, d_model, bias=False)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, D = x.shape
+        H, dh, W, n = self.n_heads, self.d_head, self.block_size, self.n_blocks
+
+        q, k, v = self.qkv(self.norm1(x)).reshape(B, L, 3, H, dh).unbind(2)
+        # [B, L, H, dh] → [B, n, H, W, dh]
+        q = q.reshape(B, n, W, H, dh).permute(0, 1, 3, 2, 4)
+        k = k.reshape(B, n, W, H, dh).permute(0, 1, 3, 2, 4)
+        v = v.reshape(B, n, W, H, dh).permute(0, 1, 3, 2, 4)
+
+        # Pad block dim by repeating boundary blocks: [B, n+2, H, W, dh]
+        k_pad = torch.cat([k[:, :1], k, k[:, -1:]], dim=1)
+        v_pad = torch.cat([v[:, :1], v, v[:, -1:]], dim=1)
+
+        # Each query block i gets K/V from blocks [i-1, i, i+1]: [B, n, H, 3W, dh]
+        k_cat = torch.cat([k_pad[:, 0:n], k_pad[:, 1:n+1], k_pad[:, 2:n+2]], dim=-2)
+        v_cat = torch.cat([v_pad[:, 0:n], v_pad[:, 1:n+1], v_pad[:, 2:n+2]], dim=-2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q.reshape(B * n, H, W, dh),
+            k_cat.reshape(B * n, H, 3 * W, dh),
+            v_cat.reshape(B * n, H, 3 * W, dh),
+        )  # [B*n, H, W, dh]
+        attn_out = attn_out.reshape(B, n, H, W, dh).permute(0, 1, 3, 2, 4).reshape(B, L, D)
+        x = x + self.out_proj(attn_out)
+        x = x + self.ff2(F.gelu(self.ff1(self.norm2(x))))
+        return x
+
+
+class ByteSparseTransformerEncoder(nn.Module):
+    """Encodes a window of raw bytes to a single d_model-dim embedding.
+
+    Architecture:
+      nn.Embedding(256, 48) + learned positional embedding(512, 48)
+      → 8 × bidirectional transformer layer (d=48, n_heads=8, ±64 sparse attention)
+      → per-token funnel: Linear(48→32) → GELU → Linear(32→1) → [N, 512, 1]
+      → flatten [N, 512]
+      → MLP: Linear(512→1024) → GELU → Linear(1024→d_model)
+    """
+
+    _D_INNER = 32
+    _N_LAYERS = 4
+    _N_HEADS = 4
+    _FFN_DIM = 128      # 4 × _D_INNER
+    _ATTN_WINDOW = 64
+    _FUNNEL_MID = 16
+
+    def __init__(self, d_model: int = 512, window_size: int = 512, dim_mask_mean: float = 0.9):
+        super().__init__()
+        self.window_size = window_size
+        self.dim_mask_exp = (1.0 - dim_mask_mean) / dim_mask_mean
+
+        D = self._D_INNER
+        self.embedding = nn.Embedding(256, D)
+        self.pos_embedding = nn.Embedding(window_size, D)
+
+        self.layers = nn.ModuleList([
+            _SparseTransformerBlock(D, self._N_HEADS, self._FFN_DIM, self._ATTN_WINDOW, window_size)
+            for _ in range(self._N_LAYERS)
+        ])
+
+        self.token_funnel = nn.Sequential(
+            nn.Linear(D, self._FUNNEL_MID, bias=False),
+            nn.GELU(),
+            nn.Linear(self._FUNNEL_MID, 1, bias=False),
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(window_size, 1024, bias=False),
+            nn.GELU(),
+            nn.Linear(1024, d_model, bias=False),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        nn.init.normal_(self.pos_embedding.weight, std=0.02)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, byte_ids: torch.Tensor, token_mask: torch.Tensor = None,
+                force_full_dim_mask: torch.Tensor = None) -> torch.Tensor:
+        # byte_ids: [N, window_size] int64
+        positions = torch.arange(self.window_size, device=byte_ids.device).unsqueeze(0)
+        x = self.embedding(byte_ids) + self.pos_embedding(positions)  # [N, L, 48]
+
+        if token_mask is not None:
+            m = token_mask.unsqueeze(-1)                          # [N, L, 1]
+            x = x.detach() * m + x * (1.0 - m)
+
+            r = torch.rand(x.shape[0], x.shape[1], 1, device=x.device).pow(self.dim_mask_exp)
+            noise = torch.rand_like(x)
+            dim_mask = (noise < r).float()
+            no_dim = (dim_mask.sum(-1, keepdim=True) == 0)
+            forced = torch.zeros_like(dim_mask).scatter_(-1, noise.argmin(-1, keepdim=True), 1.0)
+            dim_mask = torch.where(no_dim, forced, dim_mask) * m
+            x = x * (1.0 - dim_mask)
+
+        if force_full_dim_mask is not None:
+            x = x * (1.0 - force_full_dim_mask.unsqueeze(-1))
+
+        for layer in self.layers:
+            x = layer(x)                          # [N, L, 48]
+
+        x = self.token_funnel(x).squeeze(-1)      # [N, L]
+        return self.mlp(x)                         # [N, d_model]
+
+    def forward_from_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        """Run encoder from pre-computed byte embeddings [N, L, 48], skipping the lookup."""
+        positions = torch.arange(self.window_size, device=x.device).unsqueeze(0)
+        x = x + self.pos_embedding(positions)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.token_funnel(x).squeeze(-1)
+        return self.mlp(x)
+
+
 # Sparse stage specs: (d_in, n_heads, block_size) — seq_len halves each stage via concat-merge
 # 4096→2048→1024→512→256 tokens, dim 16→32→64→128→256
 _SPARSE_STAGES = [(16, 1, 128), (32, 2, 128), (64, 4, 128), (128, 8, 128)]
@@ -475,7 +625,7 @@ class JEPALevel(nn.Module):
         """Construct a level-0 JEPALevel with ByteHourglassEncoder."""
         obj = object.__new__(cls)
         nn.Module.__init__(obj)
-        obj.context_enc = ByteHourglassEncoder(d_model, window_size, dim_mask_mean)
+        obj.context_enc = ByteSparseTransformerEncoder(d_model, window_size, dim_mask_mean)
         obj.predictor = Level0Predictor(d_model, mask_dim=window_size)
         obj.target_enc = copy.deepcopy(obj.context_enc)
         for p in obj.target_enc.parameters():

@@ -340,7 +340,7 @@ def train_encoder_level(
             if is_level0 and cfg.decoder_on_predictor and decoder is not None:
                 decoder_target_bytes = batch[:, :decoder.n_chars]      # [B, n_chars]
                 with autocast:
-                    pred_recon = decoder(pred_out)                     # [B, n_chars, 256]
+                    pred_recon = decoder(context_emb)                  # [B, n_chars, 256]
                     pred_recon_loss = F.cross_entropy(
                         pred_recon.reshape(-1, 256), decoder_target_bytes.reshape(-1)
                     )
@@ -348,7 +348,7 @@ def train_encoder_level(
             else:
                 pred_recon_loss = pred_loss.new_tensor(0.0)
 
-            loss = pred_loss + lv * var_loss + lc * cov_loss + byte_loss + pred_recon_loss
+            loss = pred_loss.new_tensor(0.0) + lv * var_loss + lc * cov_loss + byte_loss + pred_recon_loss  # pred_loss temporarily zeroed
 
             optimizer.zero_grad()
             if decoder is not None:

@@ -12,9 +12,9 @@ class Config:
     n_levels: int = 4
 
     # Level-0 byte encoder (ByteHourglassEncoder)
-    level0_window_size: int = 4096  # bytes per level-0 window (= sequence length for level-0 training)
+    level0_window_size: int = 512   # bytes per level-0 window (= sequence length for level-0 training)
     level0_batch_size: int = 128     # batch size for level-0 training phases
-    level0_mask_ratio: float = 0.75 # fraction of byte tokens masked at level 0
+    level0_mask_ratio: float = 0.05 # fraction of byte tokens masked at level 0
     level0_dim_mask_mean: float = 0.80 # average fraction of dims zeroed per masked token
 
     # Masking for levels 1+ (dimension-level masking)
@@ -28,8 +28,8 @@ class Config:
     ema_adaptive_start_step: int = 0  # steps before adaptive EMA activates
 
     # VICReg weights — warmup values used before the switch steps, then full values after
-    lambda_v_warmup: float = 25.0
-    lambda_v: float = 15.0
+    lambda_v_warmup: float = 0
+    lambda_v: float = 0.0
     lambda_v_warmup_steps: int = 10_000
 
     # Non colinearity is not vital for the latent space but it is nice to have. Pushing for
@@ -48,7 +48,7 @@ class Config:
     decoder_semantic_weight: float = 0.01
     decoder_ce_weight: float = 1.0   # cross-entropy weight for level-0 decoder byte recovery
     byte_loss_weight: float = 0.05    # weight for predictor byte CE loss (final masked byte)
-    decoder_on_predictor: bool = True  # attach decoder to predictor output and add reconstruction loss
+    decoder_on_predictor: bool = True  # attach decoder in parallel with predictor (both read context_emb)
     decoder_ce_tokens: int = 16384   # max byte positions sampled per step for CE loss (cost control)
     decoder_ce_start_step: int = 5_000  # step at which CE loss activates for level-0 decoder
     lambda_overlap: float = 0.0
@@ -59,10 +59,10 @@ class Config:
     batch_size: int = 4
 
     # Optimizer
-    lr: float = 3e-4
+    lr: float = 3e-3
     lr_warmup_steps: int = 2_000    # linear warmup from 0 → lr
     lr_end_decay_step: int = 450_000  # step at which lr_min is reached; held flat after
-    lr_min: float = 3e-4            # cosine decay floor
+    lr_min: float = 3e-3            # cosine decay floor
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 
