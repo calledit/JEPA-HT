@@ -225,9 +225,11 @@ class ByteHourglassEncoder(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, byte_ids: torch.Tensor, token_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, byte_ids: torch.Tensor, token_mask: torch.Tensor = None,
+                force_full_dim_mask: torch.Tensor = None) -> torch.Tensor:
         # byte_ids: [N, window_size] int64
         # token_mask: [N, window_size] float (1.0=masked, 0.0=kept), or None
+        # force_full_dim_mask: [N, window_size] float (1.0=zero all dims), or None
         positions = torch.arange(self.window_size, device=byte_ids.device).unsqueeze(0)
         x = self.embedding(byte_ids) + self.pos_embedding(positions)  # [N, L, 16]
 
@@ -247,6 +249,9 @@ class ByteHourglassEncoder(nn.Module):
             forced = torch.zeros_like(dim_mask).scatter_(-1, noise.argmin(-1, keepdim=True), 1.0)
             dim_mask = torch.where(no_dim, forced, dim_mask) * m  # [N, L, 16]
             x = x * (1.0 - dim_mask)
+
+        if force_full_dim_mask is not None:
+            x = x * (1.0 - force_full_dim_mask.unsqueeze(-1))
 
         for layer in self.sparse_layers:
             x = layer(x)   # [N, L/2, 2D] each pass
@@ -269,43 +274,28 @@ class ByteHourglassEncoder(nn.Module):
         return self.mlp(x)
 
 
-class ByteHourglassDecoder(nn.Module):
-    """Decodes a d_model-dim embedding back to raw byte logits.
+class ByteFunnelDecoder(nn.Module):
+    """Predicts byte embeddings for the first n_chars bytes from a d_model latent.
 
-    Inverse of ByteHourglassEncoder:
-      MLP(d_model → 1024 → 512) → reshape [N, 256, 2]
-      → 6 × GrowAttnLayer (full attention at 256 tokens, dim: 2→4→16→32→64→128→256)
-      → 4 × SparseAttnExpandLayer (block-local attn, split: 256→512→1024→2048→4096 tokens)
-      → Linear(16 → vocab_size) → [N, 4096, vocab_size]
+    Simple MLP funnel: d_model → 512 → 768 → 1024 → (n_chars * byte_embed_dim)
+    Output: [N, n_chars, byte_embed_dim] — predicted byte embeddings.
+    Train with MSE against encoder.embedding(byte_ids[:, :n_chars]).
+    Snap to nearest embedding table entry at inference to recover byte IDs.
     """
 
-    def __init__(self, d_model: int = 512, window_size: int = 4096, vocab_size: int = 256):
+    def __init__(self, d_model: int = 512, n_chars: int = 128, byte_embed_dim: int = 16):
         super().__init__()
-        self.window_size = window_size
-
-        expand_tokens = window_size // (2 ** len(_EXPAND_STAGES))  # = 256
-        grow_in_dim = _GROW_STAGES[0][0]                           # = 4
-        mlp_out = expand_tokens * grow_in_dim                      # = 1024
-
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_out, bias=False),
+        self.n_chars = n_chars
+        self.byte_embed_dim = byte_embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(d_model, 512, bias=False),
             nn.GELU(),
+            nn.Linear(512, 768, bias=False),
+            nn.GELU(),
+            nn.Linear(768, 1024, bias=False),
+            nn.GELU(),
+            nn.Linear(1024, n_chars * byte_embed_dim, bias=False),
         )
-        self.expand_tokens = expand_tokens
-        self.grow_in_dim = grow_in_dim
-
-        self.grow_layers = nn.ModuleList([
-            GrowAttnLayer(d_in, n_heads, d_out)
-            for d_in, n_heads, d_out in _GROW_STAGES
-        ])
-
-        self.expand_layers = nn.ModuleList([
-            SparseAttnExpandLayer(d_in, n_heads, block_size)
-            for d_in, n_heads, block_size in _EXPAND_STAGES
-        ])
-
-        byte_dim = _SPARSE_STAGES[0][0]  # = 16
-        self.to_logits = nn.Linear(byte_dim, vocab_size, bias=False)
         self._init_weights()
 
     def _init_weights(self):
@@ -314,14 +304,14 @@ class ByteHourglassDecoder(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: [N, d_model] → [N, window_size, vocab_size]
-        x = self.mlp(z)                                                   # [N, 512]
-        x = x.reshape(x.shape[0], self.expand_tokens, self.grow_in_dim)  # [N, 256, 2]
-        for layer in self.grow_layers:
-            x = layer(x)   # dim grows, seq stays 256
-        for layer in self.expand_layers:
-            x = layer(x)   # seq doubles, dim halves
-        return self.to_logits(x)                                          # [N, 4096, vocab_size]
+        # z: [N, d_model] → [N, n_chars, byte_embed_dim]
+        return self.net(z).reshape(z.shape[0], self.n_chars, self.byte_embed_dim)
+
+    def decode_bytes(self, z: torch.Tensor, emb_weight: torch.Tensor) -> torch.Tensor:
+        """Snap predicted embeddings to nearest byte. Returns [N, n_chars] int64."""
+        pred = self.forward(z).float()                              # [N, n_chars, 16]
+        dists = torch.cdist(pred, emb_weight.float())              # [N, n_chars, 256]
+        return dists.argmin(dim=-1)                                 # [N, n_chars]
 
 
 # ── Higher-level MLP components ───────────────────────────────────────────────
@@ -520,6 +510,26 @@ class JEPAHierarchy(nn.Module):
         """
         mask = (torch.rand_like(windows) < self.cfg.mask_ratio).float()
         return windows * (1.0 - mask), mask
+
+    def get_force_full_mask(self, byte_ids: torch.Tensor) -> torch.Tensor:
+        """Returns [N, L] float mask (1.0 = zero all dims).
+        Masks the last non-null byte per sequence. For sequences with no content
+        (all nulls), falls back to masking the final position."""
+        N, L = byte_ids.shape
+        mask = torch.zeros(N, L, device=byte_ids.device)
+
+        is_content = (byte_ids != 0).float()                              # [N, L]
+        has_content = is_content.any(dim=1)                               # [N]
+        if has_content.any():
+            positions = torch.arange(L, device=byte_ids.device).float()
+            last_content = (is_content * positions).argmax(dim=1)         # [N]
+            idx = torch.arange(N, device=byte_ids.device)
+            mask[idx[has_content], last_content[has_content]] = 1.0
+
+        # Fallback for fully-null sequences: mask the last position
+        mask[~has_content, -1] = 1.0
+
+        return mask
 
     def apply_token_mask(self, N: int, device: torch.device) -> torch.Tensor:
         """Token-level masking for level 0.

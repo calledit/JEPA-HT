@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP, ByteHourglassDecoder, ContextEncoder, vicreg_components
+from model import JEPAHierarchy, JEPALevel, DecoderMLP, TokenDecoderMLP, ByteFunnelDecoder, ContextEncoder, vicreg_components
 from data import build_dataset, _FINEWEB_VAL_DOCS
 
 
@@ -42,7 +42,7 @@ def save_checkpoint(hierarchy, optimizer, step, phase_idx, docs_consumed, cfg):
         "n_encoder_levels": len(hierarchy.levels),
         "decoder_keys": list(hierarchy.decoders.keys()),
         "token_decoder_levels": [int(k) for k, v in hierarchy.decoders.items() if isinstance(v, TokenDecoderMLP)],
-        "byte_hourglass_decoder_levels": [int(k) for k, v in hierarchy.decoders.items() if isinstance(v, ByteHourglassDecoder)],
+        "byte_funnel_decoder_levels": [int(k) for k, v in hierarchy.decoders.items() if isinstance(v, ByteFunnelDecoder)],
         "docs_consumed": docs_consumed,
         "cfg": cfg,
     }
@@ -55,7 +55,7 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
     cfg = ckpt["cfg"]
     hierarchy = JEPAHierarchy(cfg).to(device)
     token_decoder_levels = ckpt.get("token_decoder_levels", [])
-    byte_hourglass_decoder_levels = ckpt.get("byte_hourglass_decoder_levels", [])
+    byte_funnel_decoder_levels = ckpt.get("byte_funnel_decoder_levels", [])
     for i in range(ckpt["n_encoder_levels"]):
         if i == 0:
             lvl = JEPALevel.make_level0(cfg.d_model, cfg.level0_window_size, cfg.level0_dim_mask_mean)
@@ -65,17 +65,15 @@ def build_hierarchy_from_checkpoint(ckpt: dict, device: torch.device) -> JEPAHie
         hierarchy.levels.append(lvl.to(device))
     for key in ckpt["decoder_keys"]:
         level = int(key)
-        if level in byte_hourglass_decoder_levels:
-            hierarchy.decoders[key] = ByteHourglassDecoder(
-                cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
-            ).to(device)
+        if level in byte_funnel_decoder_levels:
+            hierarchy.decoders[key] = ByteFunnelDecoder(cfg.d_model).to(device)
         elif level in token_decoder_levels:
             hierarchy.decoders[key] = TokenDecoderMLP(
                 cfg.d_model, cfg.level0_window_size, vocab_size=cfg.vocab_size
             ).to(device)
         else:
             hierarchy.decoders[key] = DecoderMLP(cfg.d_model, cfg.window_size).to(device)
-    hierarchy.load_state_dict(ckpt["hierarchy_state"])
+    hierarchy.load_state_dict(ckpt["hierarchy_state"], strict=False)
     return hierarchy
 
 
@@ -107,7 +105,9 @@ def eval_encoder(level_idx, hierarchy, val_data, cfg, probe=None):
             BN = flat_ids.shape[0]
             target_out = jepa_level.target_enc(flat_ids)
             token_mask = hierarchy.apply_token_mask(BN, device)
-            context_emb = jepa_level.context_enc(flat_ids, token_mask=token_mask)
+            force_full = hierarchy.get_force_full_mask(flat_ids)
+            token_mask = torch.maximum(token_mask, force_full)
+            context_emb = jepa_level.context_enc(flat_ids, token_mask=token_mask, force_full_dim_mask=force_full)
             pred_out = jepa_level.predictor(context_emb, token_mask)
         else:
             prev_embs = hierarchy.encode_to_level(batch, level_idx)
@@ -244,6 +244,8 @@ def train_encoder_level(
             hierarchy.decoders["0"] = ByteHourglassDecoder(
                 cfg.d_model, cfg.level0_window_size, cfg.vocab_size
             ).to(device)
+        if "0" not in hierarchy.decoders or not isinstance(hierarchy.decoders["0"], ByteFunnelDecoder):
+            hierarchy.decoders["0"] = ByteFunnelDecoder(cfg.d_model).to(device)
         decoder = hierarchy.decoders["0"]
         from prodigyopt import Prodigy
         decoder_optimizer = Prodigy(decoder.parameters(), lr=1.0, weight_decay=cfg.weight_decay)
@@ -292,8 +294,10 @@ def train_encoder_level(
                 t_target_sum += t0_context - t0_target
 
                 token_mask = hierarchy.apply_token_mask(B, device)
+                force_full = hierarchy.get_force_full_mask(batch)
+                token_mask = torch.maximum(token_mask, force_full)
                 with autocast:
-                    context_emb = jepa_level.context_enc(batch, token_mask=token_mask)
+                    context_emb = jepa_level.context_enc(batch, token_mask=token_mask, force_full_dim_mask=force_full)
                     pred_out = jepa_level.predictor(context_emb, token_mask)
             else:
                 with torch.no_grad(), autocast:
@@ -351,14 +355,14 @@ def train_encoder_level(
                 ema_decay = cfg.ema_decay_start + (1.0 - cfg.ema_decay_start) * min(pred_loss_ema / cfg.ema_pred_loss_target, 1.0)
             jepa_level.update_ema(ema_decay)
 
-            # Decoder step: reconstruct bytes from target encoder output
+            # Decoder step: predict byte embeddings for first n_chars bytes
             if decoder is not None:
+                target_embs = jepa_level.target_enc.embedding(
+                    batch[:, :decoder.n_chars]
+                ).detach()                                          # [B, n_chars, 16]
                 with autocast:
-                    byte_logits = decoder(target_out.detach())
-                    recon_loss = F.cross_entropy(
-                        byte_logits.reshape(-1, cfg.vocab_size),
-                        batch.reshape(-1).long(),
-                    )
+                    pred_embs = decoder(target_out.detach())        # [B, n_chars, 16]
+                    recon_loss = F.mse_loss(pred_embs, target_embs)
                 decoder_optimizer.zero_grad()
                 recon_loss.backward()
                 torch.nn.utils.clip_grad_norm_(decoder.parameters(), cfg.grad_clip)
