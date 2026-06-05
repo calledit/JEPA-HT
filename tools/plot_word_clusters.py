@@ -7,9 +7,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import TextBox, Button
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from config import Config
-from model import Generator
+from model import Generator, ContrastiveNet
 from train import find_latest_checkpoint
 
 
@@ -18,6 +19,18 @@ def embed_word(word: str, encoder, ws: int, device) -> np.ndarray:
     t = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     with torch.no_grad():
         return encoder(t).squeeze(0).cpu().float().numpy()
+
+
+def pairwise_sim(embs: np.ndarray, contrastive_net, device) -> np.ndarray:
+    """Compute NxN similarity matrix using ContrastiveNet."""
+    h = torch.tensor(embs, dtype=torch.float32, device=device)
+    N = h.shape[0]
+    i_idx = torch.arange(N, device=device).repeat_interleave(N)
+    j_idx = torch.arange(N, device=device).repeat(N)
+    with torch.no_grad():
+        scores = contrastive_net(h[i_idx], h[j_idx])  # [N*N]
+    sim = scores.reshape(N, N).cpu().float().numpy()
+    return (sim + sim.T) / 2  # symmetrize
 
 
 def residualize_length(embs: np.ndarray, lengths: np.ndarray) -> np.ndarray:
@@ -31,11 +44,13 @@ def residualize_length(embs: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     return X - np.outer(y, alpha)
 
 
-def redraw(ax, fig, words, residualize_len: bool = False):
+def redraw(ax, fig, words, residualize_len: bool = False,
+           contrastive_net=None, device=None, use_contrastive: bool = False):
     ax.cla()
-    ax.set_title(f"{len(words)} words — type a word below and press Enter", fontsize=10)
-    ax.set_xlabel("PC 1")
-    ax.set_ylabel("PC 2")
+    mode = "t-SNE (contrastive)" if use_contrastive and contrastive_net is not None else "PCA"
+    ax.set_title(f"{len(words)} words  [{mode}] — type a word below and press Enter", fontsize=10)
+    ax.set_xlabel("dim 1")
+    ax.set_ylabel("dim 2")
 
     if not words:
         fig.canvas.draw_idle()
@@ -51,6 +66,13 @@ def redraw(ax, fig, words, residualize_len: bool = False):
 
     if len(embs) == 1:
         coords = np.array([[0.0, 0.0]])
+    elif use_contrastive and contrastive_net is not None and len(embs) >= 2:
+        sim = pairwise_sim(embs, contrastive_net, device)
+        dist = sim.max() - sim  # higher similarity → smaller distance; min dist = 0
+        np.fill_diagonal(dist, 0.0)
+        perplexity = min(30, max(5, len(embs) // 3))
+        coords = TSNE(n_components=2, metric="precomputed", perplexity=perplexity,
+                      init="random", random_state=0).fit_transform(dist)
     elif len(embs) == 2:
         c1 = PCA(n_components=1).fit_transform(embs)
         coords = np.hstack([c1, np.zeros((2, 1))])
@@ -147,6 +169,8 @@ def main():
                         help="Prepend this text to every word before embedding, e.g. 'A sentence about '")
     parser.add_argument("--meaning", action="store_true",
                         help="Embed each word as 'The word <word> means' to capture semantics over spelling")
+    parser.add_argument("--contrastive", action="store_true",
+                        help="Use ContrastiveNet pairwise similarity + MDS instead of PCA")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -164,6 +188,17 @@ def main():
     generator.load_state_dict(ckpt["generator"])
     generator.eval()
     encoder = lambda t: generator.forward_hidden(t)[:, -1, :]
+
+    contrastive_net = None
+    if args.contrastive:
+        if "contrastive_net" not in ckpt:
+            print("Warning: no contrastive_net in checkpoint — falling back to PCA")
+            args.contrastive = False
+        else:
+            contrastive_net = ContrastiveNet(cfg).to(device)
+            contrastive_net.load_state_dict(ckpt["contrastive_net"])
+            contrastive_net.eval()
+            print("ContrastiveNet loaded — using MDS projection")
 
     words = []  # list of (label, embedding, category)
 
@@ -184,6 +219,11 @@ def main():
             text = args.prepend + word
         return embed_word(text, encoder, cfg.context_length, device)
 
+    def _redraw():
+        redraw(ax, fig, words, args.residualize_length,
+               contrastive_net=contrastive_net, device=device,
+               use_contrastive=args.contrastive)
+
     def submit(text):
         word = text.strip()
         textbox.set_val("")
@@ -194,11 +234,11 @@ def main():
             return
         print(f"Embedding '{word}'...")
         words.append((word, _embed(word), ""))
-        redraw(ax, fig, words, args.residualize_length)
+        _redraw()
 
     def clear(_event):
         words.clear()
-        redraw(ax, fig, words, args.residualize_length)
+        _redraw()
 
     textbox.on_submit(submit)
     btn_clear.on_clicked(clear)
@@ -220,7 +260,7 @@ def main():
             words.append((word, _embed(word), ""))
         print("Done.")
 
-    redraw(ax, fig, words, args.residualize_length)
+    _redraw()
     plt.show()
 
 

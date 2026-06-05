@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import Generator, Predictor, CorruptionPredictor
-from data import build_dataset, ByteTokenizer
+from model import Generator, LayerwisePredictor, ContrastiveNet
+from data import build_dataset
 
 
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
@@ -29,20 +29,19 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_key)
 
 
-def save_checkpoint(generator, target_generator, predictor, corruption_predictor,
-                    gen_opt, target_opt, pred_opt, corruption_opt,
+def save_checkpoint(generator, target_generator, layerwise_predictor, contrastive_net,
+                    gen_opt, layerwise_pred_opt, contrastive_opt,
                     step, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
     torch.save({
         "generator": generator.state_dict(),
         "target_generator": target_generator.state_dict(),
-        "predictor": predictor.state_dict(),
-        "corruption_predictor": corruption_predictor.state_dict(),
+        "layerwise_predictor": layerwise_predictor.state_dict(),
+        "contrastive_net": contrastive_net.state_dict(),
         "gen_opt": gen_opt.state_dict(),
-        "target_opt": target_opt.state_dict(),
-        "pred_opt": pred_opt.state_dict(),
-        "corruption_opt": corruption_opt.state_dict(),
+        "layerwise_pred_opt": layerwise_pred_opt.state_dict(),
+        "contrastive_opt": contrastive_opt.state_dict(),
         "step": step,
         "docs_consumed": docs_consumed,
         "cfg": cfg,
@@ -81,6 +80,39 @@ def estimate_loss(model, val_data, cfg) -> float:
     return total / n_eval
 
 
+def vicreg_loss(h: torch.Tensor, cfg: Config) -> torch.Tensor:
+    B, T, D = h.shape
+    z = h.reshape(B * T, D).float()
+    z = z - z.mean(dim=0)
+    std = z.std(dim=0)
+    var_loss = F.relu(1.0 - std).mean()
+    N = z.shape[0]
+    cov = (z.T @ z) / (N - 1)
+    off_diag_sq = cov.pow(2) * (1 - torch.eye(D, device=h.device))
+    cov_loss = off_diag_sq.sum() / D
+    return cfg.vicreg_var_weight * var_loss + cfg.vicreg_cov_weight * cov_loss
+
+
+def discriminator_loss(contrastive_net, h, n_samples):
+    B, T, D = h.shape
+    idx = torch.randint(T, (B, n_samples), device=h.device)
+    h_s = h.gather(1, idx.unsqueeze(-1).expand(-1, -1, D))
+
+    h_a = h_s[:, :n_samples // 2, :].reshape(B * (n_samples // 2), D)
+    h_b = h_s[:, n_samples // 2:, :].reshape(B * (n_samples // 2), D)
+
+    perm = torch.randperm(B, device=h.device)
+    for i in range(B):
+        if perm[i] == i:
+            swap = (i + 1) % B
+            perm[i], perm[swap] = perm[swap], perm[i]
+    h_b_neg = h_b.reshape(B, n_samples // 2, D)[perm].reshape(B * (n_samples // 2), D)
+
+    pos_scores = contrastive_net(h_a, h_b)
+    neg_scores = contrastive_net(h_a, h_b_neg)
+    return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
+
+
 def train():
     cfg = Config()
     device = torch.device(cfg.device)
@@ -88,24 +120,17 @@ def train():
 
     generator = Generator(cfg).to(device)
     target_generator = copy.deepcopy(generator)
-    predictor = Predictor(cfg).to(device)
-    corruption_predictor = CorruptionPredictor(cfg).to(device)
-
-    # Target optimizer: all params, trained with LM loss
-    target_opt = torch.optim.AdamW(
-        target_generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
-    )
+    layerwise_predictor = LayerwisePredictor(cfg).to(device)
+    contrastive_net = ContrastiveNet(cfg).to(device)
 
     gen_opt = torch.optim.AdamW(
         generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
-    gen_params = list(generator.parameters())
-
-    pred_opt = torch.optim.AdamW(
-        predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    layerwise_pred_opt = torch.optim.AdamW(
+        layerwise_predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
-    corruption_opt = torch.optim.AdamW(
-        corruption_predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    contrastive_opt = torch.optim.AdamW(
+        contrastive_net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
 
     step = 0
@@ -117,26 +142,39 @@ def train():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         generator.load_state_dict(ckpt["generator"])
         target_generator.load_state_dict(ckpt["target_generator"])
-        predictor.load_state_dict(ckpt["predictor"])
-        if "corruption_predictor" in ckpt:
-            corruption_predictor.load_state_dict(ckpt["corruption_predictor"])
-        for opt, key in [(gen_opt, "gen_opt"), (target_opt, "target_opt"), (pred_opt, "pred_opt"), (corruption_opt, "corruption_opt")]:
+        skip_opts = set()
+        try:
+            layerwise_predictor.load_state_dict(ckpt["layerwise_predictor"])
+        except (RuntimeError, KeyError) as e:
+            print(f"  Warning: layerwise_predictor state not loaded ({e}) — starting fresh")
+            skip_opts.add("layerwise_pred_opt")
+        try:
+            contrastive_net.load_state_dict(ckpt["contrastive_net"])
+        except (RuntimeError, KeyError) as e:
+            print(f"  Warning: contrastive_net state not loaded ({e}) — starting fresh")
+            skip_opts.add("contrastive_opt")
+        for opt, key in [(gen_opt, "gen_opt"), (layerwise_pred_opt, "layerwise_pred_opt"), (contrastive_opt, "contrastive_opt")]:
+            if key in skip_opts:
+                continue
             if key not in ckpt:
                 print(f"  Warning: {key} not in checkpoint — optimizer restarted")
                 continue
             try:
                 opt.load_state_dict(ckpt[key])
-            except ValueError:
-                print(f"  Warning: skipping {key} state (parameter group mismatch — optimizer restarted)")
+            except (ValueError, RuntimeError):
+                print(f"  Warning: skipping {key} state (shape mismatch — optimizer restarted)")
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
         print(f"  Resuming at step {step}")
     else:
         print("No checkpoint found — starting from scratch")
 
-    print(f"Generator params: {generator.num_params():,}  |  Predictor params: {predictor.num_params():,}  |  CorruptionPredictor params: {corruption_predictor.num_params():,}")
+    print(
+        f"Generator params: {generator.num_params():,}  |  "
+        f"LayerwisePredictor params: {layerwise_predictor.num_params():,}  |  "
+        f"ContrastiveNet params: {contrastive_net.num_params():,}"
+    )
 
-    tokenizer = ByteTokenizer()
     train_dataset, val_data, _ = build_dataset(cfg, skip_docs)
     val_data = val_data.to(device)
     loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=0)
@@ -147,108 +185,99 @@ def train():
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if write_header:
-        log_writer.writerow(["step", "lm_loss", "jepa_loss", "corruption_loss", "val_loss", "lr", "tok_per_s", "elapsed_s"])
+        layer_headers = [f"jepa_loss_{l}" for l in range(cfg.n_layers)]
+        log_writer.writerow(["step"] + layer_headers + ["jepa_loss_avg", "contrastive_loss", "vicreg_loss", "val_loss", "latent_std", "lr", "tok_per_s", "elapsed_s"])
 
     last_ckpt_interval = step // cfg.checkpoint_interval
-    lm_sum = jepa_sum = corruption_sum = 0.0
+    jepa_layer_sums = [0.0] * cfg.n_layers
+    jepa_sum = contrastive_sum = vicreg_sum = latent_std_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
     t0 = t_last_log = time.time()
 
     generator.train()
     target_generator.train()
-    predictor.train()
-    corruption_predictor.train()
+    layerwise_predictor.train()
+    contrastive_net.train()
 
     autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
 
     for batch in itertools.chain.from_iterable(iter(loader) for _ in itertools.count()):
-        batch = batch.to(device)  # [B, T]
-        x = batch[:, :-1]         # inputs
-        y = batch[:, 1:]          # targets
+        batch = batch.to(device)
+        x = batch[:, :-1]
 
         lr = get_lr(step, cfg)
-        for opt in (gen_opt, target_opt, pred_opt, corruption_opt):
+        for opt in (gen_opt, layerwise_pred_opt, contrastive_opt):
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
-        # ── Step 1: EMA target ← generator ───────────────────────────────────
+        # ── EMA: target ← generator ──────────────────────────────────────────
         with torch.no_grad():
             for p_gen, p_tgt in zip(generator.parameters(), target_generator.parameters()):
                 p_tgt.data.mul_(cfg.ema_decay).add_(p_gen.data, alpha=1.0 - cfg.ema_decay)
 
-        # ── Step 2: Optimize target with LM loss ──────────────────────────────
-        if cfg.enable_target_reconstruction:
-            with autocast():
-                lm_loss = F.cross_entropy(
-                    target_generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
-                )
-            target_opt.zero_grad()
-            lm_loss.backward()
-            torch.nn.utils.clip_grad_norm_(target_generator.parameters(), cfg.grad_clip)
-            target_opt.step()
-        else:
-            with torch.no_grad(), autocast():
-                lm_loss = F.cross_entropy(
-                    target_generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
-                )
-
-        # ── Step 3: Get target hidden states ─────────────────────────────────
+        # ── Layerwise JEPA ───────────────────────────────────────────────────
         with torch.no_grad():
-            target_hidden = target_generator.forward_hidden(x)  # [B, T, d_model]
+            target_hiddens = target_generator.forward_hidden_layerwise(x)
 
-        # ── Step 4: Generator + predictor JEPA loss  —or—  plain LM ─────────
-        if cfg.enable_jepa:
+        with autocast():
+            gen_hiddens = generator.forward_cross_layerwise(x)
+
+            # Per-layer: predict target layer l+1 output from generator layer l output
+            layer_losses = [
+                F.mse_loss(layerwise_predictor.predictors[l](gen_hiddens[l]), target_hiddens[l + 1].detach())
+                for l in range(cfg.n_layers)
+            ]
+            jepa_loss = sum(layer_losses) / cfg.n_layers
+
+            if cfg.enable_vicreg:
+                vc_loss = vicreg_loss(target_hiddens[-1], cfg)
+                jepa_loss = jepa_loss + vc_loss
+
+        gen_opt.zero_grad()
+        layerwise_pred_opt.zero_grad()
+        jepa_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            list(generator.parameters()) + list(layerwise_predictor.parameters()), cfg.grad_clip
+        )
+        gen_opt.step()
+        layerwise_pred_opt.step()
+
+        # ── Contrastive loss ─────────────────────────────────────────────────
+        if cfg.enable_contrastive:
             with autocast():
-                gen_hidden, actual_corruption = generator.forward_masked(x)   # [B, T, d_model], float
-                pred_hidden = predictor(gen_hidden)                # [B, T, d_model]
-                jepa_loss = F.mse_loss(pred_hidden, target_hidden)
-                if cfg.enable_generator_reconstruction:
-                    gen_recon_loss = F.cross_entropy(
-                        generator.lm_head(gen_hidden).reshape(-1, cfg.vocab_size), y.reshape(-1)
-                    )
-                    total_loss = jepa_loss + gen_recon_loss
-                else:
-                    total_loss = jepa_loss
-
-            gen_opt.zero_grad()
-            pred_opt.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(gen_params + list(predictor.parameters()), cfg.grad_clip)
-            gen_opt.step()
-            pred_opt.step()
-
-            if cfg.enable_corruption_predictor:
-                with autocast():
-                    pred_ratio = corruption_predictor(gen_hidden, target_hidden)  # [B, T, 1]
-                    corruption_loss = F.mse_loss(pred_ratio, torch.full_like(pred_ratio, actual_corruption))
-                corruption_opt.zero_grad()
-                corruption_loss.backward()
-                torch.nn.utils.clip_grad_norm_(corruption_predictor.parameters(), cfg.grad_clip)
-                corruption_opt.step()
-        else:
-            with autocast():
-                jepa_loss = F.cross_entropy(
-                    generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                contra_loss = discriminator_loss(
+                    contrastive_net,
+                    target_hiddens[-1].detach(),
+                    cfg.contrastive_n_samples,
                 )
-            gen_opt.zero_grad()
-            jepa_loss.backward()
-            torch.nn.utils.clip_grad_norm_(gen_params, cfg.grad_clip)
-            gen_opt.step()
+            contrastive_opt.zero_grad()
+            contra_loss.backward()
+            torch.nn.utils.clip_grad_norm_(contrastive_net.parameters(), cfg.grad_clip)
+            contrastive_opt.step()
 
         step += 1
-        lm_sum += lm_loss.item()
+        for l, ll in enumerate(layer_losses):
+            jepa_layer_sums[l] += ll.item()
         jepa_sum += jepa_loss.item()
-        if cfg.enable_corruption_predictor:
-            corruption_sum += corruption_loss.item()
+        if cfg.enable_contrastive:
+            contrastive_sum += contra_loss.item()
+        if cfg.enable_vicreg:
+            vicreg_sum += vc_loss.item()
+        with torch.no_grad():
+            latent_std_sum += target_hiddens[-1].float().std(dim=[0, 1]).mean().item()
         loss_count += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
 
         if step % cfg.eval_interval == 0:
-            avg_lm         = lm_sum         / loss_count
-            avg_jepa       = jepa_sum       / loss_count
-            avg_corruption = corruption_sum / loss_count
-            lm_sum = jepa_sum = corruption_sum = 0.0
+            avg_layer_losses = [jepa_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
+            avg_jepa        = jepa_sum        / loss_count
+            avg_contrastive = contrastive_sum / loss_count
+            avg_vicreg      = vicreg_sum      / loss_count
+            avg_latent_std  = latent_std_sum  / loss_count
+            jepa_layer_sums = [0.0] * cfg.n_layers
+            jepa_sum = contrastive_sum = vicreg_sum = latent_std_sum = 0.0
             loss_count = 0
 
             val_loss = estimate_loss(target_generator, val_data, cfg)
@@ -257,27 +286,26 @@ def train():
             t_last_log = time.time()
             tokens_since_log = 0
 
-            with torch.no_grad():
-                prompt_ids = tokenizer.encode("The ")
-                prompt = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                sample_ids = target_generator.generate(prompt, max_new_tokens=32, temperature=0.8, top_k=64)
-                sample = tokenizer.decode(sample_ids[0].tolist())
-
+            layer_str = " | ".join(f"l{l} {avg_layer_losses[l]:.4f}" for l in range(cfg.n_layers))
             print(
-                f"  step {step:7d} | lm {avg_lm:.4f} | jepa {avg_jepa:.4f} | "
-                f"corr {avg_corruption:.4f} | val {val_loss:.4f} | "
-                f"lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s | "
-                f"{repr(sample)}"
+                f"  step {step:7d} | {layer_str} | "
+                f"contra {avg_contrastive:.4f} | vicreg {avg_vicreg:.4f} | val {val_loss:.4f} | "
+                f"std {avg_latent_std:.4f} | lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
             )
-            log_writer.writerow([step, f"{avg_lm:.6f}", f"{avg_jepa:.6f}", f"{avg_corruption:.6f}",
-                                  f"{val_loss:.6f}", f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"])
+            log_writer.writerow(
+                [step] +
+                [f"{avg_layer_losses[l]:.6f}" for l in range(cfg.n_layers)] +
+                [f"{avg_jepa:.6f}", f"{avg_contrastive:.6f}", f"{avg_vicreg:.6f}",
+                 f"{val_loss:.6f}", f"{avg_latent_std:.6f}", f"{lr:.6e}",
+                 f"{tok_per_s:.0f}", f"{elapsed:.1f}"]
+            )
             log_file.flush()
 
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
             save_checkpoint(
-                generator, target_generator, predictor, corruption_predictor,
-                gen_opt, target_opt, pred_opt, corruption_opt,
+                generator, target_generator, layerwise_predictor, contrastive_net,
+                gen_opt, layerwise_pred_opt, contrastive_opt,
                 step, train_dataset.docs_consumed, cfg,
             )
             last_ckpt_interval = ckpt_interval

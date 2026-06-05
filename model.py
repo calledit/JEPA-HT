@@ -29,6 +29,26 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
+    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Q from x, K/V from context using the same qkv weights.
+        Strict causal mask: position i attends only to target positions j < i, not itself.
+        Own state is preserved via the residual connection in TransformerBlock.
+        """
+        B, T, C = x.shape
+        q, _, _ = self.qkv(x).split(C, dim=-1)
+        _, k, v = self.qkv(context).split(C, dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(y)
+
     def forward_kv(self, x: torch.Tensor):
         """Full forward, returning (output, k, v) for KV caching."""
         B, T, C = x.shape
@@ -81,6 +101,11 @@ class TransformerBlock(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
+    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn.forward_cross(self.norm1(x), context)
+        x = x + self.ff(self.norm2(x))
+        return x
+
     def forward_kv(self, x: torch.Tensor):
         attn_out, k, v = self.attn.forward_kv(self.norm1(x))
         x = x + attn_out
@@ -94,6 +119,37 @@ class TransformerBlock(nn.Module):
         return x, k, v
 
 
+class DoubleTransformerBlock(nn.Module):
+    """Two transformer layers per block: layer1 is cross-attn capable, layer2 is always self-attn."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        self.layer1 = TransformerBlock(d_model, n_heads, dropout)
+        self.layer2 = TransformerBlock(d_model, n_heads, dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return x
+
+    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x = self.layer1.forward_cross(x, context)
+        x = self.layer2(x)
+        return x
+
+    def forward_kv(self, x: torch.Tensor):
+        x, k1, v1 = self.layer1.forward_kv(x)
+        x, k2, v2 = self.layer2.forward_kv(x)
+        return x, (k1, v1), (k2, v2)
+
+    def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2):
+        pk1, pv1 = past_kv1
+        pk2, pv2 = past_kv2
+        x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
+        x, k2, v2 = self.layer2.forward_with_cache(x, pk2, pv2)
+        return x, (k1, v1), (k2, v2)
+
+
 class Generator(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -102,7 +158,7 @@ class Generator(nn.Module):
         self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.Sequential(*[
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            DoubleTransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_model)
@@ -127,64 +183,62 @@ class Generator(nn.Module):
         pos = torch.arange(T, device=x.device)
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         h = self.blocks(h)
-        return self.norm(h)  # [B, T, d_model]
+        return self.norm(h)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lm_head(self.forward_hidden(x))
 
-    def forward_masked(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with embedding masking for JEPA context encoder.
-
-        For a random 20% of token positions:
-          - detach their embedding (no gradient to tok_emb table)
-          - zero a random fraction of their dimensions
+    def forward_hidden_layerwise(self, x: torch.Tensor, detach_emb: bool = False) -> list:
+        """Returns [h_0, h_1, ..., h_N] where h_0 = embeddings, length = n_layers + 1.
+        detach_emb=True cuts the gradient at the embedding output (use for clean generator path).
         """
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
-        emb = self.tok_emb(x)  # [B, T, d_model]
+        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        if detach_emb:
+            h = h.detach()
+        hiddens = [h]
+        for block in self.blocks:
+            h = block(h)
+            hiddens.append(h)
+        return hiddens
 
-        ratio = torch.rand(1).item() * self.cfg.mask_token_ratio_max
-        masked = torch.rand(B, T, device=x.device) < ratio
-
-        # Detach at masked positions — gradient stops before tok_emb for those tokens
-        emb = emb.detach() * masked.unsqueeze(-1) + emb * (~masked).unsqueeze(-1)
-
-        # Zero a random fraction of dims per masked token
-        frac = torch.rand(B, T, 1, device=x.device) * self.cfg.mask_dim_ratio * 2
-        zero_dims = (torch.rand(B, T, self.cfg.d_model, device=x.device) < frac) & masked.unsqueeze(-1)
-        emb = emb * (~zero_dims)
-
-        actual_corruption = zero_dims.float().mean().item()
-
-        h = self.drop(emb + self.pos_emb(pos))
-        h = self.blocks(h)
-        return self.norm(h), actual_corruption
+    def forward_cross_layerwise(self, x: torch.Tensor) -> list:
+        """Training-only. Block 0 cross-attends to tok_emb(x)+pos_emb(x).
+        Blocks 1+ cross-attend to the previous block's output, detached.
+        Returns [h_gen_0, ..., h_gen_N-1], length = n_layers.
+        """
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device)
+        emb = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        h = torch.randn(B, T, self.cfg.d_model, device=x.device, dtype=emb.dtype) * 0.02
+        gen_hiddens = []
+        for i, block in enumerate(self.blocks):
+            context = emb if i == 0 else gen_hiddens[-1].detach()
+            h = block.forward_cross(h, context)
+            gen_hiddens.append(h)
+            h = torch.randn(B, T, self.cfg.d_model, device=h.device, dtype=h.dtype) * 0.02
+        return gen_hiddens
 
     def encode_kv(self, x: torch.Tensor):
-        """Encode full context, return (last_hidden [B, d_model], kv_cache).
-        kv_cache is a list of (k, v) per layer, each [B, n_heads, T, head_dim].
-        """
+        """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         kv_cache = []
         for block in self.blocks:
-            h, k, v = block.forward_kv(h)
-            kv_cache.append((k, v))
+            h, kv1, kv2 = block.forward_kv(h)
+            kv_cache.append((kv1, kv2))
         return self.norm(h)[:, -1, :], kv_cache
 
     def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
-        """Decode a single new token position using a KV cache.
-        token_id: [B, 1] long tensor
-        pos: position index for this token
-        Returns: (hidden [B, d_model], updated_kv_cache)
-        """
+        """Decode a single new token position using a KV cache."""
         pos_tensor = torch.tensor([pos], device=token_id.device)
-        h = self.drop(self.tok_emb(token_id) + self.pos_emb(pos_tensor))  # [B, 1, d_model]
+        h = self.drop(self.tok_emb(token_id) + self.pos_emb(pos_tensor))
         new_kv = []
-        for block, (pk, pv) in zip(self.blocks, kv_cache):
-            h, k, v = block.forward_with_cache(h, pk, pv)
-            new_kv.append((k, v))
+        for block, (kv1, kv2) in zip(self.blocks, kv_cache):
+            h, new_kv1, new_kv2 = block.forward_with_cache(h, kv1, kv2)
+            new_kv.append((new_kv1, new_kv2))
         return self.norm(h)[:, 0, :], new_kv
 
     @torch.no_grad()
@@ -206,18 +260,16 @@ class Generator(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Maps generator hidden states [B, T, d_model] → predicted target hidden states [B, T, d_model]."""
+    """Per-layer predictor: d_model → GELU → d_model → GELU → d_model."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model * 4, bias=False),
+            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
             nn.GELU(),
-            nn.Linear(cfg.d_model * 4, cfg.d_model * 4, bias=False),
+            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
             nn.GELU(),
-            nn.Linear(cfg.d_model * 4, cfg.d_model * 2, bias=False),
-            nn.GELU(),
-            nn.Linear(cfg.d_model * 2, cfg.d_model, bias=False),
+            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
         )
         self.apply(self._init_weights)
 
@@ -232,9 +284,20 @@ class Predictor(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-class CorruptionPredictor(nn.Module):
-    """Takes [gen_hidden ∥ target_hidden] (both detached) and predicts the mask ratio.
-    Architecture: 96 → 192 → 192 → 192 → 96 → 48 → 1
+class LayerwisePredictor(nn.Module):
+    """One small Predictor per transformer layer."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.predictors = nn.ModuleList([Predictor(cfg) for _ in range(cfg.n_layers)])
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class ContrastiveNet(nn.Module):
+    """Discriminator: takes two latent hidden states, outputs similarity scalar.
+    Positive (same doc) → high output. Negative (different doc) → low output.
     """
 
     def __init__(self, cfg: Config):
@@ -242,7 +305,6 @@ class CorruptionPredictor(nn.Module):
         D = cfg.d_model
         self.net = nn.Sequential(
             nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
-            nn.Linear(D * 4, D * 4, bias=False), nn.GELU(),
             nn.Linear(D * 4, D * 4, bias=False), nn.GELU(),
             nn.Linear(D * 4, D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D,     bias=False), nn.GELU(),
@@ -254,9 +316,9 @@ class CorruptionPredictor(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, gen_hidden: torch.Tensor, target_hidden: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([gen_hidden.detach(), target_hidden.detach()], dim=-1)
-        return self.net(x)  # [B, T, 1]
+    def forward(self, h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h_a.detach(), h_b.detach()], dim=-1)
+        return self.net(x).squeeze(-1)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

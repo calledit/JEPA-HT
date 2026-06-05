@@ -48,38 +48,67 @@ def main():
 
     print(f"Loaded {len(df)} rows | columns: {list(df.columns)}")
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    layer_cols = [c for c in df.columns if c.startswith("jepa_loss_") and c != "jepa_loss_avg"]
+    n_layers = len(layer_cols)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     fig.suptitle("Training curves", fontsize=13)
 
-    # LM loss (target)
-    ax = axes[0, 0]
-    plot_line(ax, df["step"], df["lm_loss"],  "train lm",  "steelblue", args.smooth)
-    plot_line(ax, df["step"], df["val_loss"], "val lm",    "steelblue", args.smooth, "--")
-    ax.set_title("LM loss (target_generator)")
-    ax.set_ylabel("cross-entropy")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    layer_colors = plt.cm.plasma(np.linspace(0.1, 0.9, max(n_layers, 1)))
 
-    # JEPA loss (generator + predictor)
-    ax = axes[0, 1]
-    plot_line(ax, df["step"], df["jepa_loss"], "jepa", "tomato", args.smooth)
-    ax.set_title("JEPA loss (generator predictor MSE)")
+    # Per-layer JEPA losses
+    ax = axes[0, 0]
+    for i, col in enumerate(layer_cols):
+        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
+    ax.set_title("Per-layer JEPA loss")
     ax.set_ylabel("MSE")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # LM + JEPA together (normalised for comparison)
-    ax = axes[1, 0]
-    plot_line(ax, df["step"], df["lm_loss"],   "lm",   "steelblue", args.smooth)
-    plot_line(ax, df["step"], df["jepa_loss"], "jepa", "tomato",    args.smooth)
-    ax.set_title("LM vs JEPA loss")
+    # JEPA avg + val loss
+    ax = axes[0, 1]
+    if "jepa_loss_avg" in df.columns:
+        plot_line(ax, df["step"], df["jepa_loss_avg"], "jepa avg", "tomato", args.smooth)
+    if "val_loss" in df.columns:
+        plot_line(ax, df["step"], df["val_loss"], "val", "steelblue", args.smooth, "--")
+    ax.set_title("JEPA avg + val loss")
     ax.set_ylabel("loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Throughput
+    # Contrastive loss
+    ax = axes[0, 2]
+    if "contrastive_loss" in df.columns:
+        plot_line(ax, df["step"], df["contrastive_loss"], "contrastive", "darkorchid", args.smooth)
+    if "vicreg_loss" in df.columns:
+        plot_line(ax, df["step"], df["vicreg_loss"], "vicreg", "darkorange", args.smooth)
+    ax.set_title("Contrastive / VICReg loss")
+    ax.set_ylabel("loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Latent std
+    ax = axes[1, 0]
+    if "latent_std" in df.columns:
+        plot_line(ax, df["step"], df["latent_std"], "latent std", "seagreen", args.smooth)
+    ax.set_title("Latent std (collapse indicator)")
+    ax.set_ylabel("std")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # LR
     ax = axes[1, 1]
-    plot_line(ax, df["step"], df["tok_per_s"] / 1000, "tok/s (k)", "seagreen", args.smooth)
+    if "lr" in df.columns:
+        plot_line(ax, df["step"], df["lr"], "lr", "gray", 1)
+    ax.set_title("Learning rate")
+    ax.set_ylabel("lr")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Throughput
+    ax = axes[1, 2]
+    if "tok_per_s" in df.columns:
+        plot_line(ax, df["step"], df["tok_per_s"] / 1000, "tok/s (k)", "steelblue", args.smooth)
     ax.set_title("Throughput")
     ax.set_ylabel("k tokens / s")
     ax.legend()
