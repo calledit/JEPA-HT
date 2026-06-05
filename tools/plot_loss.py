@@ -10,7 +10,6 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 
 
 def smooth(values, window):
@@ -20,55 +19,18 @@ def smooth(values, window):
     return np.convolve(values, kernel, mode="valid")
 
 
-def load_log(path):
-    chunks = []
-    header = None
-    with open(path) as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split(",")
-            if header is None:
-                header = parts
-                continue
-            if parts[0] == "global_step":
-                continue
-            if len(parts) < len(header):
-                parts += [""] * (len(header) - len(parts))
-            chunks.append(parts[: len(header)])
-
-    if not chunks:
-        raise ValueError(f"No data rows found in {path}")
-
-    df = pd.DataFrame(chunks, columns=header)
-    for col in df.columns:
-        if col != "phase_type":
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.sort_values("global_step").reset_index(drop=True)
-    return df
-
-
-def plot_line(ax, x, y, label, color, args, linestyle="-"):
+def plot_line(ax, x, y, label, color, window, linestyle="-"):
     y = np.array(y, dtype=float)
     mask = ~np.isnan(y)
     x, y = np.array(x)[mask], y[mask]
     if len(y) == 0:
         return
     ax.plot(x, y, alpha=0.2, color=color, linewidth=0.7, linestyle=linestyle)
-    if len(y) >= args.smooth:
-        s = smooth(y, args.smooth)
-        sx = x[args.smooth - 1 :]
-        ax.plot(sx, s, color=color, linewidth=1.8, label=label, linestyle=linestyle)
+    if len(y) >= window:
+        s = smooth(y, window)
+        ax.plot(x[window - 1:], s, color=color, linewidth=1.8, label=label, linestyle=linestyle)
     else:
         ax.plot(x, y, color=color, linewidth=1.8, label=label, linestyle=linestyle)
-
-
-def add_phase_boundaries(ax, df):
-    """Draw vertical lines at phase transitions."""
-    for phase_idx in sorted(df["phase_idx"].dropna().unique()):
-        first_step = df[df["phase_idx"] == phase_idx]["global_step"].min()
-        ax.axvline(first_step, color="lightgray", linestyle="--", linewidth=0.8, alpha=0.6)
 
 
 def main():
@@ -78,96 +40,54 @@ def main():
     parser.add_argument("--start",  type=int, default=0)
     args = parser.parse_args()
 
-    df = load_log(args.log)
+    df = pd.read_csv(args.log)
+    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.sort_values("step").reset_index(drop=True)
     if args.start > 0:
-        df = df[df["global_step"] >= args.start].reset_index(drop=True)
+        df = df[df["step"] >= args.start].reset_index(drop=True)
 
-    print(f"Loaded {len(df)} rows")
-    print(f"Columns: {list(df.columns)}")
+    print(f"Loaded {len(df)} rows | columns: {list(df.columns)}")
 
-    enc_df = df[df["phase_type"] == "encoder"].copy()
-    dec_df = df[df["phase_type"] == "decoder"].copy()
-    n_levels = int(df["level"].max()) if not df["level"].isna().all() else 1
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Training curves", fontsize=13)
 
-    colors = cm.plasma(np.linspace(0.1, 0.9, max(n_levels, 1)))
-
-    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
-    fig.suptitle("JEPA-HT Training", fontsize=14)
-
-    # ── Encoder: JEPA prediction loss ────────────────────────────────────────
+    # LM loss (target)
     ax = axes[0, 0]
-    for lvl in sorted(enc_df["level"].dropna().unique()):
-        sub = enc_df[enc_df["level"] == lvl]
-        c = colors[int(lvl) - 1]
-        plot_line(ax, sub["global_step"], sub["pred_loss"],     f"L{int(lvl)} train", c, args)
-        plot_line(ax, sub["global_step"], sub["val_pred_loss"], f"L{int(lvl)} val",   c, args, "--")
-    add_phase_boundaries(ax, enc_df)
-    ax.set_title("Encoder — JEPA Prediction Loss (MSE, lower = better)")
-    ax.set_ylabel("MSE")
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=7, ncol=2)
+    plot_line(ax, df["step"], df["lm_loss"],  "train lm",  "steelblue", args.smooth)
+    plot_line(ax, df["step"], df["val_loss"], "val lm",    "steelblue", args.smooth, "--")
+    ax.set_title("LM loss (target_generator)")
+    ax.set_ylabel("cross-entropy")
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── Encoder: VICReg collapse prevention ──────────────────────────────────
+    # JEPA loss (generator + predictor)
     ax = axes[0, 1]
-    for lvl in sorted(enc_df["level"].dropna().unique()):
-        sub = enc_df[enc_df["level"] == lvl]
-        c = colors[int(lvl) - 1]
-        plot_line(ax, sub["global_step"], sub["var_loss"], f"L{int(lvl)} var", c, args)
-        plot_line(ax, sub["global_step"], sub["cov_loss"], f"L{int(lvl)} cov", c, args)
-    add_phase_boundaries(ax, enc_df)
-    ax.set_title("Encoder — VICReg (var + cov losses)")
-    ax.set_ylabel("weighted loss")
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=7, ncol=2)
+    plot_line(ax, df["step"], df["jepa_loss"], "jepa", "tomato", args.smooth)
+    ax.set_title("JEPA loss (generator predictor MSE)")
+    ax.set_ylabel("MSE")
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── Encoder: representation drift ────────────────────────────────────────
+    # LM + JEPA together (normalised for comparison)
     ax = axes[1, 0]
-    if "repr_drift" in enc_df.columns:
-        for lvl in sorted(enc_df["level"].dropna().unique()):
-            sub = enc_df[enc_df["level"] == lvl]
-            c = colors[int(lvl) - 1]
-            plot_line(ax, sub["global_step"], sub["repr_drift"], f"L{int(lvl)}", c, args)
-    add_phase_boundaries(ax, enc_df)
-    ax.set_title("Encoder — Representation Drift (MSE vs prev eval, unmasked)")
-    ax.set_ylabel("MSE")
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=7)
+    plot_line(ax, df["step"], df["lm_loss"],   "lm",   "steelblue", args.smooth)
+    plot_line(ax, df["step"], df["jepa_loss"], "jepa", "tomato",    args.smooth)
+    ax.set_title("LM vs JEPA loss")
+    ax.set_ylabel("loss")
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── Decoder: reconstruction & semantic losses ─────────────────────────────
+    # Throughput
     ax = axes[1, 1]
-    for lvl in sorted(dec_df["level"].dropna().unique()):
-        sub = dec_df[dec_df["level"] == lvl]
-        c = colors[int(lvl) - 1]
-        plot_line(ax, sub["global_step"], sub["recon_loss"],    f"L{int(lvl)} recon", c, args)
-        plot_line(ax, sub["global_step"], sub["semantic_loss"], f"L{int(lvl)} sem",   c, args)
-    add_phase_boundaries(ax, dec_df)
-    ax.set_title("Decoder — Reconstruction & Semantic Loss (MSE)")
-    ax.set_ylabel("MSE")
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=7, ncol=2)
+    plot_line(ax, df["step"], df["tok_per_s"] / 1000, "tok/s (k)", "seagreen", args.smooth)
+    ax.set_title("Throughput")
+    ax.set_ylabel("k tokens / s")
+    ax.legend()
     ax.grid(True, alpha=0.3)
-
-    # ── Decoder: overlap consistency ──────────────────────────────────────────
-    ax = axes[2, 0]
-    for lvl in sorted(dec_df["level"].dropna().unique()):
-        sub = dec_df[dec_df["level"] == lvl]
-        c = colors[int(lvl) - 1]
-        plot_line(ax, sub["global_step"], sub["overlap_loss"], f"L{int(lvl)}", c, args)
-    add_phase_boundaries(ax, dec_df)
-    ax.set_title("Decoder — Overlap Consistency Loss (MSE)")
-    ax.set_ylabel("MSE")
-    ax.set_ylim(bottom=0)
-    ax.legend(fontsize=7)
-    ax.grid(True, alpha=0.3)
-
-    axes[2, 1].set_visible(False)
 
     for ax in axes.flat:
-        if ax.get_visible():
-            ax.set_xlabel("Global step")
+        ax.set_xlabel("step")
+
     plt.tight_layout()
     plt.show()
 

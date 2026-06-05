@@ -86,13 +86,15 @@ class Generator(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
         B, T = x.shape
-        assert T <= self.cfg.context_length
         pos = torch.arange(T, device=x.device)
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         h = self.blocks(h)
-        return self.lm_head(self.norm(h))
+        return self.norm(h)  # [B, T, d_model]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(self.forward_hidden(x))
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
@@ -107,6 +109,29 @@ class Generator(nn.Module):
                 logits[logits < v[:, -1:]] = float("-inf")
             idx = torch.cat([idx, torch.multinomial(F.softmax(logits, dim=-1), 1)], dim=1)
         return idx
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class Predictor(nn.Module):
+    """Maps generator logits [B, T, vocab_size] → predicted target hidden states [B, T, d_model]."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cfg.vocab_size, cfg.d_model * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(cfg.d_model * 2, cfg.d_model, bias=False),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.net(logits)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

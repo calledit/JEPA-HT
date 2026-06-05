@@ -13,6 +13,9 @@ class Config:
     ffn_dim: int = 192           # 4 × d_model
     dropout: float = 0.0
 
+    # EMA
+    ema_decay: float = 0.996
+
     # Training
     batch_size: int = 64
     lr: float = 3e-4
