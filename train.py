@@ -93,11 +93,10 @@ def train():
         target_generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
 
-    # Generator optimizer: excludes tok_emb (weight-tied with lm_head, frozen in generator)
-    gen_params = [p for n, p in generator.named_parameters() if "tok_emb" not in n]
     gen_opt = torch.optim.AdamW(
-        gen_params, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+        generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
+    gen_params = list(generator.parameters())
 
     pred_opt = torch.optim.AdamW(
         predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
@@ -113,9 +112,11 @@ def train():
         generator.load_state_dict(ckpt["generator"])
         target_generator.load_state_dict(ckpt["target_generator"])
         predictor.load_state_dict(ckpt["predictor"])
-        gen_opt.load_state_dict(ckpt["gen_opt"])
-        target_opt.load_state_dict(ckpt["target_opt"])
-        pred_opt.load_state_dict(ckpt["pred_opt"])
+        for opt, key in [(gen_opt, "gen_opt"), (target_opt, "target_opt"), (pred_opt, "pred_opt")]:
+            try:
+                opt.load_state_dict(ckpt[key])
+            except ValueError:
+                print(f"  Warning: skipping {key} state (parameter group mismatch — optimizer restarted)")
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
         print(f"  Resuming at step {step}")
@@ -165,32 +166,54 @@ def train():
                 p_tgt.data.mul_(cfg.ema_decay).add_(p_gen.data, alpha=1.0 - cfg.ema_decay)
 
         # ── Step 2: Optimize target with LM loss ──────────────────────────────
-        with autocast():
-            lm_loss = F.cross_entropy(
-                target_generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
-            )
-        target_opt.zero_grad()
-        lm_loss.backward()
-        torch.nn.utils.clip_grad_norm_(target_generator.parameters(), cfg.grad_clip)
-        target_opt.step()
+        if cfg.enable_target_reconstruction:
+            with autocast():
+                lm_loss = F.cross_entropy(
+                    target_generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                )
+            target_opt.zero_grad()
+            lm_loss.backward()
+            torch.nn.utils.clip_grad_norm_(target_generator.parameters(), cfg.grad_clip)
+            target_opt.step()
+        else:
+            with torch.no_grad(), autocast():
+                lm_loss = F.cross_entropy(
+                    target_generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                )
 
-        # ── Step 3: Get target hidden states, sync lm_head → generator ───────
+        # ── Step 3: Get target hidden states ─────────────────────────────────
         with torch.no_grad():
             target_hidden = target_generator.forward_hidden(x)  # [B, T, d_model]
-            generator.lm_head.weight.data.copy_(target_generator.lm_head.weight.data)
 
-        # ── Step 4: Generator + predictor JEPA loss ───────────────────────────
-        with autocast():
-            gen_logits = generator(x)                  # [B, T, vocab_size]
-            pred_hidden = predictor(gen_logits)        # [B, T, d_model]
-            jepa_loss = F.mse_loss(pred_hidden, target_hidden)
+        # ── Step 4: Generator + predictor JEPA loss  —or—  plain LM ─────────
+        if cfg.enable_jepa:
+            with autocast():
+                gen_hidden = generator.forward_masked(x)   # [B, T, d_model]
+                pred_hidden = predictor(gen_hidden)        # [B, T, d_model]
+                jepa_loss = F.mse_loss(pred_hidden[:, :-1, :], target_hidden[:, 1:, :])
+                if cfg.enable_generator_reconstruction:
+                    gen_recon_loss = F.cross_entropy(
+                        generator.lm_head(gen_hidden).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                    )
+                    total_loss = jepa_loss + gen_recon_loss
+                else:
+                    total_loss = jepa_loss
 
-        gen_opt.zero_grad()
-        pred_opt.zero_grad()
-        jepa_loss.backward()
-        torch.nn.utils.clip_grad_norm_(gen_params + list(predictor.parameters()), cfg.grad_clip)
-        gen_opt.step()
-        pred_opt.step()
+            gen_opt.zero_grad()
+            pred_opt.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(gen_params + list(predictor.parameters()), cfg.grad_clip)
+            gen_opt.step()
+            pred_opt.step()
+        else:
+            with autocast():
+                jepa_loss = F.cross_entropy(
+                    generator(x).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                )
+            gen_opt.zero_grad()
+            jepa_loss.backward()
+            torch.nn.utils.clip_grad_norm_(gen_params, cfg.grad_clip)
+            gen_opt.step()
 
         step += 1
         lm_sum += lm_loss.item()

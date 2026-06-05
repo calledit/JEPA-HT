@@ -9,12 +9,19 @@ class Config:
     context_length: int = 256
     d_model: int = 48
     n_heads: int = 4             # d_head = 12
-    n_layers: int = 6
+    n_layers: int = 7
     ffn_dim: int = 192           # 4 × d_model
     dropout: float = 0.0
 
     # EMA
     ema_decay: float = 0.996
+    enable_target_reconstruction: bool = False
+    enable_generator_reconstruction: bool = False
+    enable_jepa: bool = True
+
+    # Context encoder masking (step 4)
+    mask_token_ratio_max: float = 0.70  # upper bound; each batch samples uniform [0, max]
+    mask_dim_ratio: float = 0.75     # mean fraction of dims zeroed per masked token
 
     # Training
     batch_size: int = 64

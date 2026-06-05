@@ -29,6 +29,30 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
+    def forward_kv(self, x: torch.Tensor):
+        """Full forward, returning (output, k, v) for KV caching."""
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(y), k, v
+
+    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
+        """Single-token forward attending to cached past K, V."""
+        B, T_new, C = x.shape
+        q, k_new, v_new = self.qkv(x).split(C, dim=-1)
+        q     = q.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
+        k_new = k_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
+        v_new = v_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
+        k = torch.cat([past_k, k_new], dim=2)
+        v = torch.cat([past_v, v_new], dim=2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        y = y.transpose(1, 2).contiguous().view(B, T_new, C)
+        return self.out_proj(y), k, v
+
 
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, dropout: float):
@@ -56,6 +80,18 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.ff(self.norm2(x))
         return x
+
+    def forward_kv(self, x: torch.Tensor):
+        attn_out, k, v = self.attn.forward_kv(self.norm1(x))
+        x = x + attn_out
+        x = x + self.ff(self.norm2(x))
+        return x, k, v
+
+    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
+        attn_out, k, v = self.attn.forward_with_cache(self.norm1(x), past_k, past_v)
+        x = x + attn_out
+        x = x + self.ff(self.norm2(x))
+        return x, k, v
 
 
 class Generator(nn.Module):
@@ -96,6 +132,59 @@ class Generator(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lm_head(self.forward_hidden(x))
 
+    def forward_masked(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with embedding masking for JEPA context encoder.
+
+        For a random 20% of token positions:
+          - detach their embedding (no gradient to tok_emb table)
+          - zero a random fraction of their dimensions
+        """
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device)
+        emb = self.tok_emb(x)  # [B, T, d_model]
+
+        ratio = torch.rand(1).item() * self.cfg.mask_token_ratio_max
+        masked = torch.rand(B, T, device=x.device) < ratio  # [B, T]
+
+        # Detach at masked positions — gradient stops before tok_emb for those tokens
+        emb = emb.detach() * masked.unsqueeze(-1) + emb * (~masked).unsqueeze(-1)
+
+        # Zero a random fraction of dims per masked token
+        frac = torch.rand(B, T, 1, device=x.device) * self.cfg.mask_dim_ratio * 2
+        zero_dims = (torch.rand(B, T, self.cfg.d_model, device=x.device) < frac) & masked.unsqueeze(-1)
+        emb = emb * (~zero_dims)
+
+        h = self.drop(emb + self.pos_emb(pos))
+        h = self.blocks(h)
+        return self.norm(h)
+
+    def encode_kv(self, x: torch.Tensor):
+        """Encode full context, return (last_hidden [B, d_model], kv_cache).
+        kv_cache is a list of (k, v) per layer, each [B, n_heads, T, head_dim].
+        """
+        B, T = x.shape
+        pos = torch.arange(T, device=x.device)
+        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        kv_cache = []
+        for block in self.blocks:
+            h, k, v = block.forward_kv(h)
+            kv_cache.append((k, v))
+        return self.norm(h)[:, -1, :], kv_cache
+
+    def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
+        """Decode a single new token position using a KV cache.
+        token_id: [B, 1] long tensor
+        pos: position index for this token
+        Returns: (hidden [B, d_model], updated_kv_cache)
+        """
+        pos_tensor = torch.tensor([pos], device=token_id.device)
+        h = self.drop(self.tok_emb(token_id) + self.pos_emb(pos_tensor))  # [B, 1, d_model]
+        new_kv = []
+        for block, (pk, pv) in zip(self.blocks, kv_cache):
+            h, k, v = block.forward_with_cache(h, pk, pv)
+            new_kv.append((k, v))
+        return self.norm(h)[:, 0, :], new_kv
+
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
                  temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
@@ -115,12 +204,16 @@ class Generator(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Maps generator logits [B, T, vocab_size] → predicted target hidden states [B, T, d_model]."""
+    """Maps generator hidden states [B, T, d_model] → predicted target hidden states [B, T, d_model]."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(cfg.vocab_size, cfg.d_model * 2, bias=False),
+            nn.Linear(cfg.d_model, cfg.d_model * 4, bias=False),
+            nn.GELU(),
+            nn.Linear(cfg.d_model * 4, cfg.d_model * 4, bias=False),
+            nn.GELU(),
+            nn.Linear(cfg.d_model * 4, cfg.d_model * 2, bias=False),
             nn.GELU(),
             nn.Linear(cfg.d_model * 2, cfg.d_model, bias=False),
         )

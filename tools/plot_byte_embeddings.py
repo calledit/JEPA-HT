@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
 from config import Config
-from train import find_latest_checkpoint, build_hierarchy_from_checkpoint
+from model import Generator
+from train import find_latest_checkpoint
 
 
 _CATEGORIES = [
@@ -60,10 +61,11 @@ def main():
 
     print(f"Loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    hierarchy = build_hierarchy_from_checkpoint(ckpt, device)
-    hierarchy.eval()
+    model = Generator(ckpt["cfg"]).to(device)
+    model.load_state_dict(ckpt["target_generator"])
+    model.eval()
 
-    emb = hierarchy.levels[0].context_enc.embedding.weight.detach().cpu().float().numpy()  # [256, 16]
+    emb = model.tok_emb.weight.detach().cpu().float().numpy()  # [256, d_model]
 
     print("Running t-SNE...")
     coords = TSNE(n_components=2, perplexity=args.perplexity, random_state=42).fit_transform(emb)
