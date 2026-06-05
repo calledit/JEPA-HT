@@ -144,7 +144,7 @@ class Generator(nn.Module):
         emb = self.tok_emb(x)  # [B, T, d_model]
 
         ratio = torch.rand(1).item() * self.cfg.mask_token_ratio_max
-        masked = torch.rand(B, T, device=x.device) < ratio  # [B, T]
+        masked = torch.rand(B, T, device=x.device) < ratio
 
         # Detach at masked positions — gradient stops before tok_emb for those tokens
         emb = emb.detach() * masked.unsqueeze(-1) + emb * (~masked).unsqueeze(-1)
@@ -154,9 +154,11 @@ class Generator(nn.Module):
         zero_dims = (torch.rand(B, T, self.cfg.d_model, device=x.device) < frac) & masked.unsqueeze(-1)
         emb = emb * (~zero_dims)
 
+        actual_corruption = zero_dims.float().mean().item()
+
         h = self.drop(emb + self.pos_emb(pos))
         h = self.blocks(h)
-        return self.norm(h)
+        return self.norm(h), actual_corruption
 
     def encode_kv(self, x: torch.Tensor):
         """Encode full context, return (last_hidden [B, d_model], kv_cache).
@@ -223,8 +225,38 @@ class Predictor(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        return self.net(logits)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class CorruptionPredictor(nn.Module):
+    """Takes [gen_hidden ∥ target_hidden] (both detached) and predicts the mask ratio.
+    Architecture: 96 → 192 → 192 → 192 → 96 → 48 → 1
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        D = cfg.d_model
+        self.net = nn.Sequential(
+            nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
+            nn.Linear(D * 4, D * 4, bias=False), nn.GELU(),
+            nn.Linear(D * 4, D * 4, bias=False), nn.GELU(),
+            nn.Linear(D * 4, D * 2, bias=False), nn.GELU(),
+            nn.Linear(D * 2, D,     bias=False), nn.GELU(),
+            nn.Linear(D,     1,     bias=False),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, gen_hidden: torch.Tensor, target_hidden: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([gen_hidden.detach(), target_hidden.detach()], dim=-1)
+        return self.net(x)  # [B, T, 1]
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

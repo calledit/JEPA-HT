@@ -18,6 +18,7 @@ class Config:
     enable_target_reconstruction: bool = False
     enable_generator_reconstruction: bool = False
     enable_jepa: bool = True
+    enable_corruption_predictor: bool = True
 
     # Context encoder masking (step 4)
     mask_token_ratio_max: float = 0.70  # upper bound; each batch samples uniform [0, max]

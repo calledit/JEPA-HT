@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import Generator, Predictor
+from model import Generator, Predictor, CorruptionPredictor
 from data import build_dataset, ByteTokenizer
 
 
@@ -29,8 +29,8 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_key)
 
 
-def save_checkpoint(generator, target_generator, predictor,
-                    gen_opt, target_opt, pred_opt,
+def save_checkpoint(generator, target_generator, predictor, corruption_predictor,
+                    gen_opt, target_opt, pred_opt, corruption_opt,
                     step, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
@@ -38,9 +38,11 @@ def save_checkpoint(generator, target_generator, predictor,
         "generator": generator.state_dict(),
         "target_generator": target_generator.state_dict(),
         "predictor": predictor.state_dict(),
+        "corruption_predictor": corruption_predictor.state_dict(),
         "gen_opt": gen_opt.state_dict(),
         "target_opt": target_opt.state_dict(),
         "pred_opt": pred_opt.state_dict(),
+        "corruption_opt": corruption_opt.state_dict(),
         "step": step,
         "docs_consumed": docs_consumed,
         "cfg": cfg,
@@ -87,6 +89,7 @@ def train():
     generator = Generator(cfg).to(device)
     target_generator = copy.deepcopy(generator)
     predictor = Predictor(cfg).to(device)
+    corruption_predictor = CorruptionPredictor(cfg).to(device)
 
     # Target optimizer: all params, trained with LM loss
     target_opt = torch.optim.AdamW(
@@ -101,6 +104,9 @@ def train():
     pred_opt = torch.optim.AdamW(
         predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
+    corruption_opt = torch.optim.AdamW(
+        corruption_predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    )
 
     step = 0
     skip_docs = 0
@@ -112,7 +118,12 @@ def train():
         generator.load_state_dict(ckpt["generator"])
         target_generator.load_state_dict(ckpt["target_generator"])
         predictor.load_state_dict(ckpt["predictor"])
-        for opt, key in [(gen_opt, "gen_opt"), (target_opt, "target_opt"), (pred_opt, "pred_opt")]:
+        if "corruption_predictor" in ckpt:
+            corruption_predictor.load_state_dict(ckpt["corruption_predictor"])
+        for opt, key in [(gen_opt, "gen_opt"), (target_opt, "target_opt"), (pred_opt, "pred_opt"), (corruption_opt, "corruption_opt")]:
+            if key not in ckpt:
+                print(f"  Warning: {key} not in checkpoint — optimizer restarted")
+                continue
             try:
                 opt.load_state_dict(ckpt[key])
             except ValueError:
@@ -123,7 +134,7 @@ def train():
     else:
         print("No checkpoint found — starting from scratch")
 
-    print(f"Generator params: {generator.num_params():,}  |  Predictor params: {predictor.num_params():,}")
+    print(f"Generator params: {generator.num_params():,}  |  Predictor params: {predictor.num_params():,}  |  CorruptionPredictor params: {corruption_predictor.num_params():,}")
 
     tokenizer = ByteTokenizer()
     train_dataset, val_data, _ = build_dataset(cfg, skip_docs)
@@ -136,10 +147,10 @@ def train():
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if write_header:
-        log_writer.writerow(["step", "lm_loss", "jepa_loss", "val_loss", "lr", "tok_per_s", "elapsed_s"])
+        log_writer.writerow(["step", "lm_loss", "jepa_loss", "corruption_loss", "val_loss", "lr", "tok_per_s", "elapsed_s"])
 
     last_ckpt_interval = step // cfg.checkpoint_interval
-    lm_sum = jepa_sum = 0.0
+    lm_sum = jepa_sum = corruption_sum = 0.0
     loss_count = 0
     tokens_since_log = 0
     t0 = t_last_log = time.time()
@@ -147,6 +158,7 @@ def train():
     generator.train()
     target_generator.train()
     predictor.train()
+    corruption_predictor.train()
 
     autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
 
@@ -156,7 +168,7 @@ def train():
         y = batch[:, 1:]          # targets
 
         lr = get_lr(step, cfg)
-        for opt in (gen_opt, target_opt, pred_opt):
+        for opt in (gen_opt, target_opt, pred_opt, corruption_opt):
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
@@ -188,8 +200,8 @@ def train():
         # ── Step 4: Generator + predictor JEPA loss  —or—  plain LM ─────────
         if cfg.enable_jepa:
             with autocast():
-                gen_hidden = generator.forward_masked(x)   # [B, T, d_model]
-                pred_hidden = predictor(gen_hidden)        # [B, T, d_model]
+                gen_hidden, actual_corruption = generator.forward_masked(x)   # [B, T, d_model], float
+                pred_hidden = predictor(gen_hidden)                # [B, T, d_model]
                 jepa_loss = F.mse_loss(pred_hidden[:, :-1, :], target_hidden[:, 1:, :])
                 if cfg.enable_generator_reconstruction:
                     gen_recon_loss = F.cross_entropy(
@@ -205,6 +217,15 @@ def train():
             torch.nn.utils.clip_grad_norm_(gen_params + list(predictor.parameters()), cfg.grad_clip)
             gen_opt.step()
             pred_opt.step()
+
+            if cfg.enable_corruption_predictor:
+                with autocast():
+                    pred_ratio = corruption_predictor(gen_hidden, target_hidden)  # [B, T, 1]
+                    corruption_loss = F.mse_loss(pred_ratio, torch.full_like(pred_ratio, actual_corruption))
+                corruption_opt.zero_grad()
+                corruption_loss.backward()
+                torch.nn.utils.clip_grad_norm_(corruption_predictor.parameters(), cfg.grad_clip)
+                corruption_opt.step()
         else:
             with autocast():
                 jepa_loss = F.cross_entropy(
@@ -218,13 +239,16 @@ def train():
         step += 1
         lm_sum += lm_loss.item()
         jepa_sum += jepa_loss.item()
+        if cfg.enable_corruption_predictor:
+            corruption_sum += corruption_loss.item()
         loss_count += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
 
         if step % cfg.eval_interval == 0:
-            avg_lm   = lm_sum   / loss_count
-            avg_jepa = jepa_sum / loss_count
-            lm_sum = jepa_sum = 0.0
+            avg_lm         = lm_sum         / loss_count
+            avg_jepa       = jepa_sum       / loss_count
+            avg_corruption = corruption_sum / loss_count
+            lm_sum = jepa_sum = corruption_sum = 0.0
             loss_count = 0
 
             val_loss = estimate_loss(target_generator, val_data, cfg)
@@ -240,19 +264,20 @@ def train():
                 sample = tokenizer.decode(sample_ids[0].tolist())
 
             print(
-                f"  step {step:7d} | lm {avg_lm:.4f} | jepa {avg_jepa:.4f} | val {val_loss:.4f} | "
+                f"  step {step:7d} | lm {avg_lm:.4f} | jepa {avg_jepa:.4f} | "
+                f"corr {avg_corruption:.4f} | val {val_loss:.4f} | "
                 f"lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s | "
                 f"{repr(sample)}"
             )
-            log_writer.writerow([step, f"{avg_lm:.6f}", f"{avg_jepa:.6f}", f"{val_loss:.6f}",
-                                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"])
+            log_writer.writerow([step, f"{avg_lm:.6f}", f"{avg_jepa:.6f}", f"{avg_corruption:.6f}",
+                                  f"{val_loss:.6f}", f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"])
             log_file.flush()
 
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
             save_checkpoint(
-                generator, target_generator, predictor,
-                gen_opt, target_opt, pred_opt,
+                generator, target_generator, predictor, corruption_predictor,
+                gen_opt, target_opt, pred_opt, corruption_opt,
                 step, train_dataset.docs_consumed, cfg,
             )
             last_ckpt_interval = ckpt_interval
