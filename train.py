@@ -202,7 +202,7 @@ def train():
             with autocast():
                 gen_hidden, actual_corruption = generator.forward_masked(x)   # [B, T, d_model], float
                 pred_hidden = predictor(gen_hidden)                # [B, T, d_model]
-                jepa_loss = F.mse_loss(pred_hidden[:, :-1, :], target_hidden[:, 1:, :])
+                jepa_loss = F.mse_loss(pred_hidden, target_hidden)
                 if cfg.enable_generator_reconstruction:
                     gen_recon_loss = F.cross_entropy(
                         generator.lm_head(gen_hidden).reshape(-1, cfg.vocab_size), y.reshape(-1)
