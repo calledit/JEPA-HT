@@ -16,6 +16,10 @@ class Config:
     # EMA
     ema_decay: float = 0.996
 
+    # Fraction of training steps that use clean input instead of noise
+    # This is done to make sure the model learns to use the clean input in inferance
+    clean_input_ratio: float = 0.02
+
     # Contrastive
     enable_contrastive: bool = True
     contrastive_n_samples: int = 16
@@ -28,9 +32,9 @@ class Config:
     # Training
     batch_size: int = 64
     lr: float = 3e-4
-    lr_warmup_steps: int = 1_000
-    lr_end_decay_step: int = 200_000
-    lr_min: float = 3e-4
+    lr_warmup_steps: int = 2_000
+    lr_end_decay_step: int = 500_000
+    lr_min: float = 3e-5
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 

@@ -221,7 +221,8 @@ def train():
             target_hiddens = target_generator.forward_hidden_layerwise(x)
 
         with autocast():
-            gen_hiddens = generator.forward_cross_layerwise(x)
+            clean_every = max(1, round(1 / cfg.clean_input_ratio))
+            gen_hiddens = generator.forward_cross_layerwise(x, use_clean_input=(step % clean_every == 0))
 
             # Per-layer: predict target layer l+1 output from generator layer l output
             layer_losses = [

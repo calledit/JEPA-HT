@@ -121,29 +121,36 @@ class TransformerBlock(nn.Module):
 
 
 class DoubleTransformerBlock(nn.Module):
-    """Two transformer layers per block: layer1 is cross-attn capable, layer2 is always self-attn."""
+    """Two transformer layers per block: layer1 is cross-attn capable, layer2 is always self-attn.
+    input_mlp runs first to let the block detect and adapt to its input (real vs noise).
+    """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
+        self.input_mlp = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
         self.layer1 = TransformerBlock(d_model, n_heads, dropout)
         self.layer2 = TransformerBlock(d_model, n_heads, dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.input_mlp(x)
         x = self.layer1(x)
         x = self.layer2(x)
         return x
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = self.layer1.forward_cross(x, context)
-        x = self.layer2(x)
-        return x
-
     def forward_kv(self, x: torch.Tensor):
+        x = x + self.input_mlp(x)
         x, k1, v1 = self.layer1.forward_kv(x)
         x, k2, v2 = self.layer2.forward_kv(x)
         return x, (k1, v1), (k2, v2)
 
     def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2):
+        x = x + self.input_mlp(x)
         pk1, pv1 = past_kv1
         pk2, pv2 = past_kv2
         x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
@@ -204,21 +211,36 @@ class Generator(nn.Module):
             hiddens.append(h)
         return hiddens
 
-    def forward_cross_layerwise(self, x: torch.Tensor) -> list:
-        """Training-only. Block 0 cross-attends to tok_emb(x)+pos_emb(x).
-        Blocks 1+ cross-attend to the previous block's output, detached.
+    def forward_cross_layerwise(self, x: torch.Tensor, use_clean_input: bool = False) -> list:
+        """Training-only. Every individual transformer layer cross-attends to the corresponding
+        clean real-data state. Matches inference where each layer self-attends to the real
+        accumulated hidden state at that depth.
+        use_clean_input: start each block from its clean state instead of noise, incentivising
+        the model to behave correctly when real data is available (as at inference).
         Returns [h_gen_0, ..., h_gen_N-1], length = n_layers.
         """
+        # Clean forward pass collecting state after every individual layer
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
-        emb = self.drop(self.tok_emb(x) + self.pos_emb(pos))
-        h = torch.randn(B, T, self.cfg.d_model, device=x.device, dtype=emb.dtype) * 0.02
+        h_clean = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        clean_states = [h_clean]  # [emb, b0l1, b0l2, b1l1, b1l2, ...]
+        for block in self.blocks:
+            h_clean = block.layer1(h_clean)
+            clean_states.append(h_clean)
+            h_clean = block.layer2(h_clean)
+            clean_states.append(h_clean)
+            h_clean = h_clean.detach()
+
+        h = torch.randn(B, T, self.cfg.d_model, device=x.device, dtype=clean_states[0].dtype) * 0.02
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
-            context = emb if i == 0 else gen_hiddens[-1].detach()
-            h = block.forward_cross(h, context)
+            if use_clean_input:
+                h = clean_states[2 * i]
+            h = block.layer1.forward_cross(h, clean_states[2 * i])
+            h = block.layer2.forward_cross(h, clean_states[2 * i + 1])
             gen_hiddens.append(h)
-            h = torch.randn(B, T, self.cfg.d_model, device=h.device, dtype=h.dtype) * 0.02
+            if not use_clean_input:
+                h = torch.randn(B, T, self.cfg.d_model, device=h.device, dtype=h.dtype) * 0.02
         return gen_hiddens
 
     def encode_kv(self, x: torch.Tensor):
