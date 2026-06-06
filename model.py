@@ -92,6 +92,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
+        self.norm_context = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, dropout)
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model, dropout)
@@ -102,7 +103,7 @@ class TransformerBlock(nn.Module):
         return x
 
     def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn.forward_cross(self.norm1(x), context)
+        x = x + self.attn.forward_cross(self.norm1(x), self.norm_context(context))
         x = x + self.ff(self.norm2(x))
         return x
 
