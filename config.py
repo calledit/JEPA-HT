@@ -31,8 +31,11 @@ class Config:
     contrastive_clean_corrupt_interval: int = 333
     contrastive_clean_corrupt_n_samples: int = 64
 
+    # JEPA triplet loss
+    jepa_repulsion_weight: float = 0.5
+
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
-    enable_sigreg: bool = True
+    enable_sigreg: bool = False
     sigreg_weight: float = 15.0
     sigreg_n_projections: int = 64
 
@@ -45,11 +48,13 @@ class Config:
 
     # Training
     batch_size: int = 64
-    lr: float = 2e-4
+    decoder_lr: float = 1e-3
+    # 2.50e-06 mabye ??
+    lr: float = 2.5e-6 # Inital of 3e-3 lead to loss explosion 1e-4 does to. 2.49e-05 seamed fine on the first step  5e-5 was not 2.25e-05 was not
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
-    lr_warmup_steps: int = 225_000
-    lr_end_decay_step: int = 260_000
-    lr_min: float = 2e-4
+    lr_warmup_steps: int = 2_000
+    lr_end_decay_step: int = 20_000
+    lr_min: float = 2.5e-6
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 

@@ -185,7 +185,7 @@ def train():
         contrastive_net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     decoder_opt = torch.optim.AdamW(
-        layerwise_decoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+        layerwise_decoder.parameters(), lr=cfg.decoder_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
 
     step = 0
@@ -288,7 +288,7 @@ def train():
         x = batch[:, :-1]
 
         lr = get_lr(step, cfg)
-        for opt in (gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt):
+        for opt in (gen_opt, layerwise_pred_opt, contrastive_opt):
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
@@ -301,30 +301,33 @@ def train():
         with autocast():
             clean_every = max(1, round(1 / cfg.clean_input_ratio))
             fire_cc = cfg.enable_contrastive and (step % cfg.contrastive_clean_corrupt_interval == 0)
-            result = generator.forward_cross_layerwise(
+            gen_hiddens, clean_latents, corrupt_latents = generator.forward_cross_layerwise(
                 x,
                 use_clean_input=(step % clean_every == 0),
                 return_clean_corrupted_latents=fire_cc,
             )
-            if fire_cc:
-                gen_hiddens, clean_latents, h_corrupt_final = result
-            else:
-                gen_hiddens, clean_latents = result
+            h_corrupt_final = corrupt_latents[-1]
 
             if cfg.use_ema:
+                print ("EMA NOT SUPPORTED ANYMORE")
                 with torch.no_grad():
                     target_latents = [clean_latents[0].detach()] + [
                         target_generator.blocks[l](clean_latents[l].detach())
                         for l in range(cfg.n_layers)
                     ]
             else:
-                target_latents = [t.detach() for t in clean_latents]
+                target_latents = clean_latents
 
-            # Per-layer: predict target layer l+1 output from generator layer l output
-            layer_losses = [
-                F.mse_loss(layerwise_predictor.predictors[l](gen_hiddens[l]), target_latents[l + 1])
-                for l in range(cfg.n_layers)
-            ]
+            # Per-layer triplet loss:
+            # attract prediction to clean target, repel from corrupted target
+            layer_losses = []
+            for l in range(cfg.n_layers):
+                pred = layerwise_predictor.predictors[l](gen_hiddens[l])
+                target = target_latents[l + 1].detach()
+                corrupt = corrupt_latents[l + 1]
+                attract = F.mse_loss(pred, target)
+                repel = (F.mse_loss(pred, corrupt) + F.mse_loss(target, corrupt)) / 2
+                layer_losses.append(attract / (repel + 1e-8))
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
             if cfg.enable_vicreg:
@@ -405,7 +408,7 @@ def train():
                 vicreg_var_layer_sums[l] += vc_var_losses[l].item()
                 vicreg_cov_layer_sums[l] += vc_cov_losses[l].item()
         with torch.no_grad():
-            latent_std_sum += target_latents[-1].float().std(dim=[0, 1]).mean().item()
+            latent_std_sum += target_latents[-1].detach().float().std(dim=[0, 1]).mean().item()
         loss_count += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
 

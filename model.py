@@ -254,19 +254,22 @@ class Generator(nn.Module):
             h = block.layer2.forward_cross(h, context_states[2 * i + 1])
             gen_hiddens.append(h)
 
-        if not return_clean_corrupted_latents:
-            return gen_hiddens, clean_latents
+        # Corrupted forward pass — always computed, per-layer hidden states collected
+        x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
+        x_corr = x_corr + (x_corr >= x).long()
+        hc = self.tok_emb(x_corr) + self.pos_emb(pos)
+        corrupt_latents = [hc]
+        for i, block in enumerate(self.blocks):
+            hc = hc + block.input_mlp(hc)
+            hc = block.layer1.forward_cross(hc, context_states[2 * i])
+            hc = block.layer2.forward_cross(hc, context_states[2 * i + 1])
+            corrupt_latents.append(hc)
+            hc = hc.detach()
 
-        with torch.no_grad():
-            x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
-            x_corr = x_corr + (x_corr >= x).long()
-            hc = self.tok_emb(x_corr) + self.pos_emb(pos)
-            for i, block in enumerate(self.blocks):
-                hc = hc + block.input_mlp(hc)
-                hc = block.layer1.forward_cross(hc, context_states[2 * i])
-                hc = block.layer2.forward_cross(hc, context_states[2 * i + 1])
+        if return_clean_corrupted_latents:
+            return gen_hiddens, clean_latents, corrupt_latents
 
-        return gen_hiddens, clean_latents, hc
+        return gen_hiddens, clean_latents, corrupt_latents
 
     def encode_kv(self, x: torch.Tensor):
         """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
