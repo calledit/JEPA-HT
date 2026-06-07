@@ -10,8 +10,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from sklearn.manifold import TSNE
-from scipy.spatial import procrustes
+import umap
 from scipy.interpolate import CubicSpline
 
 from config import Config
@@ -70,34 +69,17 @@ def _load_emb(args):
     return step, emb
 
 
-def _cluster(args):
-    """Process worker: run t-SNE on a pre-extracted embedding (no torch)."""
-    step, emb, perplexity = args
-    coords = TSNE(n_components=2, perplexity=perplexity,
-                  init="pca", random_state=42).fit_transform(emb)
-    return step, coords
+def run_umap(emb_subset, n_neighbors):
+    return umap.UMAP(n_components=2, n_neighbors=n_neighbors).fit_transform(emb_subset)
 
 
-def align_to_reference(reference, coords):
-    """Procrustes-align coords to reference; returns aligned coords."""
-    _, aligned, _ = procrustes(reference, coords)
-    # procrustes normalises scale — restore reference scale
-    scale = np.sqrt((reference ** 2).sum())
-    return aligned * scale
-
-
-def run_tsne(emb_subset, perplexity):
-    return TSNE(n_components=2, perplexity=perplexity,
-                init="pca", random_state=42).fit_transform(emb_subset)
-
-
-def plot_static(ckpt_path, byte_ids, perplexity, save):
+def plot_static(ckpt_path, byte_ids, n_neighbors, save):
     cfg = Config()
     device = torch.device(cfg.device)
     emb = load_embeddings(ckpt_path, device)
 
-    print(f"Running t-SNE on {len(byte_ids)} tokens...")
-    coords = run_tsne(emb[byte_ids], perplexity)
+    print(f"Running UMAP on {len(byte_ids)} tokens...")
+    coords = run_umap(emb[byte_ids], n_neighbors)
 
     fig, ax = plt.subplots(figsize=(12, 9))
     fig.suptitle(f"Byte embedding table — {os.path.basename(ckpt_path)}", fontsize=12)
@@ -124,7 +106,7 @@ def plot_static(ckpt_path, byte_ids, perplexity, save):
         plt.show()
 
 
-def plot_animation(ckpt_dir, byte_ids, perplexity, stride, interval, save, workers, interp, start):
+def plot_animation(ckpt_dir, byte_ids, n_neighbors, stride, interval, save, workers, interp, start):
     # Prefer the lightweight .npy embedding exports if available
     emb_dir = os.path.join(ckpt_dir, "embeddings")
     npy_paths = sorted(glob.glob(os.path.join(emb_dir, "emb_s*.npy")),
@@ -156,23 +138,21 @@ def plot_animation(ckpt_dir, byte_ids, perplexity, stride, interval, save, worke
                 print(f"  loaded step {step:>7}")
                 embs[step] = emb
 
-    # Cap t-SNE workers: each run uses ~1 core, too many in parallel causes thrashing
-    tsne_workers = min(workers, os.cpu_count() or 4)
-    print(f"Running t-SNE in parallel ({tsne_workers} workers)...")
-    tsne_args = [(step, emb, perplexity) for step, emb in sorted(embs.items())]
-    results = []
-    with ThreadPoolExecutor(max_workers=tsne_workers) as executor:
-        futures = {executor.submit(_cluster, a): a[0] for a in tsne_args}
-        for future in as_completed(futures):
-            step, coords = future.result()
-            print(f"  clustered step {step:>7}")
-            results.append((step, coords))
-    results.sort(key=lambda x: x[0])
-    steps, all_coords = zip(*results)
+    sorted_items = sorted(embs.items())
+    steps = [s for s, _ in sorted_items]
+    all_embs = [e for _, e in sorted_items]
 
-    # Align all frames to the last checkpoint so the layout is stable
-    reference = all_coords[-1].copy()
-    aligned = [align_to_reference(reference, c) for c in all_coords]
+    # Fit UMAP once on the last checkpoint, transform all others into that space
+    print("Fitting UMAP on final checkpoint...")
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors)
+    reducer.fit(all_embs[-1])
+
+    print("Transforming all checkpoints...")
+    aligned = []
+    for i, emb in enumerate(all_embs):
+        coords = reducer.transform(emb)
+        print(f"  transformed step {steps[i]:>7}")
+        aligned.append(coords)
 
     # Fit cubic splines through each point's trajectory and interpolate
     coords_array = np.stack(aligned)              # [n_ckpt, n_points, 2]
@@ -381,7 +361,8 @@ def main():
                         help="parallel workers for loading+clustering (default: cpu count)")
     parser.add_argument("--save", default=None,
                         help="save to file (.png for static, .gif/.mp4 for animation)")
-    parser.add_argument("--perplexity", type=float, default=30.0)
+    parser.add_argument("--neighbors", type=int, default=15,
+                        help="UMAP n_neighbors (default: 15)")
     all_cats = [name for name, _, _ in _CATEGORIES] + ["other"]
     parser.add_argument("--categories", nargs="+", metavar="CAT",
                         choices=all_cats, default=None,
@@ -400,7 +381,7 @@ def main():
     byte_ids = [b for b in range(256) if show_cats is None or categorise(b)[0] in show_cats]
 
     if args.animate:
-        plot_animation(ckpt_dir, byte_ids, args.perplexity,
+        plot_animation(ckpt_dir, byte_ids, args.neighbors,
                        args.stride, args.interval, args.save, args.workers, args.interp, args.start)
     else:
         device = torch.device(cfg.device)
@@ -409,7 +390,7 @@ def main():
             print("No checkpoint found.")
             return
         print(f"Loading {ckpt_path}")
-        plot_static(ckpt_path, byte_ids, args.perplexity, args.save)
+        plot_static(ckpt_path, byte_ids, args.neighbors, args.save)
 
 
 if __name__ == "__main__":

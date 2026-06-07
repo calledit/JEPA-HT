@@ -48,17 +48,21 @@ def main():
 
     print(f"Loaded {len(df)} rows | columns: {list(df.columns)}")
 
-    layer_cols = [c for c in df.columns if c.startswith("jepa_loss_") and c != "jepa_loss_avg"]
-    n_layers = len(layer_cols)
+    jepa_layer_cols    = [c for c in df.columns if c.startswith("jepa_loss_")    and c != "jepa_loss_avg"]
+    decoder_layer_cols = [c for c in df.columns if c.startswith("decoder_loss_") and c != "decoder_loss_avg"]
+    vicreg_var_cols    = [c for c in df.columns if c.startswith("vicreg_var_")   and c != "vicreg_var_avg"]
+    vicreg_cov_cols    = [c for c in df.columns if c.startswith("vicreg_cov_")   and c != "vicreg_cov_avg"]
+    n_layers = max(len(jepa_layer_cols), len(decoder_layer_cols),
+                   len(vicreg_var_cols), len(vicreg_cov_cols), 1)
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    fig, axes = plt.subplots(3, 4, figsize=(20, 12))
     fig.suptitle("Training curves", fontsize=13)
 
-    layer_colors = plt.cm.plasma(np.linspace(0.1, 0.9, max(n_layers, 1)))
+    layer_colors = plt.cm.plasma(np.linspace(0.1, 0.9, n_layers))
 
     # Per-layer JEPA losses
     ax = axes[0, 0]
-    for i, col in enumerate(layer_cols):
+    for i, col in enumerate(jepa_layer_cols):
         plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
     ax.set_title("Per-layer JEPA loss")
     ax.set_ylabel("MSE")
@@ -76,19 +80,39 @@ def main():
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Contrastive loss
+    # Per-layer decoder losses
     ax = axes[0, 2]
+    for i, col in enumerate(decoder_layer_cols):
+        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
+    ax.set_title("Per-layer decoder loss")
+    ax.set_ylabel("loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Decoder avg loss
+    ax = axes[0, 3]
+    if "decoder_loss_avg" in df.columns:
+        plot_line(ax, df["step"], df["decoder_loss_avg"], "decoder avg", "mediumseagreen", args.smooth)
+    ax.set_title("Decoder avg loss")
+    ax.set_ylabel("loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Contrastive loss
+    ax = axes[1, 0]
     if "contrastive_loss" in df.columns:
         plot_line(ax, df["step"], df["contrastive_loss"], "contrastive", "darkorchid", args.smooth)
+    if "clean_corrupt_loss" in df.columns:
+        plot_line(ax, df["step"], df["clean_corrupt_loss"], "cc loss", "crimson", args.smooth)
     if "vicreg_loss" in df.columns:
         plot_line(ax, df["step"], df["vicreg_loss"], "vicreg", "darkorange", args.smooth)
-    ax.set_title("Contrastive / VICReg loss")
+    ax.set_title("Contrastive / CC / VICReg loss")
     ax.set_ylabel("loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     # Latent std
-    ax = axes[1, 0]
+    ax = axes[1, 1]
     if "latent_std" in df.columns:
         plot_line(ax, df["step"], df["latent_std"], "latent std", "seagreen", args.smooth)
     ax.set_title("Latent std (collapse indicator)")
@@ -97,7 +121,7 @@ def main():
     ax.grid(True, alpha=0.3)
 
     # LR
-    ax = axes[1, 1]
+    ax = axes[1, 2]
     if "lr" in df.columns:
         plot_line(ax, df["step"], df["lr"], "lr", "gray", 1)
     ax.set_title("Learning rate")
@@ -106,11 +130,47 @@ def main():
     ax.grid(True, alpha=0.3)
 
     # Throughput
-    ax = axes[1, 2]
+    ax = axes[1, 3]
     if "tok_per_s" in df.columns:
         plot_line(ax, df["step"], df["tok_per_s"] / 1000, "tok/s (k)", "steelblue", args.smooth)
     ax.set_title("Throughput")
     ax.set_ylabel("k tokens / s")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Per-layer VICReg variance
+    ax = axes[2, 0]
+    for i, col in enumerate(vicreg_var_cols):
+        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
+    ax.set_title("Per-layer VICReg variance")
+    ax.set_ylabel("variance")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # VICReg variance avg
+    ax = axes[2, 1]
+    if "vicreg_var_avg" in df.columns:
+        plot_line(ax, df["step"], df["vicreg_var_avg"], "var avg", "tomato", args.smooth)
+    ax.set_title("VICReg variance avg")
+    ax.set_ylabel("variance")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # Per-layer VICReg covariance
+    ax = axes[2, 2]
+    for i, col in enumerate(vicreg_cov_cols):
+        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
+    ax.set_title("Per-layer VICReg covariance")
+    ax.set_ylabel("covariance")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # VICReg covariance avg
+    ax = axes[2, 3]
+    if "vicreg_cov_avg" in df.columns:
+        plot_line(ax, df["step"], df["vicreg_cov_avg"], "cov avg", "darkorchid", args.smooth)
+    ax.set_title("VICReg covariance avg")
+    ax.set_ylabel("covariance")
     ax.legend()
     ax.grid(True, alpha=0.3)
 

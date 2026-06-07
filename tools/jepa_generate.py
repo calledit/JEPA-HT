@@ -44,9 +44,11 @@ def jepa_generate(generator, contrastive_net, prompt_ids, max_new_tokens, device
 
         # Try all 256 candidate bytes in one batched forward pass
         kv_256 = [
-            (k.expand(256, -1, -1, -1).contiguous(),
-             v.expand(256, -1, -1, -1).contiguous())
-            for k, v in kv_cache
+            ((k1.expand(256, -1, -1, -1).contiguous(),
+              v1.expand(256, -1, -1, -1).contiguous()),
+             (k2.expand(256, -1, -1, -1).contiguous(),
+              v2.expand(256, -1, -1, -1).contiguous()))
+            for (k1, v1), (k2, v2) in kv_cache
         ]
         all_bytes = torch.arange(256, dtype=torch.long, device=device).unsqueeze(1)  # [256, 1]
         candidate_hiddens, _ = generator.decode_one(all_bytes, T, kv_256)  # [256, d_model]
@@ -76,7 +78,7 @@ def main():
     parser.add_argument("checkpoint", nargs="?", help="Path to checkpoint .pt file (default: latest in --checkpoint-dir)")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory to search for latest checkpoint")
     parser.add_argument("--prompt", default="The ", help="Text prompt")
-    parser.add_argument("--max-tokens", type=int, default=200)
+    parser.add_argument("--max-tokens", type=int, default=5)
     parser.add_argument("--debug", action="store_true", help="Print scores for all candidates at each step")
     args = parser.parse_args()
 

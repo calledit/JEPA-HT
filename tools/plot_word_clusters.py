@@ -171,6 +171,8 @@ def main():
                         help="Embed each word as 'The word <word> means' to capture semantics over spelling")
     parser.add_argument("--contrastive", action="store_true",
                         help="Use ContrastiveNet pairwise similarity + MDS instead of PCA")
+    parser.add_argument("--layer", type=int, default=-1,
+                        help="Which block's latents to visualise (0-indexed). -1 = final output with norm (default).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,7 +189,18 @@ def main():
     generator = Generator(cfg).to(device)
     generator.load_state_dict(ckpt["generator"])
     generator.eval()
-    encoder = lambda t: generator.forward_hidden(t)[:, -1, :]
+
+    n_layers = cfg.n_layers
+    if args.layer == -1:
+        encoder = lambda t: generator.forward_hidden(t)[:, -1, :]
+        layer_label = f"layer {n_layers - 1} (final+norm)"
+    elif 0 <= args.layer < n_layers:
+        _l = args.layer
+        encoder = lambda t, l=_l: generator.forward_hidden_layerwise(t)[l + 1][:, -1, :]
+        layer_label = f"layer {args.layer}"
+    else:
+        print(f"--layer must be in [0, {n_layers - 1}] or -1, got {args.layer}")
+        return
 
     contrastive_net = None
     if args.contrastive:
@@ -204,7 +217,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(11, 8))
     plt.subplots_adjust(bottom=0.18)
-    fig.suptitle(os.path.basename(ckpt_path), fontsize=9, color="gray")
+    fig.suptitle(f"{os.path.basename(ckpt_path)}  [{layer_label}]", fontsize=9, color="gray")
 
     ax_box   = plt.axes([0.10, 0.06, 0.60, 0.07])
     ax_clear = plt.axes([0.74, 0.06, 0.14, 0.07])

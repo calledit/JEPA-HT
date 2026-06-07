@@ -21,10 +21,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
         y = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -56,7 +57,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y), k, v
 
@@ -92,7 +94,6 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.norm_context = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, dropout)
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = FeedForward(d_model, dropout)
@@ -103,7 +104,7 @@ class TransformerBlock(nn.Module):
         return x
 
     def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn.forward_cross(self.norm1(x), self.norm_context(context))
+        x = x + self.attn.forward_cross(self.norm1(x), self.norm1(context))
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -165,6 +166,7 @@ class Generator(nn.Module):
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
+        self.null_embs = nn.ParameterList([nn.Parameter(torch.empty(cfg.d_model)) for _ in range(cfg.n_layers)])
         self.blocks = nn.Sequential(*[
             DoubleTransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
             for _ in range(cfg.n_layers)
@@ -174,6 +176,8 @@ class Generator(nn.Module):
         self.lm_head.weight = self.tok_emb.weight  # weight tying
 
         self.apply(self._init_weights)
+        for p in self.null_embs:
+            nn.init.normal_(p, std=0.5)
         for name, p in self.named_parameters():
             if name.endswith("out_proj.weight") or name.endswith("ff.net.2.weight"):
                 nn.init.normal_(p, std=0.02 / (2 * cfg.n_layers) ** 0.5)
@@ -211,7 +215,8 @@ class Generator(nn.Module):
             hiddens.append(h)
         return hiddens
 
-    def forward_cross_layerwise(self, x: torch.Tensor, use_clean_input: bool = False) -> list:
+    def forward_cross_layerwise(self, x: torch.Tensor, use_clean_input: bool = False,
+                                return_clean_corrupted_latents: bool = False):
         """Training-only. Every individual transformer layer cross-attends to the corresponding
         clean real-data state. Matches inference where each layer self-attends to the real
         accumulated hidden state at that depth.
@@ -219,29 +224,49 @@ class Generator(nn.Module):
         the model to behave correctly when real data is available (as at inference).
         Returns [h_gen_0, ..., h_gen_N-1], length = n_layers.
         """
-        # Clean forward pass collecting state after every individual layer
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
-        h_clean = self.drop(self.tok_emb(x) + self.pos_emb(pos))
-        clean_states = [h_clean]  # [emb, b0l1, b0l2, b1l1, b1l2, ...]
+        h_clean = self.tok_emb(x) + self.pos_emb(pos)
+
+        # Clean forward pass: collect state before each block (for use_clean_input)
+        # and after input_mlp / after layer1 (for cross-attention context K/V).
+        pre_block_states = []   # state entering each block, before input_mlp
+        context_states = []     # per block: [after_input_mlp, after_layer1]
+        clean_latents = [h_clean]  # index 0 = initial embedding; index l+1 = output of block l
         for block in self.blocks:
+            pre_block_states.append(h_clean)
+            h_clean = h_clean + block.input_mlp(h_clean)
+            context_states.append(h_clean)          # after input_mlp  → K/V for layer1
             h_clean = block.layer1(h_clean)
-            clean_states.append(h_clean)
+            context_states.append(h_clean)          # after layer1     → K/V for layer2
             h_clean = block.layer2(h_clean)
-            clean_states.append(h_clean)
+            clean_latents.append(h_clean)
             h_clean = h_clean.detach()
 
-        h = torch.randn(B, T, self.cfg.d_model, device=x.device, dtype=clean_states[0].dtype) * 0.02
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
             if use_clean_input:
-                h = clean_states[2 * i]
-            h = block.layer1.forward_cross(h, clean_states[2 * i])
-            h = block.layer2.forward_cross(h, clean_states[2 * i + 1])
+                h = pre_block_states[i]
+            else:
+                h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+            h = h + block.input_mlp(h)
+            h = block.layer1.forward_cross(h, context_states[2 * i])
+            h = block.layer2.forward_cross(h, context_states[2 * i + 1])
             gen_hiddens.append(h)
-            if not use_clean_input:
-                h = torch.randn(B, T, self.cfg.d_model, device=h.device, dtype=h.dtype) * 0.02
-        return gen_hiddens
+
+        if not return_clean_corrupted_latents:
+            return gen_hiddens, clean_latents
+
+        with torch.no_grad():
+            x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
+            x_corr = x_corr + (x_corr >= x).long()
+            hc = self.tok_emb(x_corr) + self.pos_emb(pos)
+            for i, block in enumerate(self.blocks):
+                hc = hc + block.input_mlp(hc)
+                hc = block.layer1.forward_cross(hc, context_states[2 * i])
+                hc = block.layer2.forward_cross(hc, context_states[2 * i + 1])
+
+        return gen_hiddens, clean_latents, hc
 
     def encode_kv(self, x: torch.Tensor):
         """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
@@ -342,6 +367,34 @@ class ContrastiveNet(nn.Module):
     def forward(self, h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h_a.detach(), h_b.detach()], dim=-1)
         return self.net(x).squeeze(-1)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class LayerwiseDecoder(nn.Module):
+    """One 4-layer MLP decoder per block for probing latent quality via reconstruction loss."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        D, H, V = cfg.d_model, 4 * cfg.d_model, cfg.vocab_size
+        self.decoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(D, H, bias=False), nn.GELU(),
+                nn.Linear(H, H, bias=False), nn.GELU(),
+                nn.Linear(H, H, bias=False), nn.GELU(),
+                nn.Linear(H, V, bias=False),
+            )
+            for _ in range(cfg.n_layers)
+        ])
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, l: int, h: torch.Tensor) -> torch.Tensor:
+        return self.decoders[l](h)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
