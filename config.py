@@ -33,7 +33,7 @@ class Config:
 
     # Small reconstruction probe on first N latent dims
     recon_net_dims: int = 8
-    recon_loss_weight: float = 1.0
+    recon_loss_weight: float = 0.0
 
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
@@ -56,11 +56,11 @@ class Config:
     batch_size: int = 64
     decoder_lr: float = 3e-4
     contrastive_lr: float = 2e-4
-    lr: float = 7e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
+    lr: float = 1e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
-    lr_min: float = 3e-4
+    lr_min: float = 1e-4
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 
