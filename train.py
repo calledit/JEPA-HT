@@ -250,7 +250,7 @@ def train():
     log_writer = csv.writer(log_file)
     if write_header:
         layer_headers = [f"jepa_loss_{l}" for l in range(cfg.n_layers)]
-        decoder_headers = [f"decoder_loss_{l}" for l in range(cfg.n_layers)]
+        decoder_headers = [col for l in range(cfg.n_layers) for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}")]
         vicreg_var_headers = [f"vicreg_var_{l}" for l in range(cfg.n_layers)]
         vicreg_cov_headers = [f"vicreg_cov_{l}" for l in range(cfg.n_layers)]
         log_writer.writerow(
@@ -268,7 +268,8 @@ def train():
     vicreg_var_layer_sums = [0.0] * cfg.n_layers
     vicreg_cov_layer_sums = [0.0] * cfg.n_layers
     clean_corrupt_count = 0
-    decoder_layer_sums = [0.0] * cfg.n_layers
+    decoder_layer_sums_a = [0.0] * cfg.n_layers
+    decoder_layer_sums_b = [0.0] * cfg.n_layers
     decoder_sum = 0.0
     decoder_count = 0
     loss_count = 0
@@ -381,22 +382,26 @@ def train():
             targets = x.reshape(-1)
             with autocast():
                 dec_losses = [
-                    (F.cross_entropy(
-                        layerwise_decoder(l, gen_hiddens[l].detach()).reshape(-1, cfg.vocab_size),
-                        targets,
-                    ) + F.cross_entropy(
-                        layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
-                        targets,
-                    )) / 2
+                    (
+                        F.cross_entropy(
+                            layerwise_decoder(l, gen_hiddens[l].detach()).reshape(-1, cfg.vocab_size),
+                            targets,
+                        ),
+                        F.cross_entropy(
+                            layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
+                            targets,
+                        ),
+                    )
                     for l in range(cfg.n_layers)
                 ]
-                dec_loss = sum(dec_losses) / cfg.n_layers
+                dec_loss = sum((a + b) / 2 for a, b in dec_losses) / cfg.n_layers
             decoder_opt.zero_grad()
             dec_loss.backward()
             torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
             decoder_opt.step()
-            for l, dl in enumerate(dec_losses):
-                decoder_layer_sums[l] += dl.item()
+            for l, (da, db) in enumerate(dec_losses):
+                decoder_layer_sums_a[l] += da.item()
+                decoder_layer_sums_b[l] += db.item()
             decoder_sum += dec_loss.item()
             decoder_count += 1
 
@@ -427,14 +432,16 @@ def train():
             avg_vicreg_var        = sum(avg_vicreg_var_layers) / cfg.n_layers
             avg_vicreg_cov        = sum(avg_vicreg_cov_layers) / cfg.n_layers
             avg_latent_std        = latent_std_sum    / loss_count
-            avg_dec_layers        = [decoder_layer_sums[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
+            avg_dec_layers_a      = [decoder_layer_sums_a[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
+            avg_dec_layers_b      = [decoder_layer_sums_b[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec               = decoder_sum / max(decoder_count, 1)
             jepa_layer_sums = [0.0] * cfg.n_layers
             jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = 0.0
             vicreg_var_layer_sums = [0.0] * cfg.n_layers
             vicreg_cov_layer_sums = [0.0] * cfg.n_layers
             clean_corrupt_count = 0
-            decoder_layer_sums = [0.0] * cfg.n_layers
+            decoder_layer_sums_a = [0.0] * cfg.n_layers
+            decoder_layer_sums_b = [0.0] * cfg.n_layers
             decoder_sum = 0.0
             decoder_count = 0
             loss_count = 0
@@ -446,7 +453,7 @@ def train():
             tokens_since_log = 0
 
             layer_str = " | ".join(f"l{l} {avg_layer_losses[l]:.4f}" for l in range(cfg.n_layers))
-            dec_str = " | ".join(f"d{l} {avg_dec_layers[l]:.4f}" for l in range(cfg.n_layers))
+            dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
                 f"contra {avg_contrastive:.4f} | cc {avg_clean_corrupt:.4f} | "
@@ -462,7 +469,7 @@ def train():
                 [f"{avg_vicreg_var:.6f}"] +
                 [f"{avg_vicreg_cov_layers[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{avg_vicreg_cov:.6f}"] +
-                [f"{avg_dec_layers[l]:.6f}" for l in range(cfg.n_layers)] +
+                [val for l in range(cfg.n_layers) for val in (f"{avg_dec_layers_a[l]:.6f}", f"{avg_dec_layers_b[l]:.6f}")] +
                 [f"{avg_dec:.6f}", f"{val_loss:.6f}", f"{avg_latent_std:.6f}",
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"]
             )

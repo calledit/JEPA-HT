@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--log",    default="checkpoints/training_log.csv")
     parser.add_argument("--smooth", type=int, default=20)
     parser.add_argument("--start",  type=int, default=0)
+    parser.add_argument("--layer",  type=int, default=None)
     args = parser.parse_args()
 
     df = pd.read_csv(args.log)
@@ -48,11 +49,18 @@ def main():
 
     print(f"Loaded {len(df)} rows | columns: {list(df.columns)}")
 
-    jepa_layer_cols    = [c for c in df.columns if c.startswith("jepa_loss_")    and c != "jepa_loss_avg"]
-    decoder_layer_cols = [c for c in df.columns if c.startswith("decoder_loss_") and c != "decoder_loss_avg"]
-    vicreg_var_cols    = [c for c in df.columns if c.startswith("vicreg_var_")   and c != "vicreg_var_avg"]
-    vicreg_cov_cols    = [c for c in df.columns if c.startswith("vicreg_cov_")   and c != "vicreg_cov_avg"]
-    n_layers = max(len(jepa_layer_cols), len(decoder_layer_cols),
+    def layer_filter(cols, only):
+        if only is None:
+            return cols
+        return [c for c in cols if c.endswith(f"_{only}")]
+
+    jepa_layer_cols    = layer_filter([c for c in df.columns if c.startswith("jepa_loss_")    and c != "jepa_loss_avg"], args.layer)
+    decoder_a_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_a_")], args.layer)
+    decoder_b_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_b_")], args.layer)
+    decoder_layer_cols = decoder_a_cols if decoder_a_cols else layer_filter([c for c in df.columns if c.startswith("decoder_loss_") and c != "decoder_loss_avg"], args.layer)
+    vicreg_var_cols    = layer_filter([c for c in df.columns if c.startswith("vicreg_var_")   and c != "vicreg_var_avg"], args.layer)
+    vicreg_cov_cols    = layer_filter([c for c in df.columns if c.startswith("vicreg_cov_")   and c != "vicreg_cov_avg"], args.layer)
+    n_layers = max(len(jepa_layer_cols), len(decoder_a_cols) or len(decoder_layer_cols),
                    len(vicreg_var_cols), len(vicreg_cov_cols), 1)
 
     fig, axes = plt.subplots(3, 4, figsize=(20, 12))
@@ -82,8 +90,13 @@ def main():
 
     # Per-layer decoder losses
     ax = axes[0, 2]
-    for i, col in enumerate(decoder_layer_cols):
-        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
+    if decoder_a_cols:
+        for i, (ca, cb) in enumerate(zip(decoder_a_cols, decoder_b_cols)):
+            plot_line(ax, df["step"], df[ca], f"l{i} gen",   layer_colors[i], args.smooth, "-")
+            plot_line(ax, df["step"], df[cb], f"l{i} clean", layer_colors[i], args.smooth, "--")
+    else:
+        for i, col in enumerate(decoder_layer_cols):
+            plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
     ax.set_title("Per-layer decoder loss")
     ax.set_ylabel("loss")
     ax.legend()
