@@ -15,13 +15,7 @@ from torch.utils.data import DataLoader
 from config import Config
 from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder
 from data import build_dataset
-from attract_tracker import AttractPushTracker
-
-
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
-
-_PUSH_N_BUCKETS = 1000
-_PUSH_EDGES = np.geomspace(1e-10, 1.0, _PUSH_N_BUCKETS + 1)  # 100 buckets per decade
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
@@ -37,7 +31,6 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
 def save_checkpoint(generator, target_generator, layerwise_predictor, contrastive_net,
                     layerwise_decoder,
                     gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
-                    attract_tracker,
                     step, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
@@ -54,7 +47,6 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, contrastiv
         "step": step,
         "docs_consumed": docs_consumed,
         "cfg": cfg,
-        "attract_tracker": attract_tracker.state_dict(),
     }, path)
     print(f"  [ckpt] step {step} → {path}")
 
@@ -234,10 +226,8 @@ def train():
                 print(f"  Warning: skipping {key} state (shape mismatch — optimizer restarted)")
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
-        attract_tracker_state = ckpt.get("attract_tracker", None)
         print(f"  Resuming at step {step}")
     else:
-        attract_tracker_state = None
         print("No checkpoint found — starting from scratch")
 
     print(
@@ -252,16 +242,6 @@ def train():
     loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=0)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    push_log_path = os.path.join(cfg.checkpoint_dir, "attract_push_samples.csv")
-    push_log_file = open(push_log_path, "a", newline="")
-    push_log_writer = csv.writer(push_log_file)
-    if not os.path.exists(push_log_path) or os.path.getsize(push_log_path) == 0:
-        push_log_writer.writerow(
-            ["step", "layer"] +
-            [f"count_{i}" for i in range(_PUSH_N_BUCKETS)] +
-            [f"push_{i}" for i in range(_PUSH_N_BUCKETS)]
-        )
-
     log_path = os.path.join(cfg.checkpoint_dir, "training_log.csv")
     write_header = not os.path.exists(log_path)
     log_file = open(log_path, "a", newline="")
@@ -291,9 +271,6 @@ def train():
     decoder_sum = 0.0
     decoder_count = 0
     loss_count = 0
-    attract_tracker = AttractPushTracker(n_layers=cfg.n_layers)
-    if attract_tracker_state is not None:
-        attract_tracker.load_state_dict(attract_tracker_state)
     tokens_since_log = 0
     t0 = t_last_log = time.time()
 
@@ -349,26 +326,12 @@ def train():
                 corrupt = corrupt_latents[l + 1]
                 attract    = F.mse_loss(pred, target)
                 attract_grad = torch.autograd.grad(attract, pred, retain_graph=True)[0]
-                mean_toward_zero = (pred.sign() * attract_grad).mean(dim=(0, 1)).detach()  # [D]
-                anti_zero_loss = cfg.anti_towards_zero_weight * (mean_toward_zero * pred.abs().sum(dim=(0, 1))).sum()
+                mean_bias = attract_grad.mean(dim=(0, 1)).detach()  # [D]
+                weight = torch.where(mean_bias > 0, cfg.anti_bias_weight_pos, cfg.anti_bias_weight_neg)
+                anti_zero_loss = (weight * mean_bias * pred.sum(dim=(0, 1))).sum()
                 repel      = 1 + (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = 1 + (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
                 layer_loss = ((attract - anti_zero_loss + 1)) / (repel * repel_tc * cfg.jepa_repulsion_weight)
-                net_grad = torch.autograd.grad(layer_loss, pred, retain_graph=True)[0].detach()
-                attract_tracker.update(l, pred.detach(), net_grad)
-                if l == 0:
-                    distances = pred.detach().abs().float().cpu().numpy().flatten()
-                    push_vals = (pred.detach().sign() * net_grad).float().cpu().numpy().flatten()
-                    bi = np.searchsorted(_PUSH_EDGES[1:-1], distances)
-                    bi = np.clip(bi, 0, _PUSH_N_BUCKETS - 1)
-                    counts   = np.bincount(bi, minlength=_PUSH_N_BUCKETS).astype(np.float32)
-                    push_sum = np.bincount(bi, weights=push_vals, minlength=_PUSH_N_BUCKETS)
-                    push_avg = np.where(counts > 0, push_sum / counts, 0.0)
-                    push_log_writer.writerow(
-                        [step, l] +
-                        [f"{c:.0f}" for c in counts] +
-                        [f"{p:.6e}" for p in push_avg]
-                    )
                 layer_losses.append(layer_loss)
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
@@ -513,7 +476,6 @@ def train():
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"]
             )
             log_file.flush()
-            push_log_file.flush()
 
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
@@ -521,7 +483,6 @@ def train():
                 generator, target_generator, layerwise_predictor, contrastive_net,
                 layerwise_decoder,
                 gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
-                attract_tracker,
                 step, train_dataset.docs_consumed, cfg,
             )
             last_ckpt_interval = ckpt_interval

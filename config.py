@@ -9,7 +9,7 @@ class Config:
     context_length: int = 256
     d_model: int = 48
     n_heads: int = 4             # d_head = 12
-    n_layers: int = 2
+    n_layers: int = 1
     ffn_dim: int = 192           # 4 × d_model
     dropout: float = 0.0
 
@@ -33,8 +33,8 @@ class Config:
 
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
-    jepa_zero_repel_weight: float = 0.1# pushes pred away from zero; tune to raise latent std
-    anti_towards_zero_weight: float = 0.995
+    anti_bias_weight_pos: float = 0.999  # Keeping them both the same a bit lower than 1.0 keeps some of the JEPA towards zero bias which is good to keep STD from exploding
+    anti_bias_weight_neg: float = 0.999  # cancellation when mean_bias < 0 (systematic upward pressure)
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
