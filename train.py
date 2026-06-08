@@ -182,7 +182,7 @@ def train():
         layerwise_predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     contrastive_opt = torch.optim.AdamW(
-        contrastive_net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+        contrastive_net.parameters(), lr=cfg.contrastive_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     decoder_opt = torch.optim.AdamW(
         layerwise_decoder.parameters(), lr=cfg.decoder_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
@@ -288,7 +288,7 @@ def train():
         x = batch[:, :-1]
 
         lr = get_lr(step, cfg)
-        for opt in (gen_opt, layerwise_pred_opt, contrastive_opt):
+        for opt in (gen_opt, layerwise_pred_opt):
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
@@ -323,11 +323,13 @@ def train():
             layer_losses = []
             for l in range(cfg.n_layers):
                 pred = layerwise_predictor.predictors[l](gen_hiddens[l])
-                target = target_latents[l + 1].detach()
+                target = target_latents[l + 1]
                 corrupt = corrupt_latents[l + 1]
-                attract = F.mse_loss(pred, target)
-                repel = (F.mse_loss(pred, corrupt) + F.mse_loss(target, corrupt)) / 2
-                layer_losses.append(attract / (repel + 1e-8))
+                attract  = F.mse_loss(pred, target)
+                repel    = 1 + (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
+                repel_tc = 1 + ( 1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
+                repel_zero = 1 / (pred.abs().mean() + 1e-8) #since we are activle figting the attract loss which has a side effect of going to zero we can do this instead of cosine
+                layer_losses.append(((attract + 1) * (1 + cfg.jepa_zero_repel_weight * repel_zero)) / (repel * repel_tc * cfg.jepa_repulsion_weight))
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
             if cfg.enable_vicreg:
@@ -367,7 +369,7 @@ def train():
                     )
                 else:
                     disc_loss = torch.tensor(0.0, device=device)
-                cc_loss = clean_corrupt_loss(contrastive_net, clean_latents[-1].detach(), h_corrupt_final, cfg.contrastive_clean_corrupt_n_samples)
+                cc_loss = clean_corrupt_loss(contrastive_net, clean_latents[-1].detach(), h_corrupt_final.detach(), cfg.contrastive_clean_corrupt_n_samples)
                 contra_loss = disc_loss + cc_loss
             contrastive_opt.zero_grad()
             contra_loss.backward()
@@ -379,10 +381,13 @@ def train():
             targets = x.reshape(-1)
             with autocast():
                 dec_losses = [
-                    F.cross_entropy(
+                    (F.cross_entropy(
                         layerwise_decoder(l, gen_hiddens[l].detach()).reshape(-1, cfg.vocab_size),
                         targets,
-                    )
+                    ) + F.cross_entropy(
+                        layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
+                        targets,
+                    )) / 2
                     for l in range(cfg.n_layers)
                 ]
                 dec_loss = sum(dec_losses) / cfg.n_layers
