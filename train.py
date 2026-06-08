@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder
+from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder, SmallReconNet
 from data import build_dataset
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
 
@@ -29,8 +29,8 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
 
 
 def save_checkpoint(generator, target_generator, layerwise_predictor, contrastive_net,
-                    layerwise_decoder,
-                    gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
+                    layerwise_decoder, recon_net,
+                    gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt, recon_opt,
                     step, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
@@ -40,10 +40,12 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, contrastiv
         "layerwise_predictor": layerwise_predictor.state_dict(),
         "contrastive_net": contrastive_net.state_dict(),
         "layerwise_decoder": layerwise_decoder.state_dict(),
+        "recon_net": recon_net.state_dict(),
         "gen_opt": gen_opt.state_dict(),
         "layerwise_pred_opt": layerwise_pred_opt.state_dict(),
         "contrastive_opt": contrastive_opt.state_dict(),
         "decoder_opt": decoder_opt.state_dict(),
+        "recon_opt": recon_opt.state_dict(),
         "step": step,
         "docs_consumed": docs_consumed,
         "cfg": cfg,
@@ -172,6 +174,7 @@ def train():
     layerwise_predictor = LayerwisePredictor(cfg).to(device)
     contrastive_net = ContrastiveNet(cfg).to(device)
     layerwise_decoder = LayerwiseDecoder(cfg).to(device)
+    recon_net = SmallReconNet(cfg.recon_net_dims, cfg.vocab_size).to(device)
 
     gen_opt = torch.optim.AdamW(
         generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
@@ -184,6 +187,9 @@ def train():
     )
     decoder_opt = torch.optim.AdamW(
         layerwise_decoder.parameters(), lr=cfg.decoder_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    )
+    recon_opt = torch.optim.AdamW(
+        recon_net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
 
     step = 0
@@ -211,9 +217,15 @@ def train():
         except (RuntimeError, KeyError) as e:
             print(f"  Warning: layerwise_decoder state not loaded ({e}) — starting fresh")
             skip_opts.add("decoder_opt")
+        try:
+            recon_net.load_state_dict(ckpt["recon_net"])
+        except (RuntimeError, KeyError) as e:
+            print(f"  Warning: recon_net state not loaded ({e}) — starting fresh")
+            skip_opts.add("recon_opt")
         for opt, key in [
             (gen_opt, "gen_opt"), (layerwise_pred_opt, "layerwise_pred_opt"),
             (contrastive_opt, "contrastive_opt"), (decoder_opt, "decoder_opt"),
+            (recon_opt, "recon_opt"),
         ]:
             if key in skip_opts:
                 continue
@@ -264,6 +276,7 @@ def train():
     jepa_layer_sums = [0.0] * cfg.n_layers
     attract_layer_sums = [0.0] * cfg.n_layers
     repel_layer_sums = [0.0] * cfg.n_layers
+    recon_layer_sums = [0.0] * cfg.n_layers
     jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = 0.0
     vicreg_var_layer_sums = [0.0] * cfg.n_layers
     vicreg_cov_layer_sums = [0.0] * cfg.n_layers
@@ -324,6 +337,7 @@ def train():
             layer_losses = []
             attract_losses = []
             repel_losses = []
+            recon_losses = []
             for l in range(cfg.n_layers):
                 pred = layerwise_predictor.predictors[l](gen_hiddens[l])
                 target = target_latents[l + 1]
@@ -334,10 +348,15 @@ def train():
                 attract = attract_raw.detach() + (g_centered * pred).sum()
                 repel      = 1 + (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = 1 + (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
-                layer_loss = (attract + 1) / ((1 + (repel + repel_tc)/4) * cfg.jepa_repulsion_weight)
+                recon_loss = F.cross_entropy(
+                    recon_net(clean_latents[l + 1][:, :, :cfg.recon_net_dims]).reshape(-1, cfg.vocab_size),
+                    x.reshape(-1),
+                )
+                layer_loss = (attract + 1) / ((1 + (repel + repel_tc)/4) * cfg.jepa_repulsion_weight) + cfg.recon_loss_weight * recon_loss
                 layer_losses.append(layer_loss)
                 attract_losses.append(attract_raw)
                 repel_losses.append((repel + repel_tc)/4)
+                recon_losses.append(recon_loss)
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
             if cfg.enable_vicreg:
@@ -356,15 +375,18 @@ def train():
                 ) / cfg.n_layers
                 jepa_loss = jepa_loss + cfg.sigreg_weight * sig_loss
 
+
         gen_opt.zero_grad()
         layerwise_pred_opt.zero_grad()
+        recon_opt.zero_grad()
         jepa_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
-            list(generator.parameters()) + list(layerwise_predictor.parameters()), cfg.grad_clip
+            list(generator.parameters()) + list(layerwise_predictor.parameters()) + list(recon_net.parameters()), cfg.grad_clip
         )
         gen_opt.step()
         layerwise_pred_opt.step()
+        recon_opt.step()
 
         # ── Contrastive loss ─────────────────────────────────────────────────
         if cfg.enable_contrastive and fire_cc:
@@ -418,6 +440,8 @@ def train():
         for l in range(cfg.n_layers):
             attract_layer_sums[l] += attract_losses[l].item()
             repel_layer_sums[l] += repel_losses[l].item()
+        for l, r in enumerate(recon_losses):
+            recon_layer_sums[l] += r.item()
         jepa_sum += jepa_loss.item()
         if cfg.enable_contrastive and fire_cc:
             contrastive_sum += disc_loss.item()
@@ -436,6 +460,7 @@ def train():
             avg_layer_losses      = [jepa_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_attract_layers    = [attract_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_repel_layers      = [repel_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
+            avg_recon_layers      = [recon_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_jepa              = jepa_sum          / loss_count
             avg_contrastive       = contrastive_sum   / loss_count
             avg_clean_corrupt     = clean_corrupt_sum / max(clean_corrupt_count, 1)
@@ -450,6 +475,7 @@ def train():
             jepa_layer_sums = [0.0] * cfg.n_layers
             attract_layer_sums = [0.0] * cfg.n_layers
             repel_layer_sums = [0.0] * cfg.n_layers
+            recon_layer_sums = [0.0] * cfg.n_layers
             jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = 0.0
             vicreg_var_layer_sums = [0.0] * cfg.n_layers
             vicreg_cov_layer_sums = [0.0] * cfg.n_layers
@@ -467,7 +493,7 @@ def train():
             tokens_since_log = 0
 
             layer_str = " | ".join(
-                f"l{l} {avg_layer_losses[l]:.4f}(at={avg_attract_layers[l]:.4f} rp={avg_repel_layers[l]:.4f})"
+                f"l{l} {avg_layer_losses[l]:.4f}(at={avg_attract_layers[l]:.4f} rp={avg_repel_layers[l]:.4f} rc={avg_recon_layers[l]:.4f})"
                 for l in range(cfg.n_layers)
             )
             dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
@@ -496,8 +522,8 @@ def train():
         if ckpt_interval > last_ckpt_interval:
             save_checkpoint(
                 generator, target_generator, layerwise_predictor, contrastive_net,
-                layerwise_decoder,
-                gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
+                layerwise_decoder, recon_net,
+                gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt, recon_opt,
                 step, train_dataset.docs_consumed, cfg,
             )
             last_ckpt_interval = ckpt_interval

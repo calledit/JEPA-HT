@@ -388,6 +388,30 @@ class ContrastiveNet(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class SmallReconNet(nn.Module):
+    """Tiny reconstruction probe: takes first `dims` dimensions of a latent, predicts tokens."""
+
+    def __init__(self, dims: int, vocab_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dims, 64, bias=False), nn.GELU(),
+            nn.Linear(64, 128, bias=False), nn.GELU(),
+            nn.Linear(128, 128, bias=False), nn.GELU(),
+            nn.Linear(128, vocab_size, bias=False),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 class LayerwiseDecoder(nn.Module):
     """One 4-layer MLP decoder per block for probing latent quality via reconstruction loss."""
 

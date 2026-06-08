@@ -31,6 +31,10 @@ class Config:
     contrastive_clean_corrupt_interval: int = 333
     contrastive_clean_corrupt_n_samples: int = 64
 
+    # Small reconstruction probe on first N latent dims
+    recon_net_dims: int = 8
+    recon_loss_weight: float = 1.0
+
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
     anti_bias_weight_pos: float = 1.0  # Keeping them both the same a bit lower than 1.0 keeps some of the JEPA towards zero bias which is good to keep STD from exploding
@@ -52,7 +56,7 @@ class Config:
     batch_size: int = 64
     decoder_lr: float = 3e-4
     contrastive_lr: float = 2e-4
-    lr: float = 2.5e-3 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
+    lr: float = 7e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
