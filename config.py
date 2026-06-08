@@ -34,6 +34,7 @@ class Config:
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
     jepa_zero_repel_weight: float = 0.1# pushes pred away from zero; tune to raise latent std
+    anti_towards_zero_weight: float = 0.995
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
