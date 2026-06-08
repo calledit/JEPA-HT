@@ -262,6 +262,8 @@ def train():
     os.makedirs(emb_export_dir, exist_ok=True)
     last_emb_export = step // 500
     jepa_layer_sums = [0.0] * cfg.n_layers
+    attract_layer_sums = [0.0] * cfg.n_layers
+    repel_layer_sums = [0.0] * cfg.n_layers
     jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = 0.0
     vicreg_var_layer_sums = [0.0] * cfg.n_layers
     vicreg_cov_layer_sums = [0.0] * cfg.n_layers
@@ -320,19 +322,22 @@ def train():
             # Per-layer triplet loss:
             # attract prediction to clean target, repel from corrupted target
             layer_losses = []
+            attract_losses = []
+            repel_losses = []
             for l in range(cfg.n_layers):
                 pred = layerwise_predictor.predictors[l](gen_hiddens[l])
                 target = target_latents[l + 1]
                 corrupt = corrupt_latents[l + 1]
-                attract    = F.mse_loss(pred, target)
-                attract_grad = torch.autograd.grad(attract, pred, retain_graph=True)[0]
-                mean_bias = attract_grad.mean(dim=(0, 1)).detach()  # [D]
-                weight = torch.where(mean_bias > 0, cfg.anti_bias_weight_pos, cfg.anti_bias_weight_neg)
-                anti_zero_loss = (weight * mean_bias * pred.sum(dim=(0, 1))).sum()
+                attract_raw = F.mse_loss(pred, target)
+                g = torch.autograd.grad(attract_raw, pred, retain_graph=True)[0].detach()
+                g_centered = g - g.mean(dim=(0, 1), keepdim=True)
+                attract = attract_raw.detach() + (g_centered * pred).sum()
                 repel      = 1 + (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = 1 + (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
-                layer_loss = ((attract - anti_zero_loss + 1)) / (repel * repel_tc * cfg.jepa_repulsion_weight)
+                layer_loss = (attract + 1) / ((1 + (repel + repel_tc)/4) * cfg.jepa_repulsion_weight)
                 layer_losses.append(layer_loss)
+                attract_losses.append(attract_raw)
+                repel_losses.append((repel + repel_tc)/4)
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
             if cfg.enable_vicreg:
@@ -410,6 +415,9 @@ def train():
         step += 1
         for l, ll in enumerate(layer_losses):
             jepa_layer_sums[l] += ll.item()
+        for l in range(cfg.n_layers):
+            attract_layer_sums[l] += attract_losses[l].item()
+            repel_layer_sums[l] += repel_losses[l].item()
         jepa_sum += jepa_loss.item()
         if cfg.enable_contrastive and fire_cc:
             contrastive_sum += disc_loss.item()
@@ -426,6 +434,8 @@ def train():
 
         if step % cfg.eval_interval == 0:
             avg_layer_losses      = [jepa_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
+            avg_attract_layers    = [attract_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
+            avg_repel_layers      = [repel_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_jepa              = jepa_sum          / loss_count
             avg_contrastive       = contrastive_sum   / loss_count
             avg_clean_corrupt     = clean_corrupt_sum / max(clean_corrupt_count, 1)
@@ -438,6 +448,8 @@ def train():
             avg_dec_layers_b      = [decoder_layer_sums_b[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec               = decoder_sum / max(decoder_count, 1)
             jepa_layer_sums = [0.0] * cfg.n_layers
+            attract_layer_sums = [0.0] * cfg.n_layers
+            repel_layer_sums = [0.0] * cfg.n_layers
             jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = 0.0
             vicreg_var_layer_sums = [0.0] * cfg.n_layers
             vicreg_cov_layer_sums = [0.0] * cfg.n_layers
@@ -454,7 +466,10 @@ def train():
             t_last_log = time.time()
             tokens_since_log = 0
 
-            layer_str = " | ".join(f"l{l} {avg_layer_losses[l]:.4f}" for l in range(cfg.n_layers))
+            layer_str = " | ".join(
+                f"l{l} {avg_layer_losses[l]:.4f}(at={avg_attract_layers[l]:.4f} rp={avg_repel_layers[l]:.4f})"
+                for l in range(cfg.n_layers)
+            )
             dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "

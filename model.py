@@ -137,17 +137,26 @@ class DoubleTransformerBlock(nn.Module):
         )
         self.layer1 = TransformerBlock(d_model, n_heads, dropout)
         self.layer2 = TransformerBlock(d_model, n_heads, dropout)
+        self.output_mlp = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.input_mlp(x)
         x = self.layer1(x)
         x = self.layer2(x)
+        x = x + self.output_mlp(x)
         return x
 
     def forward_kv(self, x: torch.Tensor):
         x = x + self.input_mlp(x)
         x, k1, v1 = self.layer1.forward_kv(x)
         x, k2, v2 = self.layer2.forward_kv(x)
+        x = x + self.output_mlp(x)
         return x, (k1, v1), (k2, v2)
 
     def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2):
@@ -156,6 +165,7 @@ class DoubleTransformerBlock(nn.Module):
         pk2, pv2 = past_kv2
         x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
         x, k2, v2 = self.layer2.forward_with_cache(x, pk2, pv2)
+        x = x + self.output_mlp(x)
         return x, (k1, v1), (k2, v2)
 
 
@@ -240,6 +250,7 @@ class Generator(nn.Module):
             h_clean = block.layer1(h_clean)
             context_states.append(h_clean)          # after layer1     → K/V for layer2
             h_clean = block.layer2(h_clean)
+            h_clean = h_clean + block.output_mlp(h_clean)
             clean_latents.append(h_clean)
             h_clean = h_clean.detach()
 
@@ -252,6 +263,7 @@ class Generator(nn.Module):
             h = h + block.input_mlp(h)
             h = block.layer1.forward_cross(h, context_states[2 * i])
             h = block.layer2.forward_cross(h, context_states[2 * i + 1])
+            h = h + block.output_mlp(h)
             gen_hiddens.append(h)
 
         # Corrupted forward pass — always computed, per-layer hidden states collected
@@ -263,6 +275,7 @@ class Generator(nn.Module):
             hc = hc + block.input_mlp(hc)
             hc = block.layer1.forward_cross(hc, context_states[2 * i])
             hc = block.layer2.forward_cross(hc, context_states[2 * i + 1])
+            hc = hc + block.output_mlp(hc)
             corrupt_latents.append(hc)
             hc = hc.detach()
 

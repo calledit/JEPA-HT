@@ -33,8 +33,8 @@ class Config:
 
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
-    anti_bias_weight_pos: float = 0.999  # Keeping them both the same a bit lower than 1.0 keeps some of the JEPA towards zero bias which is good to keep STD from exploding
-    anti_bias_weight_neg: float = 0.999  # cancellation when mean_bias < 0 (systematic upward pressure)
+    anti_bias_weight_pos: float = 1.0  # Keeping them both the same a bit lower than 1.0 keeps some of the JEPA towards zero bias which is good to keep STD from exploding
+    anti_bias_weight_neg: float = 1.0  # cancellation when mean_bias < 0 (systematic upward pressure)
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
