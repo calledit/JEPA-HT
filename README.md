@@ -74,7 +74,7 @@ In this JEPA setup both hyperparameters have stronger and more subtle effects.
 
 In standard reconstruction loss, gradient quality degrades with small batches. When you use a small batch size in simamese JEPA the predictor is trained against a narrow, unrepresentative slice of what the generator can produce across the full data. The gradient quality degrades through both levels at once, making the effective cost of small batches worse than in supervised learning.
 
-This interaction also weakens the toward-zero mitigation. The batch-mean gradient subtracted in the anti-bias term is an estimate of the systematic bias across `P(data)`. With small batches that estimate is already noisy, but it is additionally noisy because the targets it averages over were themselves produced from that same small sample. The bias estimate is therefore less reliable, and the mitigation may subtract signal rather than bias or fail to remove the bias at all.
+This interaction also weakens the toward-zero mitigation. The batch-mean gradient subtracted in the anti-bias term is an estimate of the systematic bias across in the attraction loss. With small batches that estimate is already noisy, but it is additionally noisy because the targets it averages over were themselves produced from that same small sample. The bias estimate is therefore less reliable, and the mitigation may subtract signal rather than bias or fail to remove the bias at all.
 
 So while a bigger batch size does give better gradients it is for diffrent reasons than in standard reconstruction loss.
 
