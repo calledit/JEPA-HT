@@ -17,9 +17,8 @@ class Config:
     ema_decay: float = 0.996
     use_ema: bool = False  # if True, target = EMA_block(clean_latent); if False, target = clean_latent directly
 
-    # Fraction of training steps that use clean input instead of noise
-    # This is done to make sure the model learns to use the clean input in inferance
-    clean_input_ratio: float = 0.02
+    # Number of positions per sample (per block) replaced with real embeddings instead of null
+    n_clean_tokens: int = 2
 
     # How often to train the layerwise decoder probes
     decoder_train_interval: int = 13
@@ -53,14 +52,14 @@ class Config:
     vicreg_cov_weight: float = 1.0
 
     # Training
-    batch_size: int = 64
+    batch_size: int = 128
     decoder_lr: float = 3e-4
     contrastive_lr: float = 2e-4
-    lr: float = 1e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
+    lr: float = 2e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
-    lr_min: float = 1e-4
+    lr_min: float = 2e-4
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 

@@ -11,11 +11,13 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import warnings
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+warnings.filterwarnings("ignore", message="n_jobs value.*overridden", category=UserWarning)
 import umap
 from scipy.interpolate import CubicSpline
 
@@ -24,9 +26,8 @@ from model import Generator
 from train import find_latest_checkpoint
 
 
-def get_hiddens(model, text, layer, device):
-    """Run model on text, return hidden states at chosen layer: [T, d_model]."""
-    ids = list(text.encode("utf-8"))
+def get_hiddens(model, ids, layer, device):
+    """Run model on token id list, return hidden states at chosen layer: [T, d_model]."""
     x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
     with torch.no_grad():
         hiddens = model.forward_hidden_layerwise(x)
@@ -35,6 +36,7 @@ def get_hiddens(model, text, layer, device):
     else:
         h = hiddens[layer]
     return h.squeeze(0).cpu().float().detach().numpy()  # [T, d_model]
+
 
 
 def label_for(b: int) -> str:
@@ -87,20 +89,28 @@ def main():
         print("Text must be at least 2 bytes.")
         return
 
+    # Run model once (causal: hidden states are independent of suffix).
     print(f"Running model on {T} tokens at {layer_label}...")
-    hiddens = get_hiddens(model, args.text, args.layer, device)  # [T, d_model]
+    hiddens = get_hiddens(model, ids, args.layer, device)  # [T, d_model]
 
-    # Fit UMAP once on the full token set, transform each prefix into that fixed space
+    # Fit UMAP on all T tokens — this is the final/reference layout.
     n_neighbors = min(args.neighbors, T - 1)
-    print(f"Fitting UMAP on all {T} tokens (n_neighbors={n_neighbors})...")
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
-    reducer.fit(hiddens)
+    print(f"Fitting final UMAP layout (n_neighbors={n_neighbors})...")
+    reducer_full = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
+    final_coords = reducer_full.fit_transform(hiddens)  # [T, 2]
 
-    print("Transforming each prefix...")
+    # For each prefix of length n, re-fit UMAP initialised at the final positions
+    # of those n tokens.  UMAP optimises from that starting point so the coordinate
+    # frame is consistent by construction — no post-hoc alignment needed.
+    print("Fitting per-prefix UMAP layouts...")
     prefix_coords = []
     for n in range(1, T + 1):
-        c = reducer.transform(hiddens[:n])  # [n, 2]
-        prefix_coords.append(c)
+        if n <= 2:
+            prefix_coords.append(final_coords[:n].copy())
+        else:
+            nn = min(args.neighbors, n - 1)
+            reducer_n = umap.UMAP(n_components=2, n_neighbors=nn, init=final_coords[:n].copy())
+            prefix_coords.append(reducer_n.fit_transform(hiddens[:n]))
         print(f"  prefix {n}/{T}")
 
     # Build per-token position arrays over all T keyframes.

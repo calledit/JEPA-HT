@@ -306,11 +306,9 @@ def train():
 
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
-            clean_every = max(1, round(1 / cfg.clean_input_ratio))
             fire_cc = cfg.enable_contrastive and (step % cfg.contrastive_clean_corrupt_interval == 0)
             gen_hiddens, clean_latents, corrupt_latents = generator.forward_cross_layerwise(
                 x,
-                use_clean_input=(step % clean_every == 0),
                 return_clean_corrupted_latents=fire_cc,
             )
             h_corrupt_final = corrupt_latents[-1]
@@ -344,7 +342,7 @@ def train():
                 attract = attract_raw.detach() + (g_centered * pred).sum()
                 repel      = (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
-                layer_loss = attract + (repel + repel_tc) * cfg.jepa_repulsion_weight
+                layer_loss = attract - (repel + repel_tc) * cfg.jepa_repulsion_weight
                 layer_losses.append(layer_loss)
                 attract_losses.append(real_attract)
                 toward_zero_losses.append(toward_zero_mse)

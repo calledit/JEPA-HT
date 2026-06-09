@@ -225,13 +225,13 @@ class Generator(nn.Module):
             hiddens.append(h)
         return hiddens
 
-    def forward_cross_layerwise(self, x: torch.Tensor, use_clean_input: bool = False,
+    def forward_cross_layerwise(self, x: torch.Tensor,
                                 return_clean_corrupted_latents: bool = False):
         """Training-only. Every individual transformer layer cross-attends to the corresponding
         clean real-data state. Matches inference where each layer self-attends to the real
         accumulated hidden state at that depth.
-        use_clean_input: start each block from its clean state instead of noise, incentivising
-        the model to behave correctly when real data is available (as at inference).
+        cfg.n_clean_tokens positions per sample are replaced with their real embedding instead
+        of the null embedding, so the model always trains on some real input signal.
         Returns [h_gen_0, ..., h_gen_N-1], length = n_layers.
         """
         B, T = x.shape
@@ -256,10 +256,12 @@ class Generator(nn.Module):
 
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
-            if use_clean_input:
-                h = pre_block_states[i]
-            else:
-                h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+            h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+            if self.cfg.n_clean_tokens > 0:
+                # One argsort over uniform noise gives B independent random permutations in a single kernel
+                idxs = torch.rand(B, T, device=x.device).argsort(dim=1)[:, :self.cfg.n_clean_tokens]  # [B, n]
+                idx_exp = idxs.unsqueeze(-1).expand(-1, -1, h.size(-1))                                # [B, n, D]
+                h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             h = h + block.input_mlp(h)
             h = block.layer1.forward_cross(h, context_states[2 * i])
             h = block.layer2.forward_cross(h, context_states[2 * i + 1])
