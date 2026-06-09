@@ -338,8 +338,8 @@ def train():
                 g_centered = g - g.mean(dim=(0, 1), keepdim=True)
                 diff = (pred - target).detach()
                 toward_zero_mse = diff.mean(dim=(0, 1)).pow(2).mean()
-                real_attract = attract_raw.detach() - toward_zero_mse
-                attract = attract_raw.detach() + (g_centered * pred).sum()
+                real_attract = attract_raw.detach() - toward_zero_mse.detach()
+                attract = (g_centered * pred).sum() + 2
                 repel      = (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
                 layer_loss = attract - (repel + repel_tc) * cfg.jepa_repulsion_weight
