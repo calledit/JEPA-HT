@@ -69,8 +69,8 @@ In this JEPA setup both hyperparameters have stronger and more subtle effects.
 
 **Batch size** affects two compounded levels of sampling simultaneously:
 
-1. How well the batch samples the training data distribution which is the same as in normal reconstruction loss.
-2. How well the resulting latents sample the target latent distribution at that current progression of the training.
+1. It effects how well the batch samples the training data distribution which is the same as in normal reconstruction loss.
+2. It effects how well the resulting latents sample the target latent distribution at that current progression of the training.
 
 In standard reconstruction loss, gradient quality degrades with small batches. When you use a small batch size in simamese JEPA the predictor is trained against a narrow, unrepresentative slice of what the generator can produce across the full data. The gradient quality degrades through both levels at once, making the effective cost of small batches worse than in supervised learning.
 
