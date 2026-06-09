@@ -334,12 +334,15 @@ def train():
                 target = target_latents[l + 1]
                 corrupt = corrupt_latents[l + 1]
                 attract_raw = F.mse_loss(pred, target)
-                g = torch.autograd.grad(attract_raw, pred, retain_graph=True)[0].detach()
-                g_centered = g - g.mean(dim=(0, 1), keepdim=True)
+                loss_for_grad = attract_raw
+                for _ in range(cfg.anti_bias_iterations):
+                    g = torch.autograd.grad(loss_for_grad, pred, retain_graph=True)[0].detach()
+                    g_centered = g - g.mean(dim=(0, 1), keepdim=True)
+                    loss_for_grad = (g_centered * pred).sum()
                 diff = (pred - target).detach()
                 toward_zero_mse = diff.mean(dim=(0, 1)).pow(2).mean()
                 real_attract = attract_raw.detach() - toward_zero_mse.detach()
-                attract = (g_centered * pred).sum() + 2
+                attract = loss_for_grad + 2
                 repel      = (1 - F.cosine_similarity(pred, corrupt, dim=-1).mean()) / 2
                 repel_tc   = (1 - F.cosine_similarity(target, corrupt, dim=-1).mean()) / 2
                 layer_loss = attract - (repel + repel_tc) * cfg.jepa_repulsion_weight
