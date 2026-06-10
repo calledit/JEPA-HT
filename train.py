@@ -1,7 +1,6 @@
 import copy
 import csv
 import glob
-import itertools
 import math
 import os
 import re
@@ -11,7 +10,6 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
 from config import Config
 from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder
@@ -55,18 +53,19 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, contrastiv
     print(f"  [ckpt] step {step} → {path}")
 
 
-def get_lr(step: int, cfg: Config) -> float:
+def get_lr(step: int, cfg: Config, base_lr: float | None = None) -> float:
+    peak = base_lr if base_lr is not None else cfg.lr
     if step < cfg.lr_warmup_steps:
-        return cfg.lr * step / max(cfg.lr_warmup_steps, 1)
+        return peak * step / max(cfg.lr_warmup_steps, 1)
     decay_steps = max(cfg.lr_end_decay_step - cfg.lr_warmup_steps, 1)
     progress = min((step - cfg.lr_warmup_steps) / decay_steps, 1.0)
     if cfg.lr_schedule == "cosine":
         factor = (math.cos(math.pi * progress) + 1) / 2
-        return cfg.lr_min + (cfg.lr - cfg.lr_min) * factor
+        return cfg.lr_min + (peak - cfg.lr_min) * factor
     elif cfg.lr_schedule == "exponential":
-        return cfg.lr * (cfg.lr_min / cfg.lr) ** progress
+        return peak * (cfg.lr_min / peak) ** progress
     else:  # linear
-        return cfg.lr_min + (cfg.lr - cfg.lr_min) * (1.0 - progress)
+        return cfg.lr_min + (peak - cfg.lr_min) * (1.0 - progress)
 
 
 @torch.no_grad()
@@ -189,7 +188,7 @@ def train():
         generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
     layerwise_pred_opt = torch.optim.AdamW(
-        layerwise_predictor.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        layerwise_predictor.parameters(), lr=cfg.predictor_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
     contrastive_opt = torch.optim.AdamW(
         contrastive_net.parameters(), lr=cfg.contrastive_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
@@ -201,6 +200,7 @@ def train():
 
     step = 0
     skip_docs = 0
+    adaptive_disabled_until = 0
 
     ckpt_path = find_latest_checkpoint(cfg.checkpoint_dir)
     if ckpt_path:
@@ -242,6 +242,10 @@ def train():
                 pg["weight_decay"] = cfg.weight_decay
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
+        adaptive_disabled_until = ckpt.get("adaptive_disabled_until", 0)
+        if "cfg" in ckpt:
+            saved_cfg = ckpt["cfg"]
+            cfg.batch_size = saved_cfg.batch_size
         print(f"  Resuming at step {step}")
     else:
         print("No checkpoint found — starting from scratch")
@@ -255,7 +259,13 @@ def train():
 
     train_dataset, val_data, _ = build_dataset(cfg, skip_docs)
     val_data = val_data.to(device)
-    loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=0)
+    _dataset_iter = iter(train_dataset)
+
+    def next_batch():
+        seqs = []
+        while len(seqs) < cfg.batch_size:
+            seqs.append(next(_dataset_iter))
+        return torch.stack(seqs)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     log_path = os.path.join(cfg.checkpoint_dir, "training_log.csv")
@@ -319,14 +329,15 @@ def train():
 
     autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
 
-    for batch in itertools.chain.from_iterable(iter(loader) for _ in itertools.count()):
-        batch = batch.to(device)
+    while True:
+        batch = next_batch().to(device)
         x = batch[:, :-1]
-
+    
         lr = get_lr(step, cfg)
-        for opt in (gen_opt, layerwise_pred_opt):
-            for pg in opt.param_groups:
-                pg["lr"] = lr
+        for pg in gen_opt.param_groups:
+            pg["lr"] = lr
+        for pg in layerwise_pred_opt.param_groups:
+            pg["lr"] = cfg.predictor_lr
 
         # ── EMA: target ← generator ──────────────────────────────────────────
         with torch.no_grad():
@@ -550,6 +561,16 @@ def train():
             attract_std     = [float(np.std(attract_window[l]))     if len(attract_window[l])     > 1 else 0.0 for l in range(cfg.n_layers)]
             repel_std       = [float(np.std(repel_window[l]))       if len(repel_window[l])       > 1 else 0.0 for l in range(cfg.n_layers)]
             contrastive_std = float(np.std(contrastive_window)) if len(contrastive_window) > 1 else 0.0
+
+            # ── Adaptive LR control ──────────────────────────────────────────
+            if step >= cfg.adaptive_start_step and step >= adaptive_disabled_until:
+                _max_attract_std = max(attract_std)
+                if _max_attract_std > cfg.adaptive_variation_threshold:
+                    cfg.batch_size = cfg.batch_size * 2
+                    adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
+                    print(f"  [adaptive] attract σ={_max_attract_std:.4f} → batch_size={cfg.batch_size}, cooldown until {adaptive_disabled_until}")
+
+
             jepa_layer_sums = [0.0] * cfg.n_layers
             attract_layer_sums = [0.0] * cfg.n_layers
             toward_zero_layer_sums = [0.0] * cfg.n_layers
@@ -616,9 +637,10 @@ def train():
                 gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
                 step, train_dataset.docs_consumed, cfg,
                 extra={
-                    "attract_window":     [list(w) for w in attract_window],
-                    "repel_window":       [list(w) for w in repel_window],
-                    "contrastive_window": list(contrastive_window),
+                    "attract_window":                   [list(w) for w in attract_window],
+                    "repel_window":                     [list(w) for w in repel_window],
+                    "contrastive_window":               list(contrastive_window),
+                    "adaptive_disabled_until":          adaptive_disabled_until,
                 },
             )
             last_ckpt_interval = ckpt_interval
@@ -628,6 +650,7 @@ def train():
             emb = generator.tok_emb.weight.detach().cpu().float().numpy()
             np.save(os.path.join(emb_export_dir, f"emb_s{step:07d}.npy"), emb)
             last_emb_export = emb_interval
+
 
 
 if __name__ == "__main__":
