@@ -182,8 +182,6 @@ class Generator(nn.Module):
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_model)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.tok_emb.weight  # weight tying
 
         self.apply(self._init_weights)
         for p in self.null_embs:
@@ -208,7 +206,7 @@ class Generator(nn.Module):
         return self.norm(h)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(self.forward_hidden(x))
+        return F.linear(self.forward_hidden(x), self.tok_emb.weight)
 
     def forward_hidden_layerwise(self, x: torch.Tensor, detach_emb: bool = False) -> list:
         """Returns [h_0, h_1, ..., h_N] where h_0 = embeddings, length = n_layers + 1.

@@ -37,6 +37,7 @@ class Config:
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
     anti_bias_iterations: int = 1 #any value over 1 is esentailly just a no-op
+    anti_bias_weight: float = 0.0  # 0.0 = no bias removal, 1.0 = full mean subtraction
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
@@ -59,7 +60,7 @@ class Config:
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
     lr_min: float = 1e-4
-    weight_decay: float = 0.1
+    weight_decay: float = 0.0
     grad_clip: float = 1.0
 
     # Eval / checkpointing
