@@ -36,6 +36,12 @@ class Config:
 
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
+    jepa_repel_warmup_steps: int = 15_000  # steps using cosine repel before switching to GAN discriminator
+    # Exponent on the GAN repel term after relu. The relu output is the discriminator's equality certainty: 1.0 = certain
+    # equal, 0.0 = certain different. Controls how push force scales with that certainty.
+    # 1.0 = constant force regardless of certainty. 2.0 = spring: force vanishes smoothly as certainty→0 (grad ∝ certainty).
+    # 1.5 = intermediate: grad ∝ sqrt(certainty) — still pushes meaningfully near 0, less soft landing than 2.0.
+    jepa_repel_power: float = 1.75
     anti_bias_iterations: int = 1 #any value over 1 is esentailly just a no-op
     anti_bias_weight: float = 0.0  # 0.0 = no bias removal, 1.0 = full mean subtraction
 
@@ -52,9 +58,9 @@ class Config:
     vicreg_cov_weight: float = 1.0
 
     # Training
-    batch_size: int = 128
+    batch_size: int = 64
     decoder_lr: float = 3e-4
-    contrastive_lr: float = 2e-4
+    contrastive_lr: float = 1.5e-4
     lr: float = 1e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000

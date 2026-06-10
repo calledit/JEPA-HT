@@ -353,9 +353,9 @@ def main():
                         help="use every Nth checkpoint for animation (default: 1)")
     parser.add_argument("--start", type=int, default=0,
                         help="skip checkpoints before this step (default: 0)")
-    parser.add_argument("--interval", type=int, default=50,
+    parser.add_argument("--interval", type=int, default=40,
                         help="milliseconds per frame in animation (default: 50)")
-    parser.add_argument("--interp", type=int, default=10,
+    parser.add_argument("--interp", type=int, default=5,
                         help="interpolated frames between each checkpoint pair (default: 10)")
     parser.add_argument("--workers", type=int, default=os.cpu_count(),
                         help="parallel workers for loading+clustering (default: cpu count)")
