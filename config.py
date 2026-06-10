@@ -49,8 +49,8 @@ class Config:
     # gradient of clean latents w.r.t. input embeddings. Encourages a smooth/continuous latent
     # space so small input changes don't cause large representation jumps (stabilises self-chasing).
     # Estimated cheaply via a single random projection. Applied every jacobian_interval steps.
-    jacobian_weight: float = 0.01
-    jacobian_interval: int = 134
+    jacobian_weight: float = 0.05
+    jacobian_interval: int = 77
     gradient_residual_amplification: bool = True
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)

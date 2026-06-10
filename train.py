@@ -91,6 +91,14 @@ def estimate_loss(model, val_data, cfg) -> float:
     return total / n_eval
 
 
+def gra(loss: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    """Gradient Residual Amplification: adds a term whose gradient is the batch-centered gradient of loss w.r.t. tensor."""
+    g = torch.autograd.grad(loss, tensor, retain_graph=True)[0]
+    sample_dims = tuple(range(g.dim() - 1)) if g.dim() > 1 else (0,)
+    g_centered = g - g.mean(dim=sample_dims, keepdim=True)
+    return loss + (g_centered.detach() * tensor).sum()
+
+
 def sigreg_loss(h: torch.Tensor, n_projections: int, max_samples: int = 1024) -> torch.Tensor:
     """SIGReg: Epps-Pulley test on random 1D projections — pushes distribution toward N(0,1)."""
     B, T, D = h.shape
@@ -345,19 +353,22 @@ def train():
             preds = [layerwise_predictor.predictors[l](gen_hiddens[l]) for l in range(cfg.n_layers)]
 
             # ── Discriminator step (GAN): pred vs target = similar, pred vs corrupt = different ──
-            disc_base = sum(
-                (
-                    F.relu(1 - contrastive_net(
-                        preds[l].detach().reshape(-1, cfg.d_model),
-                        target_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                    )).mean()
-                    + F.relu(1 + contrastive_net(
-                        preds[l].detach().reshape(-1, cfg.d_model),
-                        corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                    )).mean()
-                ) / 2
-                for l in range(cfg.n_layers)
-            ) / cfg.n_layers
+            disc_layer_losses = []
+            for l in range(cfg.n_layers):
+                pos_scores = contrastive_net(
+                    preds[l].detach().reshape(-1, cfg.d_model),
+                    target_latents[l + 1].detach().reshape(-1, cfg.d_model),
+                )
+                neg_scores = contrastive_net(
+                    preds[l].detach().reshape(-1, cfg.d_model),
+                    corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model),
+                )
+                layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
+                if cfg.gradient_residual_amplification:
+                    layer_disc = gra(layer_disc, pos_scores)
+                    layer_disc = gra(layer_disc, neg_scores)
+                disc_layer_losses.append(layer_disc)
+            disc_base = sum(disc_layer_losses) / cfg.n_layers
 
             # R1 gradient penalty: penalise gradient norm w.r.t. real (positive) inputs
             r1_penalty = disc_base.new_zeros(1).squeeze()
@@ -390,9 +401,8 @@ def train():
 
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
                 if cfg.gradient_residual_amplification:
-                    g = torch.autograd.grad(attract, preds[l], retain_graph=True)[0]
-                    g_centered = g - g.mean(dim=(0, 1), keepdim=True)
-                    attract = attract + (g_centered.detach() * preds[l]).sum()
+                    attract = gra(attract, preds[l])
+                    attract = gra(attract, gen_hiddens[l])
 
                 if step < cfg.jepa_repel_warmup_steps:
                     repel    = (1 - F.cosine_similarity(preds[l], corrupt_latents[l + 1], dim=-1).mean()) / 2
