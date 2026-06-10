@@ -269,7 +269,7 @@ def train():
             ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
             vicreg_var_headers + ["vicreg_var_avg"] + vicreg_cov_headers + ["vicreg_cov_avg"] +
             decoder_headers + ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
-            attract_std_headers + repel_std_headers + ["contrastive_std"]
+            attract_std_headers + repel_std_headers + ["contrastive_std", "r1_penalty", "jacobian_penalty"]
         )
 
     last_ckpt_interval = step // cfg.checkpoint_interval
@@ -280,7 +280,8 @@ def train():
     attract_layer_sums = [0.0] * cfg.n_layers
     toward_zero_layer_sums = [0.0] * cfg.n_layers
     repel_layer_sums = [0.0] * cfg.n_layers
-    jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = 0.0
+    jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
+    jac_count = 0
     vicreg_var_layer_sums = [0.0] * cfg.n_layers
     vicreg_cov_layer_sums = [0.0] * cfg.n_layers
     clean_corrupt_count = 0
@@ -344,7 +345,7 @@ def train():
             preds = [layerwise_predictor.predictors[l](gen_hiddens[l]) for l in range(cfg.n_layers)]
 
             # ── Discriminator step (GAN): pred vs target = similar, pred vs corrupt = different ──
-            disc_total = sum(
+            disc_base = sum(
                 (
                     F.relu(1 - contrastive_net(
                         preds[l].detach().reshape(-1, cfg.d_model),
@@ -358,6 +359,22 @@ def train():
                 for l in range(cfg.n_layers)
             ) / cfg.n_layers
 
+            # R1 gradient penalty: penalise gradient norm w.r.t. real (positive) inputs
+            r1_penalty = disc_base.new_zeros(1).squeeze()
+            if cfg.r1_weight > 0.0:
+                for l in range(cfg.n_layers):
+                    real_in = torch.cat([
+                        preds[l].detach().reshape(-1, cfg.d_model),
+                        target_latents[l + 1].detach().reshape(-1, cfg.d_model),
+                    ], dim=-1).requires_grad_(True)
+                    real_score = contrastive_net.net(real_in).squeeze(-1)
+                    grad = torch.autograd.grad(
+                        outputs=real_score.sum(), inputs=real_in, create_graph=True,
+                    )[0]
+                    r1_penalty = r1_penalty + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
+
+            disc_total = disc_base + r1_penalty * cfg.r1_weight
+
         contrastive_opt.zero_grad()
         disc_total.backward()
         torch.nn.utils.clip_grad_norm_(contrastive_net.parameters(), cfg.grad_clip)
@@ -370,7 +387,13 @@ def train():
             toward_zero_losses = []
             repel_losses = []
             for l in range(cfg.n_layers):
+
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
+                if cfg.gradient_residual_amplification:
+                    g = torch.autograd.grad(attract, preds[l], retain_graph=True)[0]
+                    g_centered = g - g.mean(dim=(0, 1), keepdim=True)
+                    attract = attract + (g_centered.detach() * preds[l]).sum()
+
                 if step < cfg.jepa_repel_warmup_steps:
                     repel    = (1 - F.cosine_similarity(preds[l], corrupt_latents[l + 1], dim=-1).mean()) / 2
                     repel_tc = (1 - F.cosine_similarity(target_latents[l + 1].detach(), corrupt_latents[l + 1], dim=-1).mean()) / 2
@@ -406,6 +429,24 @@ def train():
                     for l in range(cfg.n_layers)
                 ) / cfg.n_layers
                 jepa_loss = jepa_loss + cfg.sigreg_weight * sig_loss
+
+            jac_penalty = None
+            if cfg.jacobian_weight > 0.0 and step % cfg.jacobian_interval == 0:
+                pos = torch.arange(x.shape[1], device=device)
+                emb = (generator.tok_emb(x) + generator.pos_emb(pos)).requires_grad_(True)
+                h = emb
+                for block in generator.blocks:
+                    h = h + block.input_mlp(h)
+                    h = block.layer1(h)
+                    h = block.layer2(h)
+                    h = h + block.output_mlp(h)
+                # Use the difference between pairs of real samples as the projection direction —
+                # measures sensitivity in directions that actually occur in the data.
+                v = (h[1:] - h[:-1]).detach()
+                v = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+                grad = torch.autograd.grad((h[:-1] * v).sum(), emb, create_graph=True)[0]
+                jac_penalty = grad[:-1].pow(2).sum(dim=-1).mean()
+                jepa_loss = jepa_loss + jac_penalty * cfg.jacobian_weight
 
         for param in contrastive_net.parameters():
             param.requires_grad_(False)
@@ -458,9 +499,13 @@ def train():
             attract_window[l].append(attract_losses[l].item())
             repel_window[l].append(repel_losses[l].item())
         jepa_sum += jepa_loss.item()
+        if jac_penalty is not None:
+            jac_sum += jac_penalty.item()
+            jac_count += 1
         if cfg.enable_contrastive:
-            contrastive_sum += disc_total.item()
-            contrastive_window.append(disc_total.item())
+            contrastive_sum += disc_base.item()
+            contrastive_window.append(disc_base.item())
+            r1_sum += r1_penalty.item()
             clean_corrupt_count += 1
         if cfg.enable_vicreg:
             for l in range(cfg.n_layers):
@@ -480,6 +525,8 @@ def train():
             avg_repel_layers        = [repel_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_jepa              = jepa_sum          / loss_count
             avg_contrastive       = contrastive_sum   / loss_count
+            avg_r1                = r1_sum            / loss_count
+            avg_jac               = jac_sum           / max(jac_count, 1)
             avg_clean_corrupt     = clean_corrupt_sum / max(clean_corrupt_count, 1)
             avg_vicreg_var_layers = [vicreg_var_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_vicreg_cov_layers = [vicreg_cov_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
@@ -497,7 +544,8 @@ def train():
             attract_layer_sums = [0.0] * cfg.n_layers
             toward_zero_layer_sums = [0.0] * cfg.n_layers
             repel_layer_sums = [0.0] * cfg.n_layers
-            jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = 0.0
+            jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
+            jac_count = 0
             vicreg_var_layer_sums = [0.0] * cfg.n_layers
             vicreg_cov_layer_sums = [0.0] * cfg.n_layers
             clean_corrupt_count = 0
@@ -524,7 +572,7 @@ def train():
             dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
-                f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) | cc {avg_clean_corrupt:.4f} | "
+                f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f} | cc {avg_clean_corrupt:.4f} | "
                 f"vc_var {avg_vicreg_var:.4f} | vc_cov {avg_vicreg_cov:.4f} | "
                 f"{dec_str} | val {val_loss:.4f} | "
                 f"{std_str} | "
@@ -546,7 +594,7 @@ def train():
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"] +
                 [f"{attract_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{repel_std[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{contrastive_std:.6f}"]
+                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}"]
             )
             log_file.flush()
 

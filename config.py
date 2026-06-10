@@ -36,14 +36,22 @@ class Config:
 
     # JEPA triplet loss
     jepa_repulsion_weight: float = 1.0
-    jepa_repel_warmup_steps: int = 15_000  # steps using cosine repel before switching to GAN discriminator
+    # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
+    # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
+    r1_weight: float = 0.05
+    jepa_repel_warmup_steps: int = 0  # steps using cosine repel before switching to GAN discriminator. Mabye we should remove it it does not seam to make much differance
     # Exponent on the GAN repel term after relu. The relu output is the discriminator's equality certainty: 1.0 = certain
     # equal, 0.0 = certain different. Controls how push force scales with that certainty.
     # 1.0 = constant force regardless of certainty. 2.0 = spring: force vanishes smoothly as certainty→0 (grad ∝ certainty).
     # 1.5 = intermediate: grad ∝ sqrt(certainty) — still pushes meaningfully near 0, less soft landing than 2.0.
     jepa_repel_power: float = 1.75
-    anti_bias_iterations: int = 1 #any value over 1 is esentailly just a no-op
-    anti_bias_weight: float = 0.0  # 0.0 = no bias removal, 1.0 = full mean subtraction
+    # Jacobian regularization on the generator's clean stream: penalises ||J||^2 where J is the
+    # gradient of clean latents w.r.t. input embeddings. Encourages a smooth/continuous latent
+    # space so small input changes don't cause large representation jumps (stabilises self-chasing).
+    # Estimated cheaply via a single random projection. Applied every jacobian_interval steps.
+    jacobian_weight: float = 0.01
+    jacobian_interval: int = 134
+    gradient_residual_amplification: bool = True
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False

@@ -55,9 +55,11 @@ def main():
         return [c for c in cols if c.endswith(f"_{only}")]
 
     jepa_layer_cols    = layer_filter([c for c in df.columns if c.startswith("jepa_loss_")    and c != "jepa_loss_avg"], args.layer)
-    attract_cols       = layer_filter([c for c in df.columns if c.startswith("attract_")], args.layer)
+    attract_cols       = layer_filter([c for c in df.columns if c.startswith("attract_")      and not c.startswith("attract_std_")], args.layer)
     toward_zero_cols   = layer_filter([c for c in df.columns if c.startswith("toward_zero_")], args.layer)
-    repel_cols         = layer_filter([c for c in df.columns if c.startswith("repel_")], args.layer)
+    repel_cols         = layer_filter([c for c in df.columns if c.startswith("repel_")        and not c.startswith("repel_std_")], args.layer)
+    attract_std_cols   = layer_filter([c for c in df.columns if c.startswith("attract_std_")], args.layer)
+    repel_std_cols     = layer_filter([c for c in df.columns if c.startswith("repel_std_")],   args.layer)
     decoder_a_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_a_")], args.layer)
     decoder_b_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_b_")], args.layer)
     decoder_layer_cols = decoder_a_cols if decoder_a_cols else layer_filter([c for c in df.columns if c.startswith("decoder_loss_") and c != "decoder_loss_avg"], args.layer)
@@ -98,7 +100,19 @@ def main():
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    axes[0, 3].set_visible(False)
+    ax = axes[0, 3]
+    for i, col in enumerate(attract_std_cols):
+        plot_line(ax, df["step"], df[col], f"at_σ{i}", layer_colors[i], args.smooth, "-")
+    for i, col in enumerate(repel_std_cols):
+        plot_line(ax, df["step"], df[col], f"rp_σ{i}", layer_colors[i], args.smooth, "--")
+    if "contrastive_std" in df.columns:
+        plot_line(ax, df["step"], df["contrastive_std"], "contra_σ", "darkorchid", args.smooth)
+    if "r1_penalty" in df.columns:
+        plot_line(ax, df["step"], df["r1_penalty"], "r1", "tomato", args.smooth)
+    ax.set_title("Loss variance (1k window) + R1")
+    ax.set_ylabel("std / penalty")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
     # Row 1: diagnostics
     ax = axes[1, 0]
