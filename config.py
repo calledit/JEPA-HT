@@ -52,9 +52,10 @@ class Config:
     jacobian_weight: float = 0.05
     jacobian_interval: int = 134
     gradient_residual_amplification: bool = True
-    adaptive_start_step: int = 30_000
-    adaptive_variation_threshold: float = 0.19
-    adaptive_cooldown_steps: int = 5_000
+    gra_scale: float = 1.0
+    adaptive_start_step: int = 600000_000
+    adaptive_variation_threshold: float = 10.0# 10 has been selected based on emperical observation as beeing a good enogh indication for to much variation
+    adaptive_cooldown_steps: int = 7_000
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
@@ -69,15 +70,15 @@ class Config:
     vicreg_cov_weight: float = 1.0
 
     # Training
-    batch_size: int = 128
+    batch_size: int = 64
     decoder_lr: float = 3e-4
     contrastive_lr: float = 1.5e-4
-    lr: float = 1e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
+    lr: float = 0.9e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     predictor_lr: float = 1e-4
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
-    lr_min: float = 1e-4
+    lr_min: float = 0.9e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
 

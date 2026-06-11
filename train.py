@@ -90,12 +90,37 @@ def estimate_loss(model, val_data, cfg) -> float:
     return total / n_eval
 
 
-def gra(loss: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+def gra(loss: torch.Tensor, tensor: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Gradient Residual Amplification: adds a term whose gradient is the batch-centered gradient of loss w.r.t. tensor."""
     g = torch.autograd.grad(loss, tensor, retain_graph=True)[0]
     sample_dims = tuple(range(g.dim() - 1)) if g.dim() > 1 else (0,)
     g_centered = g - g.mean(dim=sample_dims, keepdim=True)
-    return loss + (g_centered.detach() * tensor).sum()
+    return loss + scale * (g_centered.detach() * tensor).sum()
+
+
+def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Noise Comparison Augmentation: augments loss with a residual MSE after batch-centering pred and target.
+
+    Expanding the residual MSE:
+        MSE(pred_res, target_res) = Var(pred) + Var(target) - 2·Cov(pred, target)
+    where Var and Cov are taken across the batch dimension(s) and averaged over features.
+    Minimising this term maximises batch covariance between pred and target.
+
+    Analogous to batch norm applied at the loss level: batch norm removes the batch mean (and
+    optionally normalises by batch std) from activations so the network focuses on relative
+    differences across samples rather than absolute values. NCA does the same thing to the
+    supervision signal — it strips the batch mean from both pred and target before measuring
+    their distance, so the loss only sees the sample-varying "AC" component. NCA is therefore
+    the centering-only subset of batch norm (no std normalisation, no affine transform).
+
+    Mathematically equivalent to GRA for MSE losses: the gradient of the added term equals
+    scale * g_centered, the same quantity GRA injects. Cheaper (no extra autograd.grad call)
+    but limited to MSE-structured losses.
+    """
+    sample_dims = tuple(range(pred.dim() - 1)) if pred.dim() > 1 else (0,)
+    pred_res = pred - pred.mean(dim=sample_dims, keepdim=True)
+    target_res = target - target.mean(dim=sample_dims, keepdim=True)
+    return loss + scale * F.mse_loss(pred_res, target_res.detach())
 
 
 def sigreg_loss(h: torch.Tensor, n_projections: int, max_samples: int = 1024) -> torch.Tensor:
@@ -201,6 +226,8 @@ def train():
     step = 0
     skip_docs = 0
     adaptive_disabled_until = 0
+    adaptive_lr_scale = 1.0
+    adaptive_batch_doubled = False
 
     ckpt_path = find_latest_checkpoint(cfg.checkpoint_dir)
     if ckpt_path:
@@ -243,8 +270,11 @@ def train():
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
         adaptive_disabled_until = ckpt.get("adaptive_disabled_until", 0)
+        adaptive_lr_scale      = 1#ckpt.get("adaptive_lr_scale", 1.0)
+        adaptive_batch_doubled = ckpt.get("adaptive_batch_doubled", False)
         if "cfg" in ckpt:
             saved_cfg = ckpt["cfg"]
+            cfg.jacobian_weight = saved_cfg.jacobian_weight
             cfg.batch_size = saved_cfg.batch_size
         print(f"  Resuming at step {step}")
     else:
@@ -287,7 +317,7 @@ def train():
             ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
             vicreg_var_headers + ["vicreg_var_avg"] + vicreg_cov_headers + ["vicreg_cov_avg"] +
             decoder_headers + ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
-            attract_std_headers + repel_std_headers + ["contrastive_std", "r1_penalty", "jacobian_penalty"]
+            attract_std_headers + repel_std_headers + ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"]
         )
 
     last_ckpt_interval = step // cfg.checkpoint_interval
@@ -312,6 +342,7 @@ def train():
     attract_window     = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
     repel_window       = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
     contrastive_window = deque(maxlen=1000)
+    jac_window         = deque(maxlen=50)
     if ckpt_path:
         for l, v in enumerate(ckpt.get("attract_window", [])):
             attract_window[l] = deque(v, maxlen=1000)
@@ -319,6 +350,8 @@ def train():
             repel_window[l] = deque(v, maxlen=1000)
         if "contrastive_window" in ckpt:
             contrastive_window = deque(ckpt["contrastive_window"], maxlen=1000)
+        if "jac_window" in ckpt:
+            jac_window = deque(ckpt["jac_window"], maxlen=50)
     t0 = t_last_log = time.time()
 
     generator.train()
@@ -333,9 +366,11 @@ def train():
         batch = next_batch().to(device)
         x = batch[:, :-1]
     
-        lr = get_lr(step, cfg)
+        lr = get_lr(step, cfg) * adaptive_lr_scale
         for pg in gen_opt.param_groups:
             pg["lr"] = lr
+        for pg in contrastive_opt.param_groups:
+            pg["lr"] = cfg.contrastive_lr * adaptive_lr_scale
         for pg in layerwise_pred_opt.param_groups:
             pg["lr"] = cfg.predictor_lr
 
@@ -376,8 +411,8 @@ def train():
                 )
                 layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
                 if cfg.gradient_residual_amplification:
-                    layer_disc = gra(layer_disc, pos_scores)
-                    layer_disc = gra(layer_disc, neg_scores)
+                    layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
+                    layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
                 disc_layer_losses.append(layer_disc)
             disc_base = sum(disc_layer_losses) / cfg.n_layers
 
@@ -412,8 +447,8 @@ def train():
 
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
                 if cfg.gradient_residual_amplification:
-                    attract = gra(attract, preds[l])
-                    attract = gra(attract, gen_hiddens[l])
+                    attract = gra(attract, preds[l], cfg.gra_scale)
+                    attract = gra(attract, gen_hiddens[l], cfg.gra_scale)
 
                 if step < cfg.jepa_repel_warmup_steps:
                     repel    = (1 - F.cosine_similarity(preds[l], corrupt_latents[l + 1], dim=-1).mean()) / 2
@@ -523,6 +558,7 @@ def train():
         if jac_penalty is not None:
             jac_sum += jac_penalty.item()
             jac_count += 1
+            jac_window.append(jac_penalty.item())
         if cfg.enable_contrastive:
             contrastive_sum += disc_base.item()
             contrastive_window.append(disc_base.item())
@@ -558,17 +594,25 @@ def train():
             avg_dec_layers_a      = [decoder_layer_sums_a[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec_layers_b      = [decoder_layer_sums_b[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec               = decoder_sum / max(decoder_count, 1)
-            attract_std     = [float(np.std(attract_window[l]))     if len(attract_window[l])     > 1 else 0.0 for l in range(cfg.n_layers)]
-            repel_std       = [float(np.std(repel_window[l]))       if len(repel_window[l])       > 1 else 0.0 for l in range(cfg.n_layers)]
-            contrastive_std = float(np.std(contrastive_window)) if len(contrastive_window) > 1 else 0.0
+            attract_std     = [float(np.std(attract_window[l]) / (np.mean(attract_window[l]) + 1e-8))     if len(attract_window[l])     > 1 else 0.0 for l in range(cfg.n_layers)]
+            repel_std       = [float(np.std(repel_window[l])   / (np.mean(repel_window[l])   + 1e-8))     if len(repel_window[l])       > 1 else 0.0 for l in range(cfg.n_layers)]
+            contrastive_std = float(np.std(contrastive_window)  / (np.mean(contrastive_window) + 1e-8)) if len(contrastive_window) > 1 else 0.0
+            jac_cv          = float(np.std(jac_window)          / (np.mean(jac_window)          + 1e-8)) if len(jac_window)          > 1 else 0.0
 
-            # ── Adaptive LR control ──────────────────────────────────────────
+            # ── Adaptive variance control ─────────────────────────────────────
             if step >= cfg.adaptive_start_step and step >= adaptive_disabled_until:
                 _max_attract_std = max(attract_std)
                 if _max_attract_std > cfg.adaptive_variation_threshold:
-                    cfg.batch_size = cfg.batch_size * 2
-                    adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
-                    print(f"  [adaptive] attract σ={_max_attract_std:.4f} → batch_size={cfg.batch_size}, cooldown until {adaptive_disabled_until}")
+                    if adaptive_batch_doubled or lr / 2 >= 1e-15:
+                        adaptive_lr_scale /= 2
+                        adaptive_batch_doubled = False
+                        adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
+                        print(f"  [adaptive] attract σ={_max_attract_std:.4f} → lr_scale={adaptive_lr_scale:.2e} (lr≈{lr/2:.2e}), cooldown until {adaptive_disabled_until}")
+                    else:
+                        cfg.batch_size *= 2
+                        adaptive_batch_doubled = True
+                        adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
+                        print(f"  [adaptive] attract σ={_max_attract_std:.4f} → batch_size={cfg.batch_size}, cooldown until {adaptive_disabled_until}")
 
 
             jepa_layer_sums = [0.0] * cfg.n_layers
@@ -603,7 +647,7 @@ def train():
             dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
-                f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f} | cc {avg_clean_corrupt:.4f} | "
+                f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
                 f"vc_var {avg_vicreg_var:.4f} | vc_cov {avg_vicreg_cov:.4f} | "
                 f"{dec_str} | val {val_loss:.4f} | "
                 f"{std_str} | "
@@ -625,7 +669,7 @@ def train():
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"] +
                 [f"{attract_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{repel_std[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}"]
+                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"]
             )
             log_file.flush()
 
@@ -640,7 +684,10 @@ def train():
                     "attract_window":                   [list(w) for w in attract_window],
                     "repel_window":                     [list(w) for w in repel_window],
                     "contrastive_window":               list(contrastive_window),
+                    "jac_window":                       list(jac_window),
                     "adaptive_disabled_until":          adaptive_disabled_until,
+                    "adaptive_lr_scale":                adaptive_lr_scale,
+                    "adaptive_batch_doubled":           adaptive_batch_doubled,
                 },
             )
             last_ckpt_interval = ckpt_interval
