@@ -4,6 +4,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import glob
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -354,6 +356,170 @@ def plot_character_bars(ckpt_dir, characters, start, stride, interval, normalize
         plt.show()
 
 
+def plot_live(ckpt_dir, byte_ids, n_neighbors, interval, interp):
+    """Live-updating UMAP viewer. A background thread handles all I/O and UMAP
+    fitting; the animation update does only math and artist updates so the render
+    loop never stalls. Buffer: 10 entries, render target: 3 steps behind latest.
+
+    UMAP is fit once on the first sufficient buffer and kept fixed thereafter —
+    subsequent updates only call transform() so the coordinate space never shifts."""
+    emb_dir = os.path.join(ckpt_dir, "embeddings")
+    BUFFER_MAX = 10
+    RENDER_LAG = 3
+
+    lock = threading.Lock()
+    known_steps = set()
+    buffer = []          # [(step, emb[n_bytes, D]), ...] sorted, max BUFFER_MAX
+    fit_result = [None]  # (steps_arr [K], coords [K, n_bytes, 2]) when ready
+    reducer_ref = [None] # fixed after first fit, never replaced
+    bg_status = [""]
+    # exponential moving average of wall-clock seconds between buffer arrivals;
+    # written by bg thread, read by animation thread (float assign is GIL-atomic)
+    arrival_interval_s = [None]
+
+    def _bg_loop():
+        last_arrival_t = [None]
+        while True:
+            paths = sorted(glob.glob(os.path.join(emb_dir, "emb_s*.npy")),
+                           key=lambda p: int(re.search(r"s(\d+)", p).group(1)))
+            new_found = False
+            for p in paths:
+                s = int(re.search(r"s(\d+)", p).group(1))
+                with lock:
+                    if s in known_steps:
+                        continue
+                    known_steps.add(s)
+                emb = np.load(p)[byte_ids]
+                with lock:
+                    buffer.append((s, emb))
+                    buffer.sort(key=lambda x: x[0])
+                    while len(buffer) > BUFFER_MAX:
+                        buffer.pop(0)
+                new_found = True
+
+            if new_found:
+                now = time.time()
+                if last_arrival_t[0] is not None:
+                    gap = now - last_arrival_t[0]
+                    prev = arrival_interval_s[0]
+                    arrival_interval_s[0] = gap if prev is None else 0.8 * prev + 0.2 * gap
+                last_arrival_t[0] = now
+                with lock:
+                    snap = list(buffer)
+                if len(snap) >= 2:
+                    all_embs = np.stack([e for _, e in snap])
+                    steps_arr = np.array([s for s, _ in snap], dtype=float)
+                    # Fit reducer once on the first sufficient snapshot, then freeze it
+                    if reducer_ref[0] is None:
+                        bg_status[0] = "fitting UMAP…"
+                        nn = min(n_neighbors, len(snap) - 1)
+                        r = umap.UMAP(n_components=2, n_neighbors=nn)
+                        r.fit(all_embs[-1])
+                        reducer_ref[0] = r
+                    # Always transform into the same fixed space
+                    bg_status[0] = "transforming…"
+                    coords = np.stack([reducer_ref[0].transform(e) for e in all_embs])
+                    with lock:
+                        fit_result[0] = (steps_arr, coords)
+                    bg_status[0] = ""
+
+            time.sleep(1.0)
+
+    bg = threading.Thread(target=_bg_loop, daemon=True)
+    bg.start()
+
+    # --- figure setup ---
+    fig, ax = plt.subplots(figsize=(12, 9))
+    fig.suptitle("Byte embeddings — LIVE", fontsize=12)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    step_title = ax.set_title("Waiting for embeddings…", fontsize=11, fontweight="bold")
+    fit_label = fig.text(0.01, 0.01, "", fontsize=8, color="gray")
+
+    scatter_map = {}
+    for idx, b in enumerate(byte_ids):
+        scatter_map.setdefault(categorise(b)[0], []).append(idx)
+
+    colors_by_name = {name: color for name, _, color in _CATEGORIES}
+    colors_by_name["other"] = "black"
+    scatters = {}
+    for name, indices in scatter_map.items():
+        sc = ax.scatter([], [], c=colors_by_name.get(name, "black"),
+                        s=40, alpha=0.85, zorder=3, label=name)
+        scatters[name] = (sc, indices)
+
+    txt_artists = [ax.text(0, 0, label_for(b), fontsize=12, alpha=0.85) for b in byte_ids]
+    ax.legend(fontsize=9, markerscale=1.5)
+
+    # --- display state (animation thread only, never touched by bg thread) ---
+    disp = {"spline_x": None, "spline_y": None, "steps": None, "render_t": None}
+
+    def update(_frame):
+        # absorb any new UMAP result from the bg thread
+        with lock:
+            result = fit_result[0]
+            if result is not None:
+                fit_result[0] = None
+
+        if result is not None:
+            steps_arr, coords = result
+            disp["steps"] = steps_arr
+            disp["spline_x"] = CubicSpline(steps_arr, coords[:, :, 0])
+            disp["spline_y"] = CubicSpline(steps_arr, coords[:, :, 1])
+            if disp["render_t"] is None:
+                disp["render_t"] = float(steps_arr[0])
+            else:
+                disp["render_t"] = float(np.clip(disp["render_t"], steps_arr[0], steps_arr[-1]))
+            all_x = coords[:, :, 0].ravel()
+            all_y = coords[:, :, 1].ravel()
+            pad_x = (all_x.max() - all_x.min()) * 0.05 + 1e-3
+            pad_y = (all_y.max() - all_y.min()) * 0.05 + 1e-3
+            ax.set_xlim(all_x.min() - pad_x, all_x.max() + pad_x)
+            ax.set_ylim(all_y.min() - pad_y, all_y.max() + pad_y)
+
+        if disp["spline_x"] is None:
+            return []
+
+        steps_arr = disp["steps"]
+        K = len(steps_arr)
+        lag_idx = max(0, K - 1 - RENDER_LAG)
+        render_target = float(steps_arr[lag_idx])
+
+        # Auto-match playback speed to the rate new data arrives:
+        # advance render_t so the full buffer plays in one arrival interval * 1.25,
+        # meaning we finish slightly before the next entry is expected.
+        # Falls back to fixed interp if no arrival timing is available yet.
+        playback_range = render_target - float(steps_arr[0])
+        interval_s = arrival_interval_s[0]
+        if interval_s and interval_s > 0:
+            frames_per_interval = max(1.0, interval_s * 1000.0 / interval)
+            advance = playback_range / frames_per_interval * 1.25
+        else:
+            advance = playback_range / max(K - 1, 1) / interp
+        disp["render_t"] += advance
+        if disp["render_t"] >= render_target:
+            disp["render_t"] = float(steps_arr[0])
+
+        t = float(np.clip(disp["render_t"], steps_arr[0], steps_arr[-1]))
+        cx = disp["spline_x"](t)   # [n_bytes]
+        cy = disp["spline_y"](t)   # [n_bytes]
+
+        for name, (sc, indices) in scatters.items():
+            sc.set_offsets(np.stack([cx[indices], cy[indices]], axis=-1))
+        for i, txt in enumerate(txt_artists):
+            txt.set_position((float(cx[i]), float(cy[i])))
+
+        step_title.set_text(f"step {int(t):,}  (buf {K}/{BUFFER_MAX}, lag {K - 1 - lag_idx})")
+        fit_label.set_text(bg_status[0])
+
+        return [sc for sc, _ in scatters.values()] + txt_artists + [step_title, fit_label]
+
+    ani = animation.FuncAnimation(fig, update, interval=interval,  # noqa: F841
+                                  blit=False, cache_frame_data=False)
+    plt.tight_layout()
+    plt.show()
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -361,6 +527,8 @@ def main():
                         help="single checkpoint to plot (default: latest)")
     parser.add_argument("--animate", action="store_true",
                         help="animate over all checkpoints in the checkpoint dir")
+    parser.add_argument("--live", action="store_true",
+                        help="live mode: watch embeddings folder and animate as new files appear")
     parser.add_argument("--character", nargs="+", metavar="CHAR", default=None,
                         help="character mode: show bar chart per dimension for each character")
     parser.add_argument("--normalize-window", type=int, default=20,
@@ -408,7 +576,9 @@ def main():
     show_cats = set(args.categories) if args.categories else None
     byte_ids = [b for b in range(256) if show_cats is None or categorise(b)[0] in show_cats]
 
-    if args.animate:
+    if args.live:
+        plot_live(ckpt_dir, byte_ids, args.neighbors, args.interval, args.interp)
+    elif args.animate:
         plot_animation(ckpt_dir, byte_ids, args.neighbors,
                        args.stride, args.interval, args.save, args.workers, args.interp, args.start)
     else:
