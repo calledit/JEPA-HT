@@ -1,7 +1,10 @@
+import os
 import torch
 from torch.utils.data import IterableDataset
 
 from config import Config
+
+_HF_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache")
 
 
 _FINEWEB_VAL_DOCS = 500
@@ -66,6 +69,7 @@ def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
             "HuggingFaceFW/fineweb-edu",
             split="train",
             streaming=True,
+            cache_dir=_HF_CACHE_DIR,
         )
 
     print(f"  Building val set from first {_FINEWEB_VAL_DOCS} docs...")
