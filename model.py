@@ -197,8 +197,6 @@ class Generator(nn.Module):
             DoubleTransformerBlock(d_in, cfg.n_heads, cfg.dropout, d_out=cfg.d_model)
             for _ in range(cfg.n_layers)
         ])
-        self.norm = nn.LayerNorm(cfg.d_model)
-
         self.apply(self._init_weights)
         for p in self.null_embs:
             nn.init.normal_(p, std=0.5)
@@ -226,7 +224,7 @@ class Generator(nn.Module):
     def forward_hidden(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
         h = self.drop(self._build_input(x, prev_latent))
         h = self.blocks(h)
-        return self.norm(h)
+        return h
 
     def forward_hidden_layerwise(self, x: torch.Tensor, prev_latent: torch.Tensor = None,
                                  detach_emb: bool = False) -> list:
@@ -323,7 +321,7 @@ class Generator(nn.Module):
         for block in self.blocks:
             h, kv1, kv2, kv3 = block.forward_kv(h)
             kv_cache.append((kv1, kv2, kv3))
-        return self.norm(h)[:, -1, :], kv_cache
+        return h[:, -1, :], kv_cache
 
     def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
         """Decode a single new token position using a KV cache (layer_idx=0 only)."""
@@ -333,7 +331,7 @@ class Generator(nn.Module):
         for block, (kv1, kv2, kv3) in zip(self.blocks, kv_cache):
             h, new_kv1, new_kv2, new_kv3 = block.forward_with_cache(h, kv1, kv2, kv3)
             new_kv.append((new_kv1, new_kv2, new_kv3))
-        return self.norm(h)[:, 0, :], new_kv
+        return h[:, 0, :], new_kv
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,

@@ -17,8 +17,10 @@ from data import ByteTokenizer
 def find_latest_module_dir(base_dir):
     dirs = glob.glob(os.path.join(base_dir, "module_*"))
     if not dirs:
-        return base_dir
-    return max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
+        return base_dir, 0
+    latest = max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
+    idx = int(re.search(r"module_(\d+)", latest).group(1))
+    return latest, idx
 
 
 def main():
@@ -37,19 +39,37 @@ def main():
     if args.checkpoint_dir:
         cfg.checkpoint_dir = args.checkpoint_dir
 
-    ckpt_dir = find_latest_module_dir(args.checkpoint_dir or cfg.checkpoint_dir)
+    base_dir = args.checkpoint_dir or cfg.checkpoint_dir
+    ckpt_dir, module_idx = find_latest_module_dir(base_dir)
     ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
     if not ckpt_path:
         print("No checkpoint found.")
         return
 
-    print(f"Loading {ckpt_path}\n")
+    print(f"Loading final module {module_idx} from {ckpt_path}\n")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     ckpt_cfg = ckpt.get("cfg", cfg)
 
-    generator = Generator(ckpt_cfg).to(device)
-    generator.load_state_dict(ckpt["generator"], strict=False)
-    generator.eval()
+    # Load all previous frozen modules to compute prev_latent
+    prev_generators = []
+    for i in range(module_idx):
+        prev_ckpt_dir = os.path.join(base_dir, f"module_{i}")
+        prev_ckpt_path = find_latest_checkpoint(prev_ckpt_dir)
+        if not prev_ckpt_path:
+            print(f"No checkpoint found for module {i} in {prev_ckpt_dir}")
+            return
+        prev_ckpt = torch.load(prev_ckpt_path, map_location=device, weights_only=False)
+        prev_gen = Generator(ckpt_cfg, layer_idx=i).to(device)
+        prev_gen.load_state_dict(prev_ckpt["generator"], strict=False)
+        prev_gen.eval()
+        for p in prev_gen.parameters():
+            p.requires_grad_(False)
+        prev_generators.append(prev_gen)
+        print(f"  Loaded frozen module {i} from {prev_ckpt_path}")
+
+    final_generator = Generator(ckpt_cfg, layer_idx=module_idx).to(device)
+    final_generator.load_state_dict(ckpt["generator"], strict=False)
+    final_generator.eval()
 
     if "layerwise_decoder" not in ckpt:
         print("No layerwise_decoder in this checkpoint.")
@@ -88,11 +108,16 @@ def main():
     x = batch[:, :-1]  # [N, T-1]
 
     with torch.no_grad():
+        # Run through all previous frozen modules to get prev_latent
+        prev_latent = None
+        for gen in prev_generators:
+            prev_latent = gen.encode_clean(x, prev_latent)
+
         # Returns [h_0, h_1, ..., h_{n_layers}], length = n_layers + 1
-        # h_0 = initial embeddings; h_{l+1} = output of block l
-        hiddens = generator.forward_hidden_layerwise(x)
+        hiddens = final_generator.forward_hidden_layerwise(x, prev_latent)
 
         print(f"Samples  : {len(samples)}")
+        print(f"Modules  : {module_idx + 1}  (running decoder on module {module_idx})")
         print(f"Layers   : {n_layers}")
         print(f"Seq len  : {x.shape[1]}")
         print()
