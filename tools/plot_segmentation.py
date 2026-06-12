@@ -6,7 +6,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from model import Generator, ContrastiveNet
+from model import Generator, EquivalenceCertaintyEstimator
 from train import find_latest_checkpoint
 
 
@@ -68,7 +68,7 @@ def main():
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt["cfg"]
     generator = Generator(cfg).to(device)
-    contrastive_net = ContrastiveNet(cfg).to(device)
+    contrastive_net = EquivalenceCertaintyEstimator(cfg).to(device)
     generator.load_state_dict(ckpt["generator"])
     try:
         contrastive_net.load_state_dict(ckpt["contrastive_net"])

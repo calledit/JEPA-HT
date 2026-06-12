@@ -15,7 +15,7 @@ import torch.nn.functional as F
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 from config import Config
-from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder
+from model import Generator, LayerwisePredictor, EquivalenceCertaintyEstimator, LayerwiseDecoder
 from data import build_dataset
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
 
@@ -239,7 +239,7 @@ def train():
     generator = Generator(cfg, layer_idx=layer_idx).to(device)
     target_generator = copy.deepcopy(generator)
     layerwise_predictor = LayerwisePredictor(cfg).to(device)
-    contrastive_net = ContrastiveNet(cfg).to(device)
+    contrastive_net = EquivalenceCertaintyEstimator(cfg).to(device)
     layerwise_decoder = LayerwiseDecoder(cfg).to(device)
 
     gen_opt = torch.optim.AdamW(
@@ -333,7 +333,7 @@ def train():
     print(
         f"Generator params: {generator.num_params():,}  |  "
         f"LayerwisePredictor params: {layerwise_predictor.num_params():,}  |  "
-        f"ContrastiveNet params: {contrastive_net.num_params():,}  |  "
+        f"EquivalenceCertaintyEstimator params: {contrastive_net.num_params():,}  |  "
         f"LayerwiseDecoder params: {layerwise_decoder.num_params():,}"
     )
 

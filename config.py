@@ -12,6 +12,7 @@ class Config:
     n_heads: int = 4             # d_head = (d_model + char_emb_dim) / n_heads = 16
     n_layers: int = 1
     ffn_dim: int = 192           # 4 × d_model
+    predictor_dim: int = 174     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
     dropout: float = 0.0
 
     # EMA

@@ -379,16 +379,19 @@ class Generator(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Per-layer predictor: d_model → GELU → d_model → GELU → d_model."""
+    """Per-layer predictor: d_model → predictor_dim × 3 → d_model."""
 
     def __init__(self, cfg: Config):
         super().__init__()
+        h = cfg.predictor_dim
         self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
+            nn.Linear(cfg.d_model, h, bias=False),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
+            nn.Linear(h, h, bias=False),
             nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model, bias=False),
+            nn.Linear(h, h, bias=False),
+            nn.GELU(),
+            nn.Linear(h, cfg.d_model, bias=False),
         )
         self.apply(self._init_weights)
 
@@ -414,8 +417,8 @@ class LayerwisePredictor(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-class ContrastiveNet(nn.Module):
-    """Discriminator: takes two latent hidden states, outputs similarity scalar.
+class EquivalenceCertaintyEstimator(nn.Module):
+    """EquivalenceCertaintyEstimator: takes two latent hidden states, outputs similarity scalar.
     Positive (same doc) → high output. Negative (different doc) → low output.
     """
 
