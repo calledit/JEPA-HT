@@ -359,12 +359,13 @@ def train():
         ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
         [f"vicreg_var_{l}" for l in _ll] + ["vicreg_var_avg"] +
         [f"vicreg_cov_{l}" for l in _ll] + ["vicreg_cov_avg"] +
-        [col for l in _ll for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}")] +
+        [col for l in _ll for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}", f"decoder_loss_c_{l}")] +
         ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
         [f"attract_std_{l}" for l in _ll] +
         [f"repel_std_{l}" for l in _ll] +
         ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"] +
-        [f"pred_char_acc_{l}" for l in _ll]
+        [f"pred_char_acc_{l}" for l in _ll] +
+        [f"gen_char_acc_{l}" for l in _ll]
     )
     if not os.path.exists(log_path):
         write_header = True
@@ -413,6 +414,7 @@ def train():
     clean_corrupt_count = 0
     decoder_layer_sums_a = [0.0] * cfg.n_layers
     decoder_layer_sums_b = [0.0] * cfg.n_layers
+    decoder_layer_sums_c = [0.0] * cfg.n_layers
     decoder_sum = 0.0
     decoder_count = 0
     step_dec_losses = None  # set when decoder runs, cleared after each steps_log row
@@ -616,18 +618,23 @@ def train():
                             layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
                             targets,
                         ),
+                        F.cross_entropy(
+                            layerwise_decoder(l, preds[l].detach().float()).reshape(-1, cfg.vocab_size),
+                            targets,
+                        ),
                     )
                     for l in range(cfg.n_layers)
                 ]
-                dec_loss = sum((a + b) / 2 for a, b in dec_losses) / cfg.n_layers
+                dec_loss = sum((a + b + c) / 3 for a, b, c in dec_losses) / cfg.n_layers
             decoder_opt.zero_grad()
             dec_loss.backward()
             torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
             decoder_opt.step()
-            step_dec_losses = [(da.item(), db.item()) for da, db in dec_losses]
-            for l, (da, db) in enumerate(dec_losses):
+            step_dec_losses = [(da.item(), db.item(), dc.item()) for da, db, dc in dec_losses]
+            for l, (da, db, dc) in enumerate(dec_losses):
                 decoder_layer_sums_a[l] += da.item()
                 decoder_layer_sums_b[l] += db.item()
+                decoder_layer_sums_c[l] += dc.item()
             decoder_sum += dec_loss.item()
             decoder_count += 1
 
@@ -695,8 +702,9 @@ def train():
                 f"{step_latent_mean:.6f}",
                 f"{lr:.6e}",
             ] +
-            [f"{da:.6f}" if step_dec_losses else "" for da, _ in (step_dec_losses or [(0, 0)] * cfg.n_layers)] +
-            [f"{db:.6f}" if step_dec_losses else "" for _, db in (step_dec_losses or [(0, 0)] * cfg.n_layers)]
+            [f"{da:.6f}" if step_dec_losses else "" for da, _, __ in (step_dec_losses or [(0, 0, 0)] * cfg.n_layers)] +
+            [f"{db:.6f}" if step_dec_losses else "" for _, db, __ in (step_dec_losses or [(0, 0, 0)] * cfg.n_layers)] +
+            [f"{dc:.6f}" if step_dec_losses else "" for _, __, dc in (step_dec_losses or [(0, 0, 0)] * cfg.n_layers)]
         )
         step_dec_losses = None
 
@@ -718,6 +726,7 @@ def train():
             avg_latent_mean       = latent_mean_sum    / loss_count
             avg_dec_layers_a      = [decoder_layer_sums_a[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec_layers_b      = [decoder_layer_sums_b[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
+            avg_dec_layers_c      = [decoder_layer_sums_c[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
             avg_dec               = decoder_sum / max(decoder_count, 1)
             attract_std     = [float(np.std(attract_window[l]) / (np.mean(attract_window[l]) + 1e-8))     if len(attract_window[l])     > 1 else 0.0 for l in range(cfg.n_layers)]
             repel_std       = [float(np.std(repel_window[l])   / (np.mean(repel_window[l])   + 1e-8))     if len(repel_window[l])       > 1 else 0.0 for l in range(cfg.n_layers)]
@@ -737,15 +746,17 @@ def train():
             clean_corrupt_count = 0
             decoder_layer_sums_a = [0.0] * cfg.n_layers
             decoder_layer_sums_b = [0.0] * cfg.n_layers
+            decoder_layer_sums_c = [0.0] * cfg.n_layers
             decoder_sum = 0.0
             decoder_count = 0
             loss_count = 0
 
             val_loss = float("nan")
 
-            # ── Predictor → Decoder character accuracy ────────────────────────
-            # Sample 64 positions randomly from the current training batch,
-            # decode the predictor outputs, and measure % correct characters.
+            # ── Predictor / Generator → Decoder character accuracy ───────────
+            # Sample 64 positions randomly from the current training batch and
+            # measure % of characters correctly decoded from both the predictor
+            # output and the raw generative stream (context generator).
             with torch.no_grad():
                 B_val, T_val = x.shape
                 sample_idx  = torch.randperm(B_val * T_val, device=device)[:64]
@@ -753,11 +764,14 @@ def train():
                 t_idx = sample_idx % T_val
                 target_chars = x[b_idx, t_idx]
                 pred_char_acc = []
+                gen_char_acc  = []
                 for _l in range(cfg.n_layers):
-                    sampled_latent = preds[_l].detach()[b_idx, t_idx].float()
-                    logits = layerwise_decoder(_l, sampled_latent)
-                    acc = (logits.argmax(dim=-1) == target_chars).float().mean().item() * 100
-                    pred_char_acc.append(acc)
+                    sampled_pred = preds[_l].detach()[b_idx, t_idx].float()
+                    sampled_gen  = gen_hiddens[_l].detach()[b_idx, t_idx].float()
+                    pred_acc = (layerwise_decoder(_l, sampled_pred).argmax(dim=-1) == target_chars).float().mean().item() * 100
+                    gen_acc  = (layerwise_decoder(_l, sampled_gen).argmax(dim=-1)  == target_chars).float().mean().item() * 100
+                    pred_char_acc.append(pred_acc)
+                    gen_char_acc.append(gen_acc)
 
             elapsed = time.time() - t0
             tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
@@ -772,8 +786,8 @@ def train():
                 f"at_σ{l}={attract_std[l]:.4f} rp_σ{l}={repel_std[l]:.4f}"
                 for l in range(cfg.n_layers)
             )
-            dec_str  = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
-            acc_str  = " | ".join(f"acc{l} {pred_char_acc[l]:.1f}%" for l in range(cfg.n_layers))
+            dec_str  = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f},{avg_dec_layers_c[l]:.4f}" for l in range(cfg.n_layers))
+            acc_str  = " | ".join(f"acc{l} pred={pred_char_acc[l]:.1f}% gen={gen_char_acc[l]:.1f}%" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
                 f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
@@ -793,13 +807,14 @@ def train():
                 [f"{avg_vicreg_var:.6f}"] +
                 [f"{avg_vicreg_cov_layers[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{avg_vicreg_cov:.6f}"] +
-                [val for l in range(cfg.n_layers) for val in (f"{avg_dec_layers_a[l]:.6f}", f"{avg_dec_layers_b[l]:.6f}")] +
+                [val for l in range(cfg.n_layers) for val in (f"{avg_dec_layers_a[l]:.6f}", f"{avg_dec_layers_b[l]:.6f}", f"{avg_dec_layers_c[l]:.6f}")] +
                 [f"{avg_dec:.6f}", f"{val_loss:.6f}", f"{avg_latent_std:.6f}", f"{avg_latent_mean:.6f}",
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"] +
                 [f"{attract_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{repel_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"] +
-                [f"{pred_char_acc[l]:.2f}" for l in range(cfg.n_layers)]
+                [f"{pred_char_acc[l]:.2f}" for l in range(cfg.n_layers)] +
+                [f"{gen_char_acc[l]:.2f}" for l in range(cfg.n_layers)]
             )
             log_file.flush()
             steps_log_file.flush()
