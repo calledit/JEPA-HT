@@ -202,12 +202,27 @@ def discriminator_loss(contrastive_net, h, n_samples):
     return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
 
 
-def get_prev_latent(x: torch.Tensor, prev_generators: list) -> torch.Tensor | None:
-    """Run frozen earlier modules in sequence to produce input latent for the current module."""
-    latent = None
+@torch.no_grad()
+def get_prev_latents(x: torch.Tensor, prev_generators: list):
+    """Run all frozen previous modules with their full three-stream forward pass, chaining
+    clean/gen/corrupt outputs as inputs to the next module so corruption is consistent up the chain.
+    Returns (prev_clean, prev_gen, prev_corrupt, x_corr), all None if no prev modules."""
+    if not prev_generators:
+        return None, None, None, None
+    prev_clean = prev_gen = prev_corrupt = x_corr = None
     for gen in prev_generators:
-        latent = gen.encode_clean(x, latent)
-    return latent
+        gen_hiddens, clean_latents, corrupt_latents, x_corr = gen.forward_cross_layerwise(
+            x,
+            prev_latent_clean=prev_clean,
+            prev_latent_gen=prev_gen,
+            prev_latent_corrupt=prev_corrupt,
+            x_corr=x_corr,
+            clean_token_leak=False,
+        )
+        prev_clean   = clean_latents[-1]
+        prev_gen     = gen_hiddens[-1]
+        prev_corrupt = corrupt_latents[-1]
+    return prev_clean.float(), prev_gen.float(), prev_corrupt.float(), x_corr
 
 
 def train():
@@ -251,8 +266,8 @@ def train():
                 raise RuntimeError(f"No checkpoint found for module {i} in {prev_ckpt_dir}")
             prev_gen = Generator(cfg, layer_idx=i).to(device)
             prev_ckpt = torch.load(prev_ckpt_path, map_location=device, weights_only=False)
-            prev_gen.load_state_dict(prev_ckpt["generator"])
-            prev_gen.eval()
+            prev_gen.load_state_dict(prev_ckpt["generator"], strict=False)
+            #prev_gen.eval().bfloat16()
             for p in prev_gen.parameters():
                 p.requires_grad_(False)
             prev_generators.append(prev_gen)
@@ -260,9 +275,7 @@ def train():
 
     step = 0
     skip_docs = 0
-    adaptive_disabled_until = 0
     adaptive_lr_scale = 1.0
-    adaptive_batch_doubled = False
     plateau_last_decrease_step = 0
     decoder_hist = deque()
 
@@ -306,9 +319,7 @@ def train():
                 pg["weight_decay"] = cfg.weight_decay
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
-        adaptive_disabled_until    = ckpt.get("adaptive_disabled_until", 0)
         adaptive_lr_scale          = ckpt.get("adaptive_lr_scale", 1.0)
-        adaptive_batch_doubled     = ckpt.get("adaptive_batch_doubled", False)
         plateau_last_decrease_step = ckpt.get("plateau_last_decrease_step", 0)
         decoder_hist.extend(ckpt.get("decoder_hist", []))
         if "cfg" in ckpt:
@@ -433,7 +444,7 @@ def train():
         batch = next_batch().to(device)
         x = batch[:, :-1]
 
-        prev_latent = get_prev_latent(x, prev_generators) if prev_generators else None
+        prev_clean, prev_gen, prev_corrupt, prev_x_corr = get_prev_latents(x, prev_generators)
 
         lr = get_lr(step, cfg) * adaptive_lr_scale
         for pg in gen_opt.param_groups:
@@ -450,11 +461,13 @@ def train():
 
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
-            gen_hiddens, clean_latents, corrupt_latents = generator.forward_cross_layerwise(
+            gen_hiddens, clean_latents, corrupt_latents, _ = generator.forward_cross_layerwise(
                 x,
-                prev_latent=prev_latent,
-                return_clean_corrupted_latents=True,
-            )
+                prev_latent_clean=prev_clean,
+                prev_latent_gen=prev_gen,
+                prev_latent_corrupt=prev_corrupt,
+                x_corr=prev_x_corr,
+                )
 
             if cfg.use_ema:
                 print ("EMA NOT SUPPORTED ANYMORE")
@@ -563,7 +576,7 @@ def train():
                     emb = (generator.tok_emb(x) + generator.pos_emb(pos)).requires_grad_(True)
                 else:
                     char = generator.char_emb(x)
-                    emb = (torch.cat([prev_latent.detach(), char], dim=-1) + generator.pos_emb(pos)).requires_grad_(True)
+                    emb = torch.cat([prev_clean.detach(), char + generator.pos_emb(pos)], dim=-1).requires_grad_(True)
                 h = emb
                 for block in generator.blocks:
                     h = block(h)
@@ -713,20 +726,6 @@ def train():
             contrastive_std = float(np.std(contrastive_window)  / (np.mean(contrastive_window) + 1e-8)) if len(contrastive_window) > 1 else 0.0
             jac_cv          = float(np.std(jac_window)          / (np.mean(jac_window)          + 1e-8)) if len(jac_window)          > 1 else 0.0
 
-            # ── Adaptive variance control ─────────────────────────────────────
-            if step >= cfg.adaptive_start_step and step >= adaptive_disabled_until:
-                _max_attract_std = max(attract_std)
-                if _max_attract_std > cfg.adaptive_variation_threshold:
-                    if adaptive_batch_doubled or lr / 2 >= 1e-15:
-                        adaptive_lr_scale /= 2
-                        adaptive_batch_doubled = False
-                        adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
-                        print(f"  [adaptive] attract σ={_max_attract_std:.4f} → lr_scale={adaptive_lr_scale:.2e} (lr≈{lr/2:.2e}), cooldown until {adaptive_disabled_until}")
-                    else:
-                        cfg.batch_size *= 2
-                        adaptive_batch_doubled = True
-                        adaptive_disabled_until = step + cfg.adaptive_cooldown_steps
-                        print(f"  [adaptive] attract σ={_max_attract_std:.4f} → batch_size={cfg.batch_size}, cooldown until {adaptive_disabled_until}")
 
 
             jepa_layer_sums = [0.0] * cfg.n_layers
@@ -800,9 +799,7 @@ def train():
                     "repel_window":                     [list(w) for w in repel_window],
                     "contrastive_window":               list(contrastive_window),
                     "jac_window":                       list(jac_window),
-                    "adaptive_disabled_until":          adaptive_disabled_until,
                     "adaptive_lr_scale":                adaptive_lr_scale,
-                    "adaptive_batch_doubled":           adaptive_batch_doubled,
                     "plateau_last_decrease_step":       plateau_last_decrease_step,
                     "decoder_hist":                    list(decoder_hist),
                 },

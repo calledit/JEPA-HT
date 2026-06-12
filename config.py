@@ -54,9 +54,6 @@ class Config:
     jacobian_interval: int = 134
     gradient_residual_amplification: bool = True
     gra_scale: float = 1.0
-    adaptive_start_step: int = 600000_000
-    adaptive_variation_threshold: float = 10.0# 10 has been selected based on emperical observation as beeing a good enogh indication for to much variation
-    adaptive_cooldown_steps: int = 7_000
 
     # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
     enable_sigreg: bool = False
