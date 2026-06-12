@@ -363,7 +363,8 @@ def train():
         ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
         [f"attract_std_{l}" for l in _ll] +
         [f"repel_std_{l}" for l in _ll] +
-        ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"]
+        ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"] +
+        [f"pred_char_acc_{l}" for l in _ll]
     )
     if not os.path.exists(log_path):
         write_header = True
@@ -631,25 +632,22 @@ def train():
             decoder_count += 1
 
             # ── Plateau detection ──
-            # Keep a 50k-step history of raw decoder losses.
-            # Trigger if the recent 10k-step avg is worse than the avg of the
-            # ±5k window around the best point in the older 35k-step region.
+            # Keep a 50k-step history. Compare the last 25k steps (recent) to
+            # the first 25k steps (reference) — equal-sized windows for a fair comparison.
             decoder_hist.append((step, step_dec_losses[0][0]))
             while decoder_hist[0][0] < step - 50_000:
                 decoder_hist.popleft()
             if step - plateau_last_decrease_step > 50_000 and len(decoder_hist) > 200:
-                recent  = [l for s, l in decoder_hist if s > step - 10_000]
-                older   = [(s, l) for s, l in decoder_hist if s <= step - 15_000]
-                if recent and older:
-                    best_s  = min(older, key=lambda x: x[1])[0]
-                    ref_win = [l for s, l in decoder_hist if abs(s - best_s) <= 5_000]
-                    if ref_win:
-                        recent_avg = sum(recent) / len(recent)
-                        ref_avg    = sum(ref_win) / len(ref_win)
-                        if recent_avg > ref_avg + 0.01:
-                            adaptive_lr_scale *= 0.4
-                            plateau_last_decrease_step = step
-                            print(f"  [plateau] decoder_a_0 recent avg {recent_avg:.4f} > best-region avg {ref_avg:.4f} → lr_scale={adaptive_lr_scale:.3e} (lr≈{get_lr(step, cfg) * adaptive_lr_scale:.2e})")
+                midpoint = step - 25_000
+                first_half  = [l for s, l in decoder_hist if s <= midpoint]
+                second_half = [l for s, l in decoder_hist if s >  midpoint]
+                if first_half and second_half:
+                    ref_avg    = sum(first_half)  / len(first_half)
+                    recent_avg = sum(second_half) / len(second_half)
+                    if recent_avg > ref_avg + 0.01:
+                        adaptive_lr_scale *= 0.4
+                        plateau_last_decrease_step = step
+                        print(f"  [plateau] decoder_a_0 recent avg {recent_avg:.4f} > first-half avg {ref_avg:.4f} → lr_scale={adaptive_lr_scale:.3e} (lr≈{get_lr(step, cfg) * adaptive_lr_scale:.2e})")
 
         step += 1
         for l, ll in enumerate(layer_losses):
@@ -744,6 +742,23 @@ def train():
             loss_count = 0
 
             val_loss = float("nan")
+
+            # ── Predictor → Decoder character accuracy ────────────────────────
+            # Sample 64 positions randomly from the current training batch,
+            # decode the predictor outputs, and measure % correct characters.
+            with torch.no_grad():
+                B_val, T_val = x.shape
+                sample_idx  = torch.randperm(B_val * T_val, device=device)[:64]
+                b_idx = sample_idx // T_val
+                t_idx = sample_idx % T_val
+                target_chars = x[b_idx, t_idx]
+                pred_char_acc = []
+                for _l in range(cfg.n_layers):
+                    sampled_latent = preds[_l].detach()[b_idx, t_idx].float()
+                    logits = layerwise_decoder(_l, sampled_latent)
+                    acc = (logits.argmax(dim=-1) == target_chars).float().mean().item() * 100
+                    pred_char_acc.append(acc)
+
             elapsed = time.time() - t0
             tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
             t_last_log = time.time()
@@ -757,12 +772,13 @@ def train():
                 f"at_σ{l}={attract_std[l]:.4f} rp_σ{l}={repel_std[l]:.4f}"
                 for l in range(cfg.n_layers)
             )
-            dec_str = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
+            dec_str  = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
+            acc_str  = " | ".join(f"acc{l} {pred_char_acc[l]:.1f}%" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
                 f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
                 f"vc_var {avg_vicreg_var:.4f} | vc_cov {avg_vicreg_cov:.4f} | "
-                f"{dec_str} | val {val_loss:.4f} | "
+                f"{dec_str} | {acc_str} | val {val_loss:.4f} | "
                 f"{std_str} | "
                 f"std {avg_latent_std:.4f} | mean {avg_latent_mean:.4f} | lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
             )
@@ -782,7 +798,8 @@ def train():
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"] +
                 [f"{attract_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{repel_std[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"]
+                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"] +
+                [f"{pred_char_acc[l]:.2f}" for l in range(cfg.n_layers)]
             )
             log_file.flush()
             steps_log_file.flush()
