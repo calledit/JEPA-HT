@@ -6,10 +6,20 @@ Usage:
 """
 
 import argparse
+import glob
+import os
+import re
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+
+def find_latest_module_log():
+    files = glob.glob(os.path.join("checkpoints", "module_*", "training_log.csv"))
+    if not files:
+        return "checkpoints/training_log.csv"
+    return max(files, key=lambda f: int(re.search(r"module_(\d+)", f).group(1)))
 
 
 def smooth(values, window):
@@ -44,7 +54,7 @@ def plot_line(ax, x, y, label, color, window, linestyle="-"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log",    default="checkpoints/training_log.csv")
+    parser.add_argument("--log",    default=find_latest_module_log())
     parser.add_argument("--smooth", type=int, default=20)
     parser.add_argument("--start",  type=int, default=0)
     parser.add_argument("--layer",  type=int, default=None)

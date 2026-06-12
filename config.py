@@ -7,8 +7,9 @@ class Config:
     # Architecture
     vocab_size: int = 256        # byte vocabulary
     context_length: int = 256
-    d_model: int = 48
-    n_heads: int = 4             # d_head = 12
+    d_model: int = 56            # latent output dimension per module
+    char_emb_dim: int = 8        # extra char embedding dimension concatenated in modules 1+
+    n_heads: int = 4             # d_head = (d_model + char_emb_dim) / n_heads = 16
     n_layers: int = 1
     ffn_dim: int = 192           # 4 × d_model
     dropout: float = 0.0
@@ -72,13 +73,13 @@ class Config:
     # Training
     batch_size: int = 64
     decoder_lr: float = 3e-4
-    contrastive_lr: float = 1.5e-4
+    contrastive_lr: float = 1.4e-4
     lr: float = 0.9e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     predictor_lr: float = 1e-4
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
-    lr_min: float = 0.9e-4
+    lr_min: float = 0.9e-4 # 0.9e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
 

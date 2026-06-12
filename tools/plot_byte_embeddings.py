@@ -18,6 +18,18 @@ from model import Generator
 from train import find_latest_checkpoint
 
 
+def find_latest_module_dir():
+    dirs = glob.glob(os.path.join("checkpoints", "module_*"))
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
+
+
+def find_module_dir(layer):
+    path = os.path.join("checkpoints", f"module_{layer}")
+    return path if os.path.isdir(path) else None
+
+
 _CATEGORIES = [
     ("null",        lambda b: b == 0,                "gray"),
     ("whitespace",  lambda b: b in (9, 10, 13, 32),  "cyan"),
@@ -49,12 +61,17 @@ def label_for(b: int) -> str:
     return f"\\x{b:02x}"
 
 
+def _emb_weight(model):
+    return model.tok_emb.weight if model.layer_idx == 0 else model.char_emb.weight
+
+
 def load_embeddings(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = Generator(ckpt["cfg"]).to(device)
-    model.load_state_dict(ckpt["target_generator"], strict=False)
+    layer_idx = ckpt.get("layer_idx", 0)
+    model = Generator(ckpt["cfg"], layer_idx=layer_idx).to(device)
+    model.load_state_dict(ckpt["generator"], strict=False)
     model.eval()
-    return model.tok_emb.weight.detach().cpu().float().numpy()
+    return _emb_weight(model).detach().cpu().float().numpy()
 
 
 def _load_emb(args):
@@ -62,10 +79,11 @@ def _load_emb(args):
     ckpt_path, byte_ids = args
     step = int(re.search(r"s(\d+)", ckpt_path).group(1))
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model = Generator(ckpt["cfg"])
-    model.load_state_dict(ckpt["target_generator"], strict=False)
+    layer_idx = ckpt.get("layer_idx", 0)
+    model = Generator(ckpt["cfg"], layer_idx=layer_idx)
+    model.load_state_dict(ckpt["generator"], strict=False)
     model.eval()
-    emb = model.tok_emb.weight.detach().float().numpy()[byte_ids]
+    emb = _emb_weight(model).detach().float().numpy()[byte_ids]
     return step, emb
 
 
@@ -348,7 +366,9 @@ def main():
     parser.add_argument("--normalize-window", type=int, default=20,
                         help="moving average window for bar normalization in character mode (default: 20)")
     parser.add_argument("--checkpoint-dir", default=None,
-                        help="directory to scan for checkpoints (default: cfg.checkpoint_dir)")
+                        help="directory to scan for checkpoints (default: highest module dir)")
+    parser.add_argument("--layer", type=int, default=None,
+                        help="which layer module to load (e.g. 0, 1, 2); default: highest")
     parser.add_argument("--stride", type=int, default=1,
                         help="use every Nth checkpoint for animation (default: 1)")
     parser.add_argument("--start", type=int, default=0,
@@ -370,7 +390,15 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
-    ckpt_dir = args.checkpoint_dir or cfg.checkpoint_dir
+    if args.checkpoint_dir:
+        ckpt_dir = args.checkpoint_dir
+    elif args.layer is not None:
+        ckpt_dir = find_module_dir(args.layer)
+        if not ckpt_dir:
+            print(f"No checkpoint directory found for layer {args.layer}")
+            return
+    else:
+        ckpt_dir = find_latest_module_dir() or cfg.checkpoint_dir
 
     if args.character:
         plot_character_bars(ckpt_dir, args.character, args.start, args.stride,
@@ -385,7 +413,7 @@ def main():
                        args.stride, args.interval, args.save, args.workers, args.interp, args.start)
     else:
         device = torch.device(cfg.device)
-        ckpt_path = args.checkpoint or find_latest_checkpoint(cfg.checkpoint_dir)
+        ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
         if not ckpt_path:
             print("No checkpoint found.")
             return

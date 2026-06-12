@@ -21,7 +21,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -41,7 +41,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -57,7 +57,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype).triu(0)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y), k, v
@@ -82,7 +82,9 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(d_model, 4 * d_model, bias=False),
             nn.GELU(),
-            nn.Linear(4 * d_model, d_model, bias=False),
+            nn.Linear(4 * d_model, 2 * d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model, bias=False),
             nn.Dropout(dropout),
         )
 
@@ -122,12 +124,17 @@ class TransformerBlock(nn.Module):
 
 
 class DoubleTransformerBlock(nn.Module):
-    """Two transformer layers per block: layer1 is cross-attn capable, layer2 is always self-attn.
+    """Three transformer layers per block: all cross-attn capable during training.
     input_mlp runs first to let the block detect and adapt to its input (real vs noise).
+    d_out may be smaller than d_model; the output_mlp projects down and the residual is only
+    applied to the first d_out dimensions (the char-embedding tail is dropped).
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, d_out: int = None):
         super().__init__()
+        if d_out is None:
+            d_out = d_model
+        self.d_out = d_out
         self.input_mlp = nn.Sequential(
             nn.Linear(d_model, 2 * d_model, bias=False),
             nn.GELU(),
@@ -137,48 +144,57 @@ class DoubleTransformerBlock(nn.Module):
         )
         self.layer1 = TransformerBlock(d_model, n_heads, dropout)
         self.layer2 = TransformerBlock(d_model, n_heads, dropout)
+        self.layer3 = TransformerBlock(d_model, n_heads, dropout)
         self.output_mlp = nn.Sequential(
             nn.Linear(d_model, 2 * d_model, bias=False),
             nn.GELU(),
             nn.Linear(2 * d_model, d_model, bias=False),
             nn.GELU(),
-            nn.Linear(d_model, d_model, bias=False),
+            nn.Linear(d_model, d_out, bias=False),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.input_mlp(x)
         x = self.layer1(x)
         x = self.layer2(x)
-        x = x + self.output_mlp(x)
-        return x
+        x = self.layer3(x)
+        return x[:, :, :self.d_out] + self.output_mlp(x)
 
     def forward_kv(self, x: torch.Tensor):
         x = x + self.input_mlp(x)
         x, k1, v1 = self.layer1.forward_kv(x)
         x, k2, v2 = self.layer2.forward_kv(x)
-        x = x + self.output_mlp(x)
-        return x, (k1, v1), (k2, v2)
+        x, k3, v3 = self.layer3.forward_kv(x)
+        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
 
-    def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2):
+    def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2, past_kv3):
         x = x + self.input_mlp(x)
         pk1, pv1 = past_kv1
         pk2, pv2 = past_kv2
+        pk3, pv3 = past_kv3
         x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
         x, k2, v2 = self.layer2.forward_with_cache(x, pk2, pv2)
-        x = x + self.output_mlp(x)
-        return x, (k1, v1), (k2, v2)
+        x, k3, v3 = self.layer3.forward_with_cache(x, pk3, pv3)
+        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
 
 
 class Generator(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, layer_idx: int = 0):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
+        self.layer_idx = layer_idx
+        d_in = cfg.d_model + cfg.char_emb_dim  # internal block dimension, e.g. 48+16=64
+
+        if layer_idx == 0:
+            self.tok_emb = nn.Embedding(cfg.vocab_size, d_in)
+        else:
+            self.char_emb = nn.Embedding(cfg.vocab_size, cfg.char_emb_dim)
+
+        self.pos_emb = nn.Embedding(cfg.context_length, d_in)
         self.drop = nn.Dropout(cfg.dropout)
-        self.null_embs = nn.ParameterList([nn.Parameter(torch.empty(cfg.d_model)) for _ in range(cfg.n_layers)])
+        self.null_embs = nn.ParameterList([nn.Parameter(torch.empty(d_in)) for _ in range(cfg.n_layers)])
         self.blocks = nn.Sequential(*[
-            DoubleTransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            DoubleTransformerBlock(d_in, cfg.n_heads, cfg.dropout, d_out=cfg.d_model)
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_model)
@@ -187,7 +203,7 @@ class Generator(nn.Module):
         for p in self.null_embs:
             nn.init.normal_(p, std=0.5)
         for name, p in self.named_parameters():
-            if name.endswith("out_proj.weight") or name.endswith("ff.net.2.weight"):
+            if name.endswith("out_proj.weight") or name.endswith("ff.net.4.weight"):
                 nn.init.normal_(p, std=0.02 / (2 * cfg.n_layers) ** 0.5)
 
     def _init_weights(self, module):
@@ -198,23 +214,24 @@ class Generator(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
 
-    def forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        B, T = x.shape
-        pos = torch.arange(T, device=x.device)
-        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+    def _build_input(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
+        """Construct the d_in-dimensional input tensor from token ids and optional prev_latent."""
+        pos = torch.arange(x.shape[1], device=x.device)
+        if self.layer_idx == 0:
+            return self.tok_emb(x) + self.pos_emb(pos)
+        assert prev_latent is not None, "prev_latent required for layer_idx > 0"
+        char = self.char_emb(x)
+        return torch.cat([prev_latent, char], dim=-1) + self.pos_emb(pos)
+
+    def forward_hidden(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
+        h = self.drop(self._build_input(x, prev_latent))
         h = self.blocks(h)
         return self.norm(h)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(self.forward_hidden(x), self.tok_emb.weight)
-
-    def forward_hidden_layerwise(self, x: torch.Tensor, detach_emb: bool = False) -> list:
-        """Returns [h_0, h_1, ..., h_N] where h_0 = embeddings, length = n_layers + 1.
-        detach_emb=True cuts the gradient at the embedding output (use for clean generator path).
-        """
-        B, T = x.shape
-        pos = torch.arange(T, device=x.device)
-        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+    def forward_hidden_layerwise(self, x: torch.Tensor, prev_latent: torch.Tensor = None,
+                                 detach_emb: bool = False) -> list:
+        """Returns [h_0, h_1, ..., h_N] where h_0 = input embedding, length = n_layers + 1."""
+        h = self.drop(self._build_input(x, prev_latent))
         if detach_emb:
             h = h.detach()
         hiddens = [h]
@@ -223,23 +240,24 @@ class Generator(nn.Module):
             hiddens.append(h)
         return hiddens
 
-    def forward_cross_layerwise(self, x: torch.Tensor,
+    def forward_cross_layerwise(self, x: torch.Tensor, prev_latent: torch.Tensor = None,
                                 return_clean_corrupted_latents: bool = False):
         """Training-only. Every individual transformer layer cross-attends to the corresponding
         clean real-data state. Matches inference where each layer self-attends to the real
         accumulated hidden state at that depth.
         cfg.n_clean_tokens positions per sample are replaced with their real embedding instead
         of the null embedding, so the model always trains on some real input signal.
+        prev_latent: [B, T, d_model] output from the previous frozen module (required for layer_idx > 0).
         Returns [h_gen_0, ..., h_gen_N-1], length = n_layers.
         """
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
-        h_clean = self.tok_emb(x) + self.pos_emb(pos)
+        h_clean = self._build_input(x, prev_latent)
 
-        # Clean forward pass: collect state before each block (for use_clean_input)
+        # Clean forward pass: collect state before each block (for n_clean_tokens replacement)
         # and after input_mlp / after layer1 (for cross-attention context K/V).
-        pre_block_states = []   # state entering each block, before input_mlp
-        context_states = []     # per block: [after_input_mlp, after_layer1]
+        pre_block_states = []   # state entering each block, before input_mlp  [B, T, d_in]
+        context_states = []     # per block: [after_input_mlp, after_layer1, after_layer2]  [B, T, d_in]
         clean_latents = [h_clean]  # index 0 = initial embedding; index l+1 = output of block l
         for block in self.blocks:
             pre_block_states.append(h_clean)
@@ -248,9 +266,11 @@ class Generator(nn.Module):
             h_clean = block.layer1(h_clean)
             context_states.append(h_clean)          # after layer1     → K/V for layer2
             h_clean = block.layer2(h_clean)
-            h_clean = h_clean + block.output_mlp(h_clean)
-            clean_latents.append(h_clean)
-            h_clean = h_clean.detach()
+            context_states.append(h_clean)          # after layer2     → K/V for layer3
+            h_clean = block.layer3(h_clean)
+            h_out = h_clean[:, :, :block.d_out] + block.output_mlp(h_clean)  # [B, T, d_out]
+            clean_latents.append(h_out)
+            h_clean = h_out.detach()
 
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
@@ -258,51 +278,61 @@ class Generator(nn.Module):
             if self.cfg.n_clean_tokens > 0:
                 # One argsort over uniform noise gives B independent random permutations in a single kernel
                 idxs = torch.rand(B, T, device=x.device).argsort(dim=1)[:, :self.cfg.n_clean_tokens]  # [B, n]
-                idx_exp = idxs.unsqueeze(-1).expand(-1, -1, h.size(-1))                                # [B, n, D]
+                idx_exp = idxs.unsqueeze(-1).expand(-1, -1, h.size(-1))                                # [B, n, d_in]
                 h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             h = h + block.input_mlp(h)
-            h = block.layer1.forward_cross(h, context_states[2 * i])
-            h = block.layer2.forward_cross(h, context_states[2 * i + 1])
-            h = h + block.output_mlp(h)
-            gen_hiddens.append(h)
+            h = block.layer1.forward_cross(h, context_states[3 * i])
+            h = block.layer2.forward_cross(h, context_states[3 * i + 1])
+            h = block.layer3.forward_cross(h, context_states[3 * i + 2])
+            gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
-        # Corrupted forward pass — always computed, per-layer hidden states collected
+        # Corrupted forward pass — same prev_latent, different char sequence
         x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
         x_corr = x_corr + (x_corr >= x).long()
-        hc = self.tok_emb(x_corr) + self.pos_emb(pos)
+        if self.layer_idx == 0:
+            hc = self.tok_emb(x_corr) + self.pos_emb(pos)
+        else:
+            hc = torch.cat([prev_latent, self.char_emb(x_corr)], dim=-1) + self.pos_emb(pos)
         corrupt_latents = [hc]
         for i, block in enumerate(self.blocks):
             hc = hc + block.input_mlp(hc)
-            hc = block.layer1.forward_cross(hc, context_states[2 * i])
-            hc = block.layer2.forward_cross(hc, context_states[2 * i + 1])
-            hc = hc + block.output_mlp(hc)
-            corrupt_latents.append(hc)
-            hc = hc.detach()
+            hc = block.layer1.forward_cross(hc, context_states[3 * i])
+            hc = block.layer2.forward_cross(hc, context_states[3 * i + 1])
+            hc = block.layer3.forward_cross(hc, context_states[3 * i + 2])
+            hc_out = hc[:, :, :block.d_out] + block.output_mlp(hc)
+            corrupt_latents.append(hc_out)
+            hc = hc_out.detach()
 
         if return_clean_corrupted_latents:
             return gen_hiddens, clean_latents, corrupt_latents
 
         return gen_hiddens, clean_latents, corrupt_latents
 
-    def encode_kv(self, x: torch.Tensor):
+    @torch.no_grad()
+    def encode_clean(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
+        """Return clean latent output [B, T, d_model] for use as input to the next module."""
+        h = self._build_input(x, prev_latent)
+        for block in self.blocks:
+            h = block(h)
+        return h
+
+    def encode_kv(self, x: torch.Tensor, prev_latent: torch.Tensor = None):
         """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
-        B, T = x.shape
-        pos = torch.arange(T, device=x.device)
-        h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
+        h = self.drop(self._build_input(x, prev_latent))
         kv_cache = []
         for block in self.blocks:
-            h, kv1, kv2 = block.forward_kv(h)
-            kv_cache.append((kv1, kv2))
+            h, kv1, kv2, kv3 = block.forward_kv(h)
+            kv_cache.append((kv1, kv2, kv3))
         return self.norm(h)[:, -1, :], kv_cache
 
     def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
-        """Decode a single new token position using a KV cache."""
+        """Decode a single new token position using a KV cache (layer_idx=0 only)."""
         pos_tensor = torch.tensor([pos], device=token_id.device)
         h = self.drop(self.tok_emb(token_id) + self.pos_emb(pos_tensor))
         new_kv = []
-        for block, (kv1, kv2) in zip(self.blocks, kv_cache):
-            h, new_kv1, new_kv2 = block.forward_with_cache(h, kv1, kv2)
-            new_kv.append((new_kv1, new_kv2))
+        for block, (kv1, kv2, kv3) in zip(self.blocks, kv_cache):
+            h, new_kv1, new_kv2, new_kv3 = block.forward_with_cache(h, kv1, kv2, kv3)
+            new_kv.append((new_kv1, new_kv2, new_kv3))
         return self.norm(h)[:, 0, :], new_kv
 
     @torch.no_grad()

@@ -1,5 +1,7 @@
 import argparse
+import glob
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,6 +12,13 @@ import torch.nn.functional as F
 from data import ByteTokenizer
 from model import Generator, LayerwiseDecoder
 from train import find_latest_checkpoint
+
+
+def find_latest_module_dir(base_dir):
+    dirs = glob.glob(os.path.join(base_dir, "module_*"))
+    if not dirs:
+        return base_dir
+    return max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
 
 
 def load_checkpoint(path, device):
@@ -41,9 +50,9 @@ def _predict_next_logits(generator, layerwise_decoder, pos: int, ctx_kv, device)
     """
     pos_t = torch.tensor([pos], device=device)
     pred_h = None
-    for i, (block, (kv1, kv2)) in enumerate(zip(generator.blocks, ctx_kv)):
+    for i, (block, (kv1, kv2, kv3)) in enumerate(zip(generator.blocks, ctx_kv)):
         h = (generator.null_embs[i] + generator.pos_emb(pos_t)).unsqueeze(0)  # [1, 1, D]
-        h, _, _ = block.forward_with_cache(h, kv1, kv2)
+        h, _, _, _ = block.forward_with_cache(h, kv1, kv2, kv3)
         pred_h = h  # [1, 1, D]
     n_layers = len(generator.blocks)
     return layerwise_decoder(n_layers - 1, pred_h[:, 0, :])  # [1, vocab_size]
@@ -125,9 +134,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = ByteTokenizer()
 
-    ckpt_path = args.checkpoint or find_latest_checkpoint(args.checkpoint_dir)
+    ckpt_dir = find_latest_module_dir(args.checkpoint_dir)
+    ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
     if ckpt_path is None:
-        sys.exit(f"No checkpoint found in {args.checkpoint_dir!r}")
+        sys.exit(f"No checkpoint found in {ckpt_dir!r}")
     print(f"Loading checkpoint: {ckpt_path}")
     generator, layerwise_decoder, cfg = load_checkpoint(ckpt_path, device)
     print(f"Generating {args.max_tokens} tokens on {device}...")

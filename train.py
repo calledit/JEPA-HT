@@ -1,3 +1,4 @@
+import argparse
 import copy
 import csv
 import glob
@@ -10,6 +11,8 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 from config import Config
 from model import Generator, LayerwisePredictor, ContrastiveNet, LayerwiseDecoder
@@ -46,6 +49,7 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, contrastiv
         "step": step,
         "docs_consumed": docs_consumed,
         "cfg": cfg,
+        "layer_idx": generator.layer_idx,
     }
     if extra:
         payload.update(extra)
@@ -198,12 +202,26 @@ def discriminator_loss(contrastive_net, h, n_samples):
     return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
 
 
-def train():
-    cfg = Config()
-    device = torch.device(cfg.device)
-    print(f"Device: {device}")
+def get_prev_latent(x: torch.Tensor, prev_generators: list) -> torch.Tensor | None:
+    """Run frozen earlier modules in sequence to produce input latent for the current module."""
+    latent = None
+    for gen in prev_generators:
+        latent = gen.encode_clean(x, latent)
+    return latent
 
-    generator = Generator(cfg).to(device)
+
+def train():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layer", type=int, default=0, help="Which module to train (0-indexed)")
+    args = parser.parse_args()
+    layer_idx = args.layer
+
+    cfg = Config()
+    cfg.checkpoint_dir = os.path.join("checkpoints", f"module_{layer_idx}")
+    device = torch.device(cfg.device)
+    print(f"Device: {device}  |  Training module {layer_idx}")
+
+    generator = Generator(cfg, layer_idx=layer_idx).to(device)
     target_generator = copy.deepcopy(generator)
     layerwise_predictor = LayerwisePredictor(cfg).to(device)
     contrastive_net = ContrastiveNet(cfg).to(device)
@@ -223,11 +241,30 @@ def train():
     )
 
 
+    # ── Load frozen previous modules (layer_idx > 0) ────────────────────────
+    prev_generators = []
+    if layer_idx > 0:
+        for i in range(layer_idx):
+            prev_ckpt_dir = os.path.join("checkpoints", f"module_{i}")
+            prev_ckpt_path = find_latest_checkpoint(prev_ckpt_dir)
+            if prev_ckpt_path is None:
+                raise RuntimeError(f"No checkpoint found for module {i} in {prev_ckpt_dir}")
+            prev_gen = Generator(cfg, layer_idx=i).to(device)
+            prev_ckpt = torch.load(prev_ckpt_path, map_location=device, weights_only=False)
+            prev_gen.load_state_dict(prev_ckpt["generator"])
+            prev_gen.eval()
+            for p in prev_gen.parameters():
+                p.requires_grad_(False)
+            prev_generators.append(prev_gen)
+            print(f"  Loaded frozen module {i} from {prev_ckpt_path}")
+
     step = 0
     skip_docs = 0
     adaptive_disabled_until = 0
     adaptive_lr_scale = 1.0
     adaptive_batch_doubled = False
+    plateau_last_decrease_step = 0
+    decoder_hist = deque()
 
     ckpt_path = find_latest_checkpoint(cfg.checkpoint_dir)
     if ckpt_path:
@@ -269,9 +306,11 @@ def train():
                 pg["weight_decay"] = cfg.weight_decay
         step = ckpt["step"]
         skip_docs = ckpt.get("docs_consumed", 0)
-        adaptive_disabled_until = ckpt.get("adaptive_disabled_until", 0)
-        adaptive_lr_scale      = 1#ckpt.get("adaptive_lr_scale", 1.0)
-        adaptive_batch_doubled = ckpt.get("adaptive_batch_doubled", False)
+        adaptive_disabled_until    = ckpt.get("adaptive_disabled_until", 0)
+        adaptive_lr_scale          = ckpt.get("adaptive_lr_scale", 1.0)
+        adaptive_batch_doubled     = ckpt.get("adaptive_batch_doubled", False)
+        plateau_last_decrease_step = ckpt.get("plateau_last_decrease_step", 0)
+        decoder_hist.extend(ckpt.get("decoder_hist", []))
         if "cfg" in ckpt:
             saved_cfg = ckpt["cfg"]
             cfg.jacobian_weight = saved_cfg.jacobian_weight
@@ -299,25 +338,52 @@ def train():
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     log_path = os.path.join(cfg.checkpoint_dir, "training_log.csv")
-    write_header = not os.path.exists(log_path)
+    _ll = range(cfg.n_layers)
+    _log_header = (
+        ["step"] +
+        [f"jepa_loss_{l}" for l in _ll] +
+        [f"attract_{l}" for l in _ll] +
+        [f"toward_zero_{l}" for l in _ll] +
+        [f"repel_{l}" for l in _ll] +
+        ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
+        [f"vicreg_var_{l}" for l in _ll] + ["vicreg_var_avg"] +
+        [f"vicreg_cov_{l}" for l in _ll] + ["vicreg_cov_avg"] +
+        [col for l in _ll for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}")] +
+        ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
+        [f"attract_std_{l}" for l in _ll] +
+        [f"repel_std_{l}" for l in _ll] +
+        ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"]
+    )
+    if not os.path.exists(log_path):
+        write_header = True
+    else:
+        with open(log_path) as _f:
+            _has_header = _f.readline().startswith("step")
+        if not _has_header:
+            with open(log_path) as _f:
+                _existing = _f.read()
+            with open(log_path, "w", newline="") as _fw:
+                csv.writer(_fw).writerow(_log_header)
+                _fw.write(_existing)
+        write_header = False
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if write_header:
-        layer_headers = [f"jepa_loss_{l}" for l in range(cfg.n_layers)]
-        attract_headers = [f"attract_{l}" for l in range(cfg.n_layers)]
-        toward_zero_headers = [f"toward_zero_{l}" for l in range(cfg.n_layers)]
-        repel_headers = [f"repel_{l}" for l in range(cfg.n_layers)]
-        decoder_headers = [col for l in range(cfg.n_layers) for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}")]
-        vicreg_var_headers = [f"vicreg_var_{l}" for l in range(cfg.n_layers)]
-        vicreg_cov_headers = [f"vicreg_cov_{l}" for l in range(cfg.n_layers)]
-        attract_std_headers = [f"attract_std_{l}" for l in range(cfg.n_layers)]
-        repel_std_headers   = [f"repel_std_{l}"   for l in range(cfg.n_layers)]
-        log_writer.writerow(
-            ["step"] + layer_headers + attract_headers + toward_zero_headers + repel_headers +
-            ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
-            vicreg_var_headers + ["vicreg_var_avg"] + vicreg_cov_headers + ["vicreg_cov_avg"] +
-            decoder_headers + ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
-            attract_std_headers + repel_std_headers + ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"]
+        log_writer.writerow(_log_header)
+
+    steps_log_path = os.path.join(cfg.checkpoint_dir, "steps_log.csv")
+    steps_write_header = not os.path.exists(steps_log_path)
+    steps_log_file = open(steps_log_path, "a", newline="")
+    steps_log_writer = csv.writer(steps_log_file)
+    if steps_write_header:
+        steps_log_writer.writerow(
+            ["step"] +
+            [f"jepa_{l}" for l in range(cfg.n_layers)] +
+            [f"attract_{l}" for l in range(cfg.n_layers)] +
+            [f"repel_{l}" for l in range(cfg.n_layers)] +
+            ["jepa_total", "contrastive", "r1", "jacobian", "latent_std", "latent_mean", "lr"] +
+            [f"decoder_a_{l}" for l in range(cfg.n_layers)] +
+            [f"decoder_b_{l}" for l in range(cfg.n_layers)]
         )
 
     last_ckpt_interval = step // cfg.checkpoint_interval
@@ -337,6 +403,7 @@ def train():
     decoder_layer_sums_b = [0.0] * cfg.n_layers
     decoder_sum = 0.0
     decoder_count = 0
+    step_dec_losses = None  # set when decoder runs, cleared after each steps_log row
     loss_count = 0
     tokens_since_log = 0
     attract_window     = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
@@ -365,7 +432,9 @@ def train():
     while True:
         batch = next_batch().to(device)
         x = batch[:, :-1]
-    
+
+        prev_latent = get_prev_latent(x, prev_generators) if prev_generators else None
+
         lr = get_lr(step, cfg) * adaptive_lr_scale
         for pg in gen_opt.param_groups:
             pg["lr"] = lr
@@ -383,6 +452,7 @@ def train():
         with autocast():
             gen_hiddens, clean_latents, corrupt_latents = generator.forward_cross_layerwise(
                 x,
+                prev_latent=prev_latent,
                 return_clean_corrupted_latents=True,
             )
 
@@ -489,13 +559,14 @@ def train():
             jac_penalty = None
             if cfg.jacobian_weight > 0.0 and step % cfg.jacobian_interval == 0:
                 pos = torch.arange(x.shape[1], device=device)
-                emb = (generator.tok_emb(x) + generator.pos_emb(pos)).requires_grad_(True)
+                if layer_idx == 0:
+                    emb = (generator.tok_emb(x) + generator.pos_emb(pos)).requires_grad_(True)
+                else:
+                    char = generator.char_emb(x)
+                    emb = (torch.cat([prev_latent.detach(), char], dim=-1) + generator.pos_emb(pos)).requires_grad_(True)
                 h = emb
                 for block in generator.blocks:
-                    h = h + block.input_mlp(h)
-                    h = block.layer1(h)
-                    h = block.layer2(h)
-                    h = h + block.output_mlp(h)
+                    h = block(h)
                 # Use the difference between pairs of real samples as the projection direction —
                 # measures sensitivity in directions that actually occur in the data.
                 v = (h[1:] - h[:-1]).detach()
@@ -539,11 +610,33 @@ def train():
             dec_loss.backward()
             torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
             decoder_opt.step()
+            step_dec_losses = [(da.item(), db.item()) for da, db in dec_losses]
             for l, (da, db) in enumerate(dec_losses):
                 decoder_layer_sums_a[l] += da.item()
                 decoder_layer_sums_b[l] += db.item()
             decoder_sum += dec_loss.item()
             decoder_count += 1
+
+            # ── Plateau detection ──
+            # Keep a 50k-step history of raw decoder losses.
+            # Trigger if the recent 10k-step avg is worse than the avg of the
+            # ±5k window around the best point in the older 35k-step region.
+            decoder_hist.append((step, step_dec_losses[0][0]))
+            while decoder_hist[0][0] < step - 50_000:
+                decoder_hist.popleft()
+            if step - plateau_last_decrease_step > 50_000 and len(decoder_hist) > 200:
+                recent  = [l for s, l in decoder_hist if s > step - 10_000]
+                older   = [(s, l) for s, l in decoder_hist if s <= step - 15_000]
+                if recent and older:
+                    best_s  = min(older, key=lambda x: x[1])[0]
+                    ref_win = [l for s, l in decoder_hist if abs(s - best_s) <= 5_000]
+                    if ref_win:
+                        recent_avg = sum(recent) / len(recent)
+                        ref_avg    = sum(ref_win) / len(ref_win)
+                        if recent_avg > ref_avg + 0.01:
+                            adaptive_lr_scale *= 0.4
+                            plateau_last_decrease_step = step
+                            print(f"  [plateau] decoder_a_0 recent avg {recent_avg:.4f} > best-region avg {ref_avg:.4f} → lr_scale={adaptive_lr_scale:.3e} (lr≈{get_lr(step, cfg) * adaptive_lr_scale:.2e})")
 
         step += 1
         for l, ll in enumerate(layer_losses):
@@ -570,10 +663,31 @@ def train():
                 vicreg_cov_layer_sums[l] += vc_cov_losses[l].item()
         with torch.no_grad():
             latent = target_latents[-1].detach().float()
-            latent_std_sum  += latent.std(dim=[0, 1]).mean().item()
-            latent_mean_sum += latent.mean().item()
+            step_latent_std  = latent.std(dim=[0, 1]).mean().item()
+            step_latent_mean = latent.mean().item()
+            latent_std_sum  += step_latent_std
+            latent_mean_sum += step_latent_mean
         loss_count += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
+
+        steps_log_writer.writerow(
+            [step] +
+            [f"{ll.item():.6f}" for ll in layer_losses] +
+            [f"{a.item():.6f}" for a in attract_losses] +
+            [f"{r.item():.6f}" for r in repel_losses] +
+            [
+                f"{jepa_loss.item():.6f}",
+                f"{disc_base.item():.6f}" if cfg.enable_contrastive else "",
+                f"{r1_penalty.item():.6f}" if cfg.enable_contrastive else "",
+                f"{jac_penalty.item():.6f}" if jac_penalty is not None else "",
+                f"{step_latent_std:.6f}",
+                f"{step_latent_mean:.6f}",
+                f"{lr:.6e}",
+            ] +
+            [f"{da:.6f}" if step_dec_losses else "" for da, _ in (step_dec_losses or [(0, 0)] * cfg.n_layers)] +
+            [f"{db:.6f}" if step_dec_losses else "" for _, db in (step_dec_losses or [(0, 0)] * cfg.n_layers)]
+        )
+        step_dec_losses = None
 
         if step % cfg.eval_interval == 0:
             avg_layer_losses        = [jepa_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
@@ -630,7 +744,7 @@ def train():
             decoder_count = 0
             loss_count = 0
 
-            val_loss = estimate_loss(target_generator, val_data, cfg)
+            val_loss = float("nan")
             elapsed = time.time() - t0
             tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
             t_last_log = time.time()
@@ -672,6 +786,7 @@ def train():
                 [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"]
             )
             log_file.flush()
+            steps_log_file.flush()
 
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
@@ -688,14 +803,17 @@ def train():
                     "adaptive_disabled_until":          adaptive_disabled_until,
                     "adaptive_lr_scale":                adaptive_lr_scale,
                     "adaptive_batch_doubled":           adaptive_batch_doubled,
+                    "plateau_last_decrease_step":       plateau_last_decrease_step,
+                    "decoder_hist":                    list(decoder_hist),
                 },
             )
             last_ckpt_interval = ckpt_interval
 
         emb_interval = step // 500
         if emb_interval > last_emb_export:
-            emb = generator.tok_emb.weight.detach().cpu().float().numpy()
-            np.save(os.path.join(emb_export_dir, f"emb_s{step:07d}.npy"), emb)
+            emb_weight = generator.tok_emb.weight if layer_idx == 0 else generator.char_emb.weight
+            np.save(os.path.join(emb_export_dir, f"emb_s{step:07d}.npy"),
+                    emb_weight.detach().cpu().float().numpy())
             last_emb_export = emb_interval
 
 
