@@ -468,15 +468,18 @@ def train():
 
             # ── Discriminator step: target latents = real (+1), corrupt latents = fake (-1) ──
             disc_layer_losses = []
+            disc_margin_sum = 0.0
             for l in range(cfg.n_layers):
                 pos_scores = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
                 neg_scores = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
                 layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
+                disc_margin_sum += (pos_scores.mean() - neg_scores.mean()).item()
                 if cfg.gradient_residual_amplification:
                     layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
                     layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
                 disc_layer_losses.append(layer_disc)
             disc_base = sum(disc_layer_losses) / cfg.n_layers
+            disc_margin = disc_margin_sum / cfg.n_layers
 
             # R1 gradient penalty on real (target) inputs only
             r1_penalty = disc_base.new_zeros(1).squeeze()
@@ -504,24 +507,16 @@ def train():
             repel_losses = []
             B, T = x.shape
             for l in range(cfg.n_layers):
-                with torch.no_grad():
-                    disc_target  = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
-                    disc_corrupt = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
-                    disc_pred = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
-                # attract scale: certain about both target and corrupt → reliable training signal
-                attract_scale = (disc_target.abs() + disc_corrupt.abs()) / 2.0 + cfg.disc_eps
-                # repel scale (attached): repel when pred looks corrupt; disc frozen during gen backward
-                repel_scale = F.relu(-disc_pred) + cfg.disc_eps
+                disc_target  = contrastive_net(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+                disc_corrupt = contrastive_net(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+                #disc_pred  = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
-                per_token_attract = F.mse_loss(preds[l], target_latents[l + 1].detach(), reduction='none').mean(-1)
-                attract = (attract_scale * per_token_attract).mean()
+                attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
                 if cfg.gradient_residual_amplification:
                     attract = gra(attract, preds[l], cfg.gra_scale)
-                    #attract = gra(attract, gen_hiddens[l], cfg.gra_scale)
 
-                per_token_repel = (1.0 - F.cosine_similarity(preds[l], corrupt_latents[l + 1].detach(), dim=-1)) / 2.0
-                repel = ((repel_scale+1) * per_token_repel).mean()
+                repel = (disc_corrupt - disc_target).mean()
 
                 layer_loss = attract + repel * cfg.jepa_repulsion_weight
                 layer_losses.append(layer_loss)
@@ -646,8 +641,8 @@ def train():
             jac_count += 1
             jac_window.append(jac_penalty.item())
         if cfg.enable_contrastive:
-            contrastive_sum += disc_base.item()
-            contrastive_window.append(disc_base.item())
+            contrastive_sum += disc_margin
+            contrastive_window.append(disc_margin)
             r1_sum += r1_penalty.item()
             clean_corrupt_count += 1
         if cfg.enable_vicreg:
