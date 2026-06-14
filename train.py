@@ -507,11 +507,11 @@ def train():
                 with torch.no_grad():
                     disc_target  = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
                     disc_corrupt = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
+                    disc_pred = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
                 # attract scale: certain about both target and corrupt → reliable training signal
                 attract_scale = (disc_target.abs() + disc_corrupt.abs()) / 2.0 + cfg.disc_eps
                 # repel scale (attached): repel when pred looks corrupt; disc frozen during gen backward
-                disc_pred = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
                 repel_scale = F.relu(-disc_pred) + cfg.disc_eps
 
                 per_token_attract = F.mse_loss(preds[l], target_latents[l + 1].detach(), reduction='none').mean(-1)
