@@ -437,7 +437,9 @@ def train():
                 probs = torch.softmax(logits, dim=-1)
                 probs.scatter_(-1, x.unsqueeze(-1), 0.0)
                 probs = probs / probs.sum(dim=-1, keepdim=True)
-                return torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=1).reshape(x.shape)
+                B, T = x.shape
+                samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
+                return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
 
         corrupt_fn = decoder_corrupt_fn if step % cfg.decoder_train_interval == 0 else None
 
@@ -532,7 +534,8 @@ def train():
             for l in range(cfg.n_layers):
 
                 disc_target  = manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
-                disc_corrupt = manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+                K = cfg.corrupt_samples
+                disc_corrupt = manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(K, B, T).mean(0)
                 #disc_pred  = manifold_est(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())

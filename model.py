@@ -313,21 +313,31 @@ class Generator(nn.Module):
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
         # ── Corrupt stream ────────────────────────────────────────────────────
+        K = self.cfg.corrupt_samples
         if x_corr is None:
             if corrupt_fn is not None:
-                x_corr = corrupt_fn(clean_latents, gen_hiddens)
+                x_corr = corrupt_fn(clean_latents, gen_hiddens)  # [B*K, T]
             else:
-                x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
-                x_corr = x_corr + (x_corr >= x).long()
+                xc_list = []
+                for _ in range(K):
+                    xc = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
+                    xc = xc + (xc >= x).long()
+                    xc_list.append(xc)
+                x_corr = torch.cat(xc_list, dim=0)  # [B*K, T]
         prev_c = prev_latent_corrupt if prev_latent_corrupt is not None else prev_latent_clean
+        if prev_c is not None:
+            prev_c = prev_c.repeat(K, 1, 1)  # [B*K, T, D]
         hc = self._build_input(x_corr, prev_c)
         corrupt_latents = [hc]
         for i, block in enumerate(self.blocks):
-            kv0, kv1, kv2 = cross_kvs[i]
+            (k0, v0), (k1, v1), (k2, v2) = cross_kvs[i]
+            k0, v0 = k0.repeat(K, 1, 1, 1), v0.repeat(K, 1, 1, 1)
+            k1, v1 = k1.repeat(K, 1, 1, 1), v1.repeat(K, 1, 1, 1)
+            k2, v2 = k2.repeat(K, 1, 1, 1), v2.repeat(K, 1, 1, 1)
             hc = hc + block.input_mlp(hc)
-            hc = block.layer1.forward_cross_kv(hc, *kv0)
-            hc = block.layer2.forward_cross_kv(hc, *kv1)
-            hc = block.layer3.forward_cross_kv(hc, *kv2)
+            hc = block.layer1.forward_cross_kv(hc, k0, v0)
+            hc = block.layer2.forward_cross_kv(hc, k1, v1)
+            hc = block.layer3.forward_cross_kv(hc, k2, v2)
             hc_out = hc[:, :, :block.d_out] + block.output_mlp(hc)
             corrupt_latents.append(hc_out)
             hc = hc_out.detach()

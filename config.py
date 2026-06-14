@@ -21,6 +21,8 @@ class Config:
     # How often to train the layerwise decoder probes
     decoder_train_interval: int = 13
 
+    corrupt_samples: int = 3
+
     # Contrastive / Equivalence Estimator
     enable_manifold: bool = True
     # Minimum attract scale: prevents the attract loss from hitting exactly 0
