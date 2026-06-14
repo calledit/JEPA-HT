@@ -407,6 +407,40 @@ def train():
         for pg in layerwise_pred_opt.param_groups:
             pg["lr"] = cfg.predictor_lr
 
+        # ── Decoder callback: trains on fresh latents, returns hard-negative tokens ──
+        step_dec_losses = None
+        _dec_loss_ref = [None]
+        _dec_losses_ref = [None]
+
+        def decoder_corrupt_fn(clean_latents, gen_hiddens):
+            targets = x.reshape(-1)
+            with autocast():
+                dec_losses = [
+                    (
+                        F.cross_entropy(
+                            layerwise_decoder(l, gen_hiddens[l].detach()).reshape(-1, cfg.vocab_size),
+                            targets,
+                        ),
+                        F.cross_entropy(
+                            layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
+                            targets,
+                        ),
+                        torch.tensor(0.0),
+                    )
+                    for l in range(cfg.n_layers)
+                ]
+                dec_loss = sum((a + b + c) / 3 for a, b, c in dec_losses) / cfg.n_layers
+            _dec_loss_ref[0] = dec_loss
+            _dec_losses_ref[0] = dec_losses
+            with torch.no_grad():
+                logits = layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach().float())
+                probs = torch.softmax(logits, dim=-1)
+                probs.scatter_(-1, x.unsqueeze(-1), 0.0)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+                return torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=1).reshape(x.shape)
+
+        corrupt_fn = decoder_corrupt_fn if step % cfg.decoder_train_interval == 0 else None
+
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
             gen_hiddens, clean_latents, corrupt_latents, _ = generator.forward_cross_layerwise(
@@ -415,12 +449,46 @@ def train():
                 prev_latent_gen=prev_gen,
                 prev_latent_corrupt=prev_corrupt,
                 x_corr=prev_x_corr,
+                corrupt_fn=corrupt_fn,
                 )
 
             target_latents = clean_latents
 
             preds = [layerwise_predictor.predictors[l](gen_hiddens[l]) for l in range(cfg.n_layers)]
 
+        # ── Decoder backward (forward ran inside the callback above) ──────────
+        if _dec_loss_ref[0] is not None:
+            dec_loss   = _dec_loss_ref[0]
+            dec_losses = _dec_losses_ref[0]
+            decoder_opt.zero_grad()
+            dec_loss.backward()
+            torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
+            decoder_opt.step()
+            step_dec_losses = [(da.item(), db.item(), dc.item()) for da, db, dc in dec_losses]
+            for l, (da, db, dc) in enumerate(dec_losses):
+                decoder_layer_sums_a[l] += da.item()
+                decoder_layer_sums_b[l] += db.item()
+                decoder_layer_sums_c[l] += dc.item()
+            decoder_sum += dec_loss.item()
+            decoder_count += 1
+
+            # ── Plateau detection ──
+            decoder_hist.append((step, step_dec_losses[0][0]))
+            while decoder_hist[0][0] < step - 50_000:
+                decoder_hist.popleft()
+            if step - plateau_last_decrease_step > 50_000 and len(decoder_hist) > 200 and False:
+                midpoint = step - 25_000
+                first_half  = [l for s, l in decoder_hist if s <= midpoint]
+                second_half = [l for s, l in decoder_hist if s >  midpoint]
+                if first_half and second_half:
+                    ref_avg    = sum(first_half)  / len(first_half)
+                    recent_avg = sum(second_half) / len(second_half)
+                    if recent_avg > ref_avg + 0.01:
+                        adaptive_lr_scale *= 0.4
+                        plateau_last_decrease_step = step
+                        print(f"  [plateau] decoder_a_0 recent avg {recent_avg:.4f} > first-half avg {ref_avg:.4f} → lr_scale={adaptive_lr_scale:.3e} (lr≈{get_lr(step, cfg) * adaptive_lr_scale:.2e})")
+
+        with autocast():
             # ── Discriminator step: target latents = real (+1), corrupt latents = fake (-1) ──
             disc_layer_losses = []
             disc_margin_sum = 0.0
@@ -512,59 +580,6 @@ def train():
         layerwise_pred_opt.step()
         for param in manifold_est.parameters():
             param.requires_grad_(True)
-
-        # ── Layerwise decoder probes ──────────────────────────────────────────
-        if step % cfg.decoder_train_interval == 0:
-            targets = x.reshape(-1)
-            with autocast():
-                dec_losses = [
-                    (
-                        F.cross_entropy(
-                            layerwise_decoder(l, gen_hiddens[l].detach()).reshape(-1, cfg.vocab_size),
-                            targets,
-                        ),
-                        F.cross_entropy(
-                            layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
-                            targets,
-                        ),
-                        torch.tensor(0.0),
-                        #F.cross_entropy(
-                        #    layerwise_decoder(l, preds[l].detach().float()).reshape(-1, cfg.vocab_size),
-                        #    targets,
-                        #),
-                    )
-                    for l in range(cfg.n_layers)
-                ]
-                dec_loss = sum((a + b + c) / 3 for a, b, c in dec_losses) / cfg.n_layers
-            decoder_opt.zero_grad()
-            dec_loss.backward()
-            torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
-            decoder_opt.step()
-            step_dec_losses = [(da.item(), db.item(), dc.item()) for da, db, dc in dec_losses]
-            for l, (da, db, dc) in enumerate(dec_losses):
-                decoder_layer_sums_a[l] += da.item()
-                decoder_layer_sums_b[l] += db.item()
-                decoder_layer_sums_c[l] += dc.item()
-            decoder_sum += dec_loss.item()
-            decoder_count += 1
-
-            # ── Plateau detection ──
-            # Keep a 50k-step history. Compare the last 25k steps (recent) to
-            # the first 25k steps (reference) — equal-sized windows for a fair comparison.
-            decoder_hist.append((step, step_dec_losses[0][0]))
-            while decoder_hist[0][0] < step - 50_000:
-                decoder_hist.popleft()
-            if step - plateau_last_decrease_step > 50_000 and len(decoder_hist) > 200:
-                midpoint = step - 25_000
-                first_half  = [l for s, l in decoder_hist if s <= midpoint]
-                second_half = [l for s, l in decoder_hist if s >  midpoint]
-                if first_half and second_half:
-                    ref_avg    = sum(first_half)  / len(first_half)
-                    recent_avg = sum(second_half) / len(second_half)
-                    if recent_avg > ref_avg + 0.01:
-                        adaptive_lr_scale *= 0.4
-                        plateau_last_decrease_step = step
-                        print(f"  [plateau] decoder_a_0 recent avg {recent_avg:.4f} > first-half avg {ref_avg:.4f} → lr_scale={adaptive_lr_scale:.3e} (lr≈{get_lr(step, cfg) * adaptive_lr_scale:.2e})")
 
         step += 1
         for l, ll in enumerate(layer_losses):

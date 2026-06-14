@@ -261,12 +261,16 @@ class Generator(nn.Module):
                                 prev_latent_gen: torch.Tensor = None,
                                 prev_latent_corrupt: torch.Tensor = None,
                                 x_corr: torch.Tensor = None,
-                                clean_token_leak: bool = True):
+                                clean_token_leak: bool = True,
+                                corrupt_fn=None):
         """Training-only forward with three parallel streams: clean, generative (null-init), corrupt.
         For module 0 all prev_latents are None. For module 1+ each stream receives the corresponding
         output from the frozen previous module so the corruption/generation is consistent up the chain.
         x_corr: if provided, reuse this corrupted character sequence (keeps corruption consistent
                 across all modules); otherwise a fresh one is sampled and returned.
+        corrupt_fn: optional callable(clean_latents, gen_hiddens) -> x_corr tensor [B, T].
+                    Called after clean/gen streams are computed but before the corrupt stream runs.
+                    Allows the decoder to train on fresh latents and supply hard-negative tokens.
         Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr).
         """
         B, T = x.shape
@@ -310,8 +314,11 @@ class Generator(nn.Module):
 
         # ── Corrupt stream ────────────────────────────────────────────────────
         if x_corr is None:
-            x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
-            x_corr = x_corr + (x_corr >= x).long()
+            if corrupt_fn is not None:
+                x_corr = corrupt_fn(clean_latents, gen_hiddens)
+            else:
+                x_corr = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
+                x_corr = x_corr + (x_corr >= x).long()
         prev_c = prev_latent_corrupt if prev_latent_corrupt is not None else prev_latent_clean
         hc = self._build_input(x_corr, prev_c)
         corrupt_latents = [hc]
@@ -466,7 +473,7 @@ class LayerwiseDecoder(nn.Module):
 
     def __init__(self, cfg: Config):
         super().__init__()
-        D, H, V = cfg.d_model, 4 * cfg.d_model, cfg.vocab_size
+        D, H, V = cfg.d_model, 128, cfg.vocab_size
         self.decoders = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(D, H, bias=False), nn.GELU(),
