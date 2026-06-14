@@ -418,16 +418,14 @@ class LayerwisePredictor(nn.Module):
 
 
 class EquivalenceCertaintyEstimator(nn.Module):
-    """EquivalenceCertaintyEstimator: takes two latent hidden states, outputs similarity scalar.
-    Positive (same doc) → high output. Negative (different doc) → low output.
-    """
+    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         D = cfg.d_model
         self.net = nn.Sequential(
+            nn.Linear(D,     D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
-            nn.Linear(D * 4, D * 4, bias=False), nn.GELU(),
             nn.Linear(D * 4, D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D,     bias=False), nn.GELU(),
             nn.Linear(D,     1,     bias=False),
@@ -438,9 +436,8 @@ class EquivalenceCertaintyEstimator(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, h_a: torch.Tensor, h_b: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([h_a.detach(), h_b.detach()], dim=-1)
-        return self.net(x).squeeze(-1)
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h).squeeze(-1)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

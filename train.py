@@ -182,24 +182,6 @@ def clean_corrupt_loss(contrastive_net, h_clean, h_corrupt, n_samples):
     return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
 
 
-def discriminator_loss(contrastive_net, h, n_samples):
-    B, T, D = h.shape
-    idx = torch.randint(T, (B, n_samples), device=h.device)
-    h_s = h.gather(1, idx.unsqueeze(-1).expand(-1, -1, D))
-
-    h_a = h_s[:, :n_samples // 2, :].reshape(B * (n_samples // 2), D)
-    h_b = h_s[:, n_samples // 2:, :].reshape(B * (n_samples // 2), D)
-
-    perm = torch.randperm(B, device=h.device)
-    for i in range(B):
-        if perm[i] == i:
-            swap = (i + 1) % B
-            perm[i], perm[swap] = perm[swap], perm[i]
-    h_b_neg = h_b.reshape(B, n_samples // 2, D)[perm].reshape(B * (n_samples // 2), D)
-
-    pos_scores = contrastive_net(h_a, h_b)
-    neg_scores = contrastive_net(h_a, h_b_neg)
-    return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
 
 
 @torch.no_grad()
@@ -484,17 +466,11 @@ def train():
 
             preds = [layerwise_predictor.predictors[l](gen_hiddens[l]) for l in range(cfg.n_layers)]
 
-            # ── Discriminator step (GAN): pred vs target = similar, pred vs corrupt = different ──
+            # ── Discriminator step: target latents = real (+1), corrupt latents = fake (-1) ──
             disc_layer_losses = []
             for l in range(cfg.n_layers):
-                pos_scores = contrastive_net(
-                    preds[l].detach().reshape(-1, cfg.d_model),
-                    target_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                )
-                neg_scores = contrastive_net(
-                    preds[l].detach().reshape(-1, cfg.d_model),
-                    corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                )
+                pos_scores = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
+                neg_scores = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
                 layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
                 if cfg.gradient_residual_amplification:
                     layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
@@ -502,14 +478,11 @@ def train():
                 disc_layer_losses.append(layer_disc)
             disc_base = sum(disc_layer_losses) / cfg.n_layers
 
-            # R1 gradient penalty: penalise gradient norm w.r.t. real (positive) inputs
+            # R1 gradient penalty on real (target) inputs only
             r1_penalty = disc_base.new_zeros(1).squeeze()
             if cfg.r1_weight > 0.0:
                 for l in range(cfg.n_layers):
-                    real_in = torch.cat([
-                        preds[l].detach().reshape(-1, cfg.d_model),
-                        target_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                    ], dim=-1).requires_grad_(True)
+                    real_in = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
                     real_score = contrastive_net.net(real_in).squeeze(-1)
                     grad = torch.autograd.grad(
                         outputs=real_score.sum(), inputs=real_in, create_graph=True,
@@ -523,37 +496,38 @@ def train():
         torch.nn.utils.clip_grad_norm_(contrastive_net.parameters(), cfg.grad_clip)
         contrastive_opt.step()
 
-        # ── Generator step: attract to target, repel from corrupt via frozen discriminator ──
+        # ── Generator step: attract to target, repel from corrupt ──────────────
         with autocast():
             layer_losses = []
             attract_losses = []
             toward_zero_losses = []
             repel_losses = []
+            B, T = x.shape
             for l in range(cfg.n_layers):
+                with torch.no_grad():
+                    disc_target  = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
+                    disc_corrupt = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model)).reshape(B, T)
 
-                attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
+                # attract scale: certain about both target and corrupt → reliable training signal
+                attract_scale = (disc_target.abs() + disc_corrupt.abs()) / 2.0 + cfg.disc_eps
+                # repel scale (attached): repel when pred looks corrupt; disc frozen during gen backward
+                disc_pred = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
+                repel_scale = F.relu(-disc_pred) + cfg.disc_eps
+
+                per_token_attract = F.mse_loss(preds[l], target_latents[l + 1].detach(), reduction='none').mean(-1)
+                attract = (attract_scale * per_token_attract).mean()
                 if cfg.gradient_residual_amplification:
                     attract = gra(attract, preds[l], cfg.gra_scale)
-                    attract = gra(attract, gen_hiddens[l], cfg.gra_scale)
+                    #attract = gra(attract, gen_hiddens[l], cfg.gra_scale)
 
-                if step < cfg.jepa_repel_warmup_steps:
-                    repel    = (1 - F.cosine_similarity(preds[l], corrupt_latents[l + 1], dim=-1).mean()) / 2
-                    repel_tc = (1 - F.cosine_similarity(target_latents[l + 1].detach(), corrupt_latents[l + 1], dim=-1).mean()) / 2
-                    layer_loss = attract - (repel + repel_tc) * cfg.jepa_repulsion_weight
-                else:
-                    repel = F.relu((contrastive_net(
-                        preds[l].reshape(-1, cfg.d_model),
-                        corrupt_latents[l + 1].reshape(-1, cfg.d_model),
-                    ) + 1) / 2).pow(cfg.jepa_repel_power).mean()
-                    repel_tc = F.relu((contrastive_net(
-                        target_latents[l + 1].detach().reshape(-1, cfg.d_model),
-                        corrupt_latents[l + 1].reshape(-1, cfg.d_model),
-                    ) + 1) / 2).pow(cfg.jepa_repel_power).mean()
-                    layer_loss = attract + (repel + repel_tc) * cfg.jepa_repulsion_weight
+                per_token_repel = (1.0 - F.cosine_similarity(preds[l], corrupt_latents[l + 1].detach(), dim=-1)) / 2.0
+                repel = ((repel_scale+1) * per_token_repel).mean()
+
+                layer_loss = attract + repel * cfg.jepa_repulsion_weight
                 layer_losses.append(layer_loss)
                 attract_losses.append(attract.detach())
                 toward_zero_losses.append(attract)
-                repel_losses.append(((repel + repel_tc) / 2).detach())
+                repel_losses.append(repel.detach())
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
             if cfg.enable_vicreg:
@@ -618,10 +592,11 @@ def train():
                             layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
                             targets,
                         ),
-                        F.cross_entropy(
-                            layerwise_decoder(l, preds[l].detach().float()).reshape(-1, cfg.vocab_size),
-                            targets,
-                        ),
+                        torch.tensor(0.0),
+                        #F.cross_entropy(
+                        #    layerwise_decoder(l, preds[l].detach().float()).reshape(-1, cfg.vocab_size),
+                        #    targets,
+                        #),
                     )
                     for l in range(cfg.n_layers)
                 ]
