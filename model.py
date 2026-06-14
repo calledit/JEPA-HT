@@ -6,12 +6,11 @@ from config import Config
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.dropout = dropout
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
@@ -25,7 +24,6 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
-            dropout_p=self.dropout if self.training else 0.0,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -43,7 +41,6 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
-            dropout_p=self.dropout if self.training else 0.0,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -57,7 +54,6 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
-            dropout_p=self.dropout if self.training else 0.0,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -89,7 +85,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, dropout: float):
+    def __init__(self, d_model: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, 4 * d_model, bias=False),
@@ -97,7 +93,6 @@ class FeedForward(nn.Module):
             nn.Linear(4 * d_model, 2 * d_model, bias=False),
             nn.GELU(),
             nn.Linear(2 * d_model, d_model, bias=False),
-            nn.Dropout(dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,12 +100,12 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        self.attn = CausalSelfAttention(d_model, n_heads)
         self.norm2 = nn.LayerNorm(d_model)
-        self.ff = FeedForward(d_model, dropout)
+        self.ff = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
@@ -147,7 +142,7 @@ class DoubleTransformerBlock(nn.Module):
     applied to the first d_out dimensions (the char-embedding tail is dropped).
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float, d_out: int = None):
+    def __init__(self, d_model: int, n_heads: int, d_out: int = None):
         super().__init__()
         if d_out is None:
             d_out = d_model
@@ -159,9 +154,9 @@ class DoubleTransformerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model, bias=False),
         )
-        self.layer1 = TransformerBlock(d_model, n_heads, dropout)
-        self.layer2 = TransformerBlock(d_model, n_heads, dropout)
-        self.layer3 = TransformerBlock(d_model, n_heads, dropout)
+        self.layer1 = TransformerBlock(d_model, n_heads)
+        self.layer2 = TransformerBlock(d_model, n_heads)
+        self.layer3 = TransformerBlock(d_model, n_heads)
         self.output_mlp = nn.Sequential(
             nn.Linear(d_model, 2 * d_model, bias=False),
             nn.GELU(),
@@ -209,12 +204,11 @@ class Generator(nn.Module):
 
         # module 0: pos covers the full tok_emb (d_in); module 1+: pos covers only the char slot
         self.pos_emb = nn.Embedding(cfg.context_length, d_in if layer_idx == 0 else cfg.char_emb_dim)
-        self.drop = nn.Dropout(cfg.dropout)
         # module 0: null covers full tok_emb (d_in); module 1+: null covers only the char slot
         _null_dim = d_in if layer_idx == 0 else cfg.char_emb_dim
         self.null_embs = nn.ParameterList([nn.Parameter(torch.empty(_null_dim)) for _ in range(cfg.n_layers)])
         self.blocks = nn.Sequential(*[
-            DoubleTransformerBlock(d_in, cfg.n_heads, cfg.dropout, d_out=cfg.d_model)
+            DoubleTransformerBlock(d_in, cfg.n_heads, d_out=cfg.d_model)
             for _ in range(cfg.n_layers)
         ])
         self.apply(self._init_weights)
@@ -246,14 +240,14 @@ class Generator(nn.Module):
         return torch.cat([prev_latent, char + self.pos_emb(pos)], dim=-1)
 
     def forward_hidden(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
-        h = self.drop(self._build_input(x, prev_latent))
+        h = self._build_input(x, prev_latent)
         h = self.blocks(h)
         return h
 
     def forward_hidden_layerwise(self, x: torch.Tensor, prev_latent: torch.Tensor = None,
                                  detach_emb: bool = False) -> list:
         """Returns [h_0, h_1, ..., h_N] where h_0 = input embedding, length = n_layers + 1."""
-        h = self.drop(self._build_input(x, prev_latent))
+        h = self._build_input(x, prev_latent)
         if detach_emb:
             h = h.detach()
         hiddens = [h]
@@ -343,7 +337,7 @@ class Generator(nn.Module):
 
     def encode_kv(self, x: torch.Tensor, prev_latent: torch.Tensor = None):
         """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
-        h = self.drop(self._build_input(x, prev_latent))
+        h = self._build_input(x, prev_latent)
         kv_cache = []
         for block in self.blocks:
             h, kv1, kv2, kv3 = block.forward_kv(h)
@@ -353,7 +347,7 @@ class Generator(nn.Module):
     def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
         """Decode a single new token position using a KV cache (layer_idx=0 only)."""
         pos_tensor = torch.tensor([pos], device=token_id.device)
-        h = self.drop(self.tok_emb(token_id) + self.pos_emb(pos_tensor))
+        h = self.tok_emb(token_id) + self.pos_emb(pos_tensor)
         new_kv = []
         for block, (kv1, kv2, kv3) in zip(self.blocks, kv_cache):
             h, new_kv1, new_kv2, new_kv3 = block.forward_with_cache(h, kv1, kv2, kv3)
@@ -417,7 +411,7 @@ class LayerwisePredictor(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-class EquivalenceCertaintyEstimator(nn.Module):
+class ManifoldEstimator(nn.Module):
     """Single-input latent discriminator: clean latents → positive scores, corrupt → negative."""
 
     def __init__(self, cfg: Config):

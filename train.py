@@ -15,7 +15,7 @@ import torch.nn.functional as F
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 from config import Config
-from model import Generator, LayerwisePredictor, EquivalenceCertaintyEstimator, LayerwiseDecoder
+from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder
 from data import build_dataset
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
 
@@ -30,9 +30,9 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_key)
 
 
-def save_checkpoint(generator, target_generator, layerwise_predictor, contrastive_net,
+def save_checkpoint(generator, target_generator, layerwise_predictor, manifold_est,
                     layerwise_decoder,
-                    gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
+                    gen_opt, layerwise_pred_opt, manifold_opt, decoder_opt,
                     step, docs_consumed, cfg, extra=None):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
@@ -40,11 +40,11 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, contrastiv
         "generator": generator.state_dict(),
         "target_generator": target_generator.state_dict(),
         "layerwise_predictor": layerwise_predictor.state_dict(),
-        "contrastive_net": contrastive_net.state_dict(),
+        "manifold_est": manifold_est.state_dict(),
         "layerwise_decoder": layerwise_decoder.state_dict(),
         "gen_opt": gen_opt.state_dict(),
         "layerwise_pred_opt": layerwise_pred_opt.state_dict(),
-        "contrastive_opt": contrastive_opt.state_dict(),
+        "manifold_opt": manifold_opt.state_dict(),
         "decoder_opt": decoder_opt.state_dict(),
         "step": step,
         "docs_consumed": docs_consumed,
@@ -127,46 +127,18 @@ def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: flo
     return loss + scale * F.mse_loss(pred_res, target_res.detach())
 
 
-def sigreg_loss(h: torch.Tensor, n_projections: int, max_samples: int = 1024) -> torch.Tensor:
-    """SIGReg: Epps-Pulley test on random 1D projections — pushes distribution toward N(0,1)."""
-    B, T, D = h.shape
-    z = h.reshape(B * T, D).float()
-    if z.shape[0] > max_samples:
-        idx = torch.randperm(z.shape[0], device=z.device)[:max_samples]
-        z = z[idx]
-    directions = F.normalize(torch.randn(D, n_projections, device=h.device), dim=0)
-    proj = z @ directions  # [N, M]
-    proj = (proj - proj.mean(0)) / (proj.std(0) + 1e-8)
-    diff = proj.unsqueeze(0) - proj.unsqueeze(1)  # [N, N, M]
-    term1 = torch.exp(-diff.pow(2) / 2).mean(dim=[0, 1])
-    term2 = (2 ** 0.5) * 2 * torch.exp(-proj.pow(2) / 4).mean(0)
-    return (term1 - term2).mean()
 
-
-def vicreg_loss(h: torch.Tensor, cfg: Config) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, D = h.shape
-    z = h.reshape(B * T, D).float()
-    z = z - z.mean(dim=0)
-    std = z.std(dim=0)
-    var_loss = F.relu(1.0 - std).mean()
-    N = z.shape[0]
-    cov = (z.T @ z) / (N - 1)
-    off_diag_sq = cov.pow(2) * (1 - torch.eye(D, device=h.device))
-    cov_loss = off_diag_sq.sum() / D
-    return var_loss, cov_loss
-
-
-def clean_corrupt_loss(contrastive_net, h_clean, h_corrupt):
+def clean_corrupt_loss(manifold_est, h_clean, h_corrupt):
     """Contrastive loss between clean and 100%-corrupted latents.
     Every (clean_i, corrupt_i) pair is a negative — score should be below -1.
     """
     B, T, D = h_clean.shape
     hc = h_clean.reshape(B * T, D)
     hn = h_corrupt.reshape(B * T, D)
-    return F.relu(1 + contrastive_net(hc, hn)).mean()
+    return F.relu(1 + manifold_est(hc, hn)).mean()
 
 
-def clean_corrupt_loss(contrastive_net, h_clean, h_corrupt, n_samples):
+def clean_corrupt_loss(manifold_est, h_clean, h_corrupt, n_samples):
     """Next-token contrastive loss.
     Anchor: clean[t]. Positive: clean[t+1]. Negative: corrupt[t+1].
     """
@@ -177,8 +149,8 @@ def clean_corrupt_loss(contrastive_net, h_clean, h_corrupt, n_samples):
     h_anchor = h_clean.gather(1, expand(idx)).reshape(B * n_samples, D)
     h_pos    = h_clean.gather(1, expand(idx_next)).reshape(B * n_samples, D)
     h_neg    = h_corrupt.gather(1, expand(idx_next)).reshape(B * n_samples, D)
-    pos_scores = contrastive_net(h_anchor, h_pos)
-    neg_scores = contrastive_net(h_anchor, h_neg)
+    pos_scores = manifold_est(h_anchor, h_pos)
+    neg_scores = manifold_est(h_anchor, h_neg)
     return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
 
 
@@ -221,7 +193,7 @@ def train():
     generator = Generator(cfg, layer_idx=layer_idx).to(device)
     target_generator = copy.deepcopy(generator)
     layerwise_predictor = LayerwisePredictor(cfg).to(device)
-    contrastive_net = EquivalenceCertaintyEstimator(cfg).to(device)
+    manifold_est = ManifoldEstimator(cfg).to(device)
     layerwise_decoder = LayerwiseDecoder(cfg).to(device)
 
     gen_opt = torch.optim.AdamW(
@@ -230,8 +202,8 @@ def train():
     layerwise_pred_opt = torch.optim.AdamW(
         layerwise_predictor.parameters(), lr=cfg.predictor_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
-    contrastive_opt = torch.optim.AdamW(
-        contrastive_net.parameters(), lr=cfg.contrastive_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    manifold_opt = torch.optim.AdamW(
+        manifold_est.parameters(), lr=cfg.manifold_est_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
     )
     decoder_opt = torch.optim.AdamW(
         layerwise_decoder.parameters(), lr=cfg.decoder_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
@@ -274,10 +246,10 @@ def train():
             print(f"  Warning: layerwise_predictor state not loaded ({e}) — starting fresh")
             skip_opts.add("layerwise_pred_opt")
         try:
-            contrastive_net.load_state_dict(ckpt["contrastive_net"])
+            manifold_est.load_state_dict(ckpt["manifold_est"])
         except (RuntimeError, KeyError) as e:
-            print(f"  Warning: contrastive_net state not loaded ({e}) — starting fresh")
-            skip_opts.add("contrastive_opt")
+            print(f"  Warning: manifold_est state not loaded ({e}) — starting fresh")
+            skip_opts.add("manifold_opt")
         try:
             layerwise_decoder.load_state_dict(ckpt["layerwise_decoder"])
         except (RuntimeError, KeyError) as e:
@@ -285,7 +257,7 @@ def train():
             skip_opts.add("decoder_opt")
         for opt, key in [
             (gen_opt, "gen_opt"), (layerwise_pred_opt, "layerwise_pred_opt"),
-            (contrastive_opt, "contrastive_opt"), (decoder_opt, "decoder_opt"),
+            (manifold_opt, "manifold_opt"), (decoder_opt, "decoder_opt"),
         ]:
             if key in skip_opts:
                 continue
@@ -296,7 +268,7 @@ def train():
                 opt.load_state_dict(ckpt[key])
             except (ValueError, RuntimeError):
                 print(f"  Warning: skipping {key} state (shape mismatch — optimizer restarted)")
-        for opt in (gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt):
+        for opt in (gen_opt, layerwise_pred_opt, manifold_opt, decoder_opt):
             for pg in opt.param_groups:
                 pg["weight_decay"] = cfg.weight_decay
         step = ckpt["step"]
@@ -315,7 +287,7 @@ def train():
     print(
         f"Generator params: {generator.num_params():,}  |  "
         f"LayerwisePredictor params: {layerwise_predictor.num_params():,}  |  "
-        f"EquivalenceCertaintyEstimator params: {contrastive_net.num_params():,}  |  "
+        f"ManifoldEstimator params: {manifold_est.num_params():,}  |  "
         f"LayerwiseDecoder params: {layerwise_decoder.num_params():,}"
     )
 
@@ -338,14 +310,12 @@ def train():
         [f"attract_{l}" for l in _ll] +
         [f"toward_zero_{l}" for l in _ll] +
         [f"repel_{l}" for l in _ll] +
-        ["jepa_loss_avg", "contrastive_loss", "clean_corrupt_loss"] +
-        [f"vicreg_var_{l}" for l in _ll] + ["vicreg_var_avg"] +
-        [f"vicreg_cov_{l}" for l in _ll] + ["vicreg_cov_avg"] +
+        ["jepa_loss_avg", "manifold_margin", "clean_corrupt_loss"] +
         [col for l in _ll for col in (f"decoder_loss_a_{l}", f"decoder_loss_b_{l}", f"decoder_loss_c_{l}")] +
         ["decoder_loss_avg", "val_loss", "latent_std", "latent_mean", "lr", "tok_per_s", "elapsed_s"] +
         [f"attract_std_{l}" for l in _ll] +
         [f"repel_std_{l}" for l in _ll] +
-        ["contrastive_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"] +
+        ["manifold_std", "r1_penalty", "jacobian_penalty", "jacobian_cv"] +
         [f"pred_char_acc_{l}" for l in _ll] +
         [f"gen_char_acc_{l}" for l in _ll]
     )
@@ -376,7 +346,7 @@ def train():
             [f"jepa_{l}" for l in range(cfg.n_layers)] +
             [f"attract_{l}" for l in range(cfg.n_layers)] +
             [f"repel_{l}" for l in range(cfg.n_layers)] +
-            ["jepa_total", "contrastive", "r1", "jacobian", "latent_std", "latent_mean", "lr"] +
+            ["jepa_total", "manifold", "r1", "jacobian", "latent_std", "latent_mean", "lr"] +
             [f"decoder_a_{l}" for l in range(cfg.n_layers)] +
             [f"decoder_b_{l}" for l in range(cfg.n_layers)]
         )
@@ -389,10 +359,8 @@ def train():
     attract_layer_sums = [0.0] * cfg.n_layers
     toward_zero_layer_sums = [0.0] * cfg.n_layers
     repel_layer_sums = [0.0] * cfg.n_layers
-    jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
+    jepa_sum = manifold_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
     jac_count = 0
-    vicreg_var_layer_sums = [0.0] * cfg.n_layers
-    vicreg_cov_layer_sums = [0.0] * cfg.n_layers
     clean_corrupt_count = 0
     decoder_layer_sums_a = [0.0] * cfg.n_layers
     decoder_layer_sums_b = [0.0] * cfg.n_layers
@@ -404,15 +372,15 @@ def train():
     tokens_since_log = 0
     attract_window     = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
     repel_window       = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
-    contrastive_window = deque(maxlen=1000)
+    manifold_window = deque(maxlen=1000)
     jac_window         = deque(maxlen=50)
     if ckpt_path:
         for l, v in enumerate(ckpt.get("attract_window", [])):
             attract_window[l] = deque(v, maxlen=1000)
         for l, v in enumerate(ckpt.get("repel_window", [])):
             repel_window[l] = deque(v, maxlen=1000)
-        if "contrastive_window" in ckpt:
-            contrastive_window = deque(ckpt["contrastive_window"], maxlen=1000)
+        if "manifold_window" in ckpt:
+            manifold_window = deque(ckpt["manifold_window"], maxlen=1000)
         if "jac_window" in ckpt:
             jac_window = deque(ckpt["jac_window"], maxlen=50)
     t0 = t_last_log = time.time()
@@ -420,7 +388,7 @@ def train():
     generator.train()
     target_generator.train()
     layerwise_predictor.train()
-    contrastive_net.train()
+    manifold_est.train()
     layerwise_decoder.train()
 
     autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -434,15 +402,10 @@ def train():
         lr = get_lr(step, cfg) * adaptive_lr_scale
         for pg in gen_opt.param_groups:
             pg["lr"] = lr
-        for pg in contrastive_opt.param_groups:
-            pg["lr"] = cfg.contrastive_lr * adaptive_lr_scale
+        for pg in manifold_opt.param_groups:
+            pg["lr"] = cfg.manifold_est_lr * adaptive_lr_scale
         for pg in layerwise_pred_opt.param_groups:
             pg["lr"] = cfg.predictor_lr
-
-        # ── EMA: target ← generator ──────────────────────────────────────────
-        with torch.no_grad():
-            for p_gen, p_tgt in zip(generator.parameters(), target_generator.parameters()):
-                p_tgt.data.mul_(cfg.ema_decay).add_(p_gen.data, alpha=1.0 - cfg.ema_decay)
 
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
@@ -454,15 +417,7 @@ def train():
                 x_corr=prev_x_corr,
                 )
 
-            if cfg.use_ema:
-                print ("EMA NOT SUPPORTED ANYMORE")
-                with torch.no_grad():
-                    target_latents = [clean_latents[0].detach()] + [
-                        target_generator.blocks[l](clean_latents[l].detach())
-                        for l in range(cfg.n_layers)
-                    ]
-            else:
-                target_latents = clean_latents
+            target_latents = clean_latents
 
             preds = [layerwise_predictor.predictors[l](gen_hiddens[l]) for l in range(cfg.n_layers)]
 
@@ -470,8 +425,8 @@ def train():
             disc_layer_losses = []
             disc_margin_sum = 0.0
             for l in range(cfg.n_layers):
-                pos_scores = contrastive_net(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
-                neg_scores = contrastive_net(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
+                pos_scores = manifold_est(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
+                neg_scores = manifold_est(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
                 layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
                 disc_margin_sum += (pos_scores.mean() - neg_scores.mean()).item()
                 if cfg.gradient_residual_amplification:
@@ -486,7 +441,7 @@ def train():
             if cfg.r1_weight > 0.0:
                 for l in range(cfg.n_layers):
                     real_in = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
-                    real_score = contrastive_net.net(real_in).squeeze(-1)
+                    real_score = manifold_est.net(real_in).squeeze(-1)
                     grad = torch.autograd.grad(
                         outputs=real_score.sum(), inputs=real_in, create_graph=True,
                     )[0]
@@ -494,10 +449,10 @@ def train():
 
             disc_total = disc_base + r1_penalty * cfg.r1_weight
 
-        contrastive_opt.zero_grad()
+        manifold_opt.zero_grad()
         disc_total.backward()
-        torch.nn.utils.clip_grad_norm_(contrastive_net.parameters(), cfg.grad_clip)
-        contrastive_opt.step()
+        torch.nn.utils.clip_grad_norm_(manifold_est.parameters(), cfg.grad_clip)
+        manifold_opt.step()
 
         # ── Generator step: attract to target, repel from corrupt ──────────────
         with autocast():
@@ -508,38 +463,23 @@ def train():
             B, T = x.shape
             for l in range(cfg.n_layers):
 
-                disc_target  = contrastive_net(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
-                disc_corrupt = contrastive_net(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
-                #disc_pred  = contrastive_net(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
+                disc_target  = manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+                disc_corrupt = manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+                #disc_pred  = manifold_est(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
                 if cfg.gradient_residual_amplification:
                     attract = gra(attract, preds[l], cfg.gra_scale)
 
-                repel = (disc_corrupt - disc_target).mean()
+                manifold_stablization = (disc_corrupt - disc_target).mean()
 
-                layer_loss = attract + repel * cfg.jepa_repulsion_weight
+                layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
                 layer_losses.append(layer_loss)
                 attract_losses.append(attract.detach())
                 toward_zero_losses.append(attract)
-                repel_losses.append(repel.detach())
+                repel_losses.append(manifold_stablization.detach())
             jepa_loss = sum(layer_losses) / cfg.n_layers
 
-            if cfg.enable_vicreg:
-                vc_var_losses, vc_cov_losses = zip(*[vicreg_loss(gen_hiddens[l], cfg) for l in range(cfg.n_layers)])
-                var_weight = cfg.vicreg_var_warmup_weight if step < cfg.vicreg_var_warmup_steps else cfg.vicreg_var_weight
-                vc_loss = sum(
-                    var_weight * v + cfg.vicreg_cov_weight * c
-                    for v, c in zip(vc_var_losses, vc_cov_losses)
-                ) / cfg.n_layers
-                jepa_loss = jepa_loss + vc_loss
-
-            if cfg.enable_sigreg:
-                sig_loss = sum(
-                    sigreg_loss(gen_hiddens[l], cfg.sigreg_n_projections)
-                    for l in range(cfg.n_layers)
-                ) / cfg.n_layers
-                jepa_loss = jepa_loss + cfg.sigreg_weight * sig_loss
 
             jac_penalty = None
             if cfg.jacobian_weight > 0.0 and step % cfg.jacobian_interval == 0:
@@ -560,7 +500,7 @@ def train():
                 jac_penalty = grad[:-1].pow(2).sum(dim=-1).mean()
                 jepa_loss = jepa_loss + jac_penalty * cfg.jacobian_weight
 
-        for param in contrastive_net.parameters():
+        for param in manifold_est.parameters():
             param.requires_grad_(False)
         gen_opt.zero_grad()
         layerwise_pred_opt.zero_grad()
@@ -570,7 +510,7 @@ def train():
         )
         gen_opt.step()
         layerwise_pred_opt.step()
-        for param in contrastive_net.parameters():
+        for param in manifold_est.parameters():
             param.requires_grad_(True)
 
         # ── Layerwise decoder probes ──────────────────────────────────────────
@@ -640,15 +580,11 @@ def train():
             jac_sum += jac_penalty.item()
             jac_count += 1
             jac_window.append(jac_penalty.item())
-        if cfg.enable_contrastive:
-            contrastive_sum += disc_margin
-            contrastive_window.append(disc_margin)
+        if cfg.enable_manifold:
+            manifold_sum += disc_margin
+            manifold_window.append(disc_margin)
             r1_sum += r1_penalty.item()
             clean_corrupt_count += 1
-        if cfg.enable_vicreg:
-            for l in range(cfg.n_layers):
-                vicreg_var_layer_sums[l] += vc_var_losses[l].item()
-                vicreg_cov_layer_sums[l] += vc_cov_losses[l].item()
         with torch.no_grad():
             latent = target_latents[-1].detach().float()
             step_latent_std  = latent.std(dim=[0, 1]).mean().item()
@@ -665,8 +601,8 @@ def train():
             [f"{r.item():.6f}" for r in repel_losses] +
             [
                 f"{jepa_loss.item():.6f}",
-                f"{disc_base.item():.6f}" if cfg.enable_contrastive else "",
-                f"{r1_penalty.item():.6f}" if cfg.enable_contrastive else "",
+                f"{disc_base.item():.6f}" if cfg.enable_manifold else "",
+                f"{r1_penalty.item():.6f}" if cfg.enable_manifold else "",
                 f"{jac_penalty.item():.6f}" if jac_penalty is not None else "",
                 f"{step_latent_std:.6f}",
                 f"{step_latent_mean:.6f}",
@@ -684,14 +620,10 @@ def train():
             avg_toward_zero_layers  = [toward_zero_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_repel_layers        = [repel_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_jepa              = jepa_sum          / loss_count
-            avg_contrastive       = contrastive_sum   / loss_count
+            avg_manifold       = manifold_sum   / loss_count
             avg_r1                = r1_sum            / loss_count
             avg_jac               = jac_sum           / max(jac_count, 1)
             avg_clean_corrupt     = clean_corrupt_sum / max(clean_corrupt_count, 1)
-            avg_vicreg_var_layers = [vicreg_var_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
-            avg_vicreg_cov_layers = [vicreg_cov_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
-            avg_vicreg_var        = sum(avg_vicreg_var_layers) / cfg.n_layers
-            avg_vicreg_cov        = sum(avg_vicreg_cov_layers) / cfg.n_layers
             avg_latent_std        = latent_std_sum     / loss_count
             avg_latent_mean       = latent_mean_sum    / loss_count
             avg_dec_layers_a      = [decoder_layer_sums_a[l] / max(decoder_count, 1) for l in range(cfg.n_layers)]
@@ -700,7 +632,7 @@ def train():
             avg_dec               = decoder_sum / max(decoder_count, 1)
             attract_std     = [float(np.std(attract_window[l]) / (np.mean(attract_window[l]) + 1e-8))     if len(attract_window[l])     > 1 else 0.0 for l in range(cfg.n_layers)]
             repel_std       = [float(np.std(repel_window[l])   / (np.mean(repel_window[l])   + 1e-8))     if len(repel_window[l])       > 1 else 0.0 for l in range(cfg.n_layers)]
-            contrastive_std = float(np.std(contrastive_window)  / (np.mean(contrastive_window) + 1e-8)) if len(contrastive_window) > 1 else 0.0
+            manifold_std = float(np.std(manifold_window)  / (np.mean(manifold_window) + 1e-8)) if len(manifold_window) > 1 else 0.0
             jac_cv          = float(np.std(jac_window)          / (np.mean(jac_window)          + 1e-8)) if len(jac_window)          > 1 else 0.0
 
 
@@ -709,10 +641,8 @@ def train():
             attract_layer_sums = [0.0] * cfg.n_layers
             toward_zero_layer_sums = [0.0] * cfg.n_layers
             repel_layer_sums = [0.0] * cfg.n_layers
-            jepa_sum = contrastive_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
+            jepa_sum = manifold_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
             jac_count = 0
-            vicreg_var_layer_sums = [0.0] * cfg.n_layers
-            vicreg_cov_layer_sums = [0.0] * cfg.n_layers
             clean_corrupt_count = 0
             decoder_layer_sums_a = [0.0] * cfg.n_layers
             decoder_layer_sums_b = [0.0] * cfg.n_layers
@@ -760,8 +690,7 @@ def train():
             acc_str  = " | ".join(f"acc{l} pred={pred_char_acc[l]:.1f}% gen={gen_char_acc[l]:.1f}%" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
-                f"contra {avg_contrastive:.4f}(σ={contrastive_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
-                f"vc_var {avg_vicreg_var:.4f} | vc_cov {avg_vicreg_cov:.4f} | "
+                f"margin {avg_manifold:.4f}(σ={manifold_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
                 f"{dec_str} | {acc_str} | val {val_loss:.4f} | "
                 f"{std_str} | "
                 f"std {avg_latent_std:.4f} | mean {avg_latent_mean:.4f} | lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
@@ -772,17 +701,13 @@ def train():
                 [f"{avg_attract_layers[l]:.6e}" for l in range(cfg.n_layers)] +
                 [f"{avg_toward_zero_layers[l]:.6e}" for l in range(cfg.n_layers)] +
                 [f"{avg_repel_layers[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{avg_jepa:.6f}", f"{avg_contrastive:.6f}", f"{avg_clean_corrupt:.6f}"] +
-                [f"{avg_vicreg_var_layers[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{avg_vicreg_var:.6f}"] +
-                [f"{avg_vicreg_cov_layers[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{avg_vicreg_cov:.6f}"] +
+                [f"{avg_jepa:.6f}", f"{avg_manifold:.6f}", f"{avg_clean_corrupt:.6f}"] +
                 [val for l in range(cfg.n_layers) for val in (f"{avg_dec_layers_a[l]:.6f}", f"{avg_dec_layers_b[l]:.6f}", f"{avg_dec_layers_c[l]:.6f}")] +
                 [f"{avg_dec:.6f}", f"{val_loss:.6f}", f"{avg_latent_std:.6f}", f"{avg_latent_mean:.6f}",
                  f"{lr:.6e}", f"{tok_per_s:.0f}", f"{elapsed:.1f}"] +
                 [f"{attract_std[l]:.6f}" for l in range(cfg.n_layers)] +
                 [f"{repel_std[l]:.6f}" for l in range(cfg.n_layers)] +
-                [f"{contrastive_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"] +
+                [f"{manifold_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"] +
                 [f"{pred_char_acc[l]:.2f}" for l in range(cfg.n_layers)] +
                 [f"{gen_char_acc[l]:.2f}" for l in range(cfg.n_layers)]
             )
@@ -792,14 +717,14 @@ def train():
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
             save_checkpoint(
-                generator, target_generator, layerwise_predictor, contrastive_net,
+                generator, target_generator, layerwise_predictor, manifold_est,
                 layerwise_decoder,
-                gen_opt, layerwise_pred_opt, contrastive_opt, decoder_opt,
+                gen_opt, layerwise_pred_opt, manifold_opt, decoder_opt,
                 step, train_dataset.docs_consumed, cfg,
                 extra={
                     "attract_window":                   [list(w) for w in attract_window],
                     "repel_window":                     [list(w) for w in repel_window],
-                    "contrastive_window":               list(contrastive_window),
+                    "manifold_window":               list(manifold_window),
                     "jac_window":                       list(jac_window),
                     "adaptive_lr_scale":                adaptive_lr_scale,
                     "plateau_last_decrease_step":       plateau_last_decrease_step,

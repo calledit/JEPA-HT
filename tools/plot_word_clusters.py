@@ -10,7 +10,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from config import Config
-from model import Generator, EquivalenceCertaintyEstimator
+from model import Generator, ManifoldEstimator
 from train import find_latest_checkpoint
 
 
@@ -22,7 +22,7 @@ def embed_word(word: str, encoder, ws: int, device) -> np.ndarray:
 
 
 def pairwise_sim(embs: np.ndarray, contrastive_net, device) -> np.ndarray:
-    """Compute NxN similarity matrix using EquivalenceCertaintyEstimator."""
+    """Compute NxN similarity matrix using ManifoldEstimator."""
     h = torch.tensor(embs, dtype=torch.float32, device=device)
     N = h.shape[0]
     i_idx = torch.arange(N, device=device).repeat_interleave(N)
@@ -170,7 +170,7 @@ def main():
     parser.add_argument("--meaning", action="store_true",
                         help="Embed each word as 'The word <word> means' to capture semantics over spelling")
     parser.add_argument("--contrastive", action="store_true",
-                        help="Use EquivalenceCertaintyEstimator pairwise similarity + MDS instead of PCA")
+                        help="Use ManifoldEstimator pairwise similarity + MDS instead of PCA")
     parser.add_argument("--layer", type=int, default=-1,
                         help="Which block's latents to visualise (0-indexed). -1 = final output with norm (default).")
     args = parser.parse_args()
@@ -208,10 +208,10 @@ def main():
             print("Warning: no contrastive_net in checkpoint — falling back to PCA")
             args.contrastive = False
         else:
-            contrastive_net = EquivalenceCertaintyEstimator(cfg).to(device)
+            contrastive_net = ManifoldEstimator(cfg).to(device)
             contrastive_net.load_state_dict(ckpt["contrastive_net"])
             contrastive_net.eval()
-            print("EquivalenceCertaintyEstimator loaded — using MDS projection")
+            print("ManifoldEstimator loaded — using MDS projection")
 
     words = []  # list of (label, embedding, category)
 

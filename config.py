@@ -13,11 +13,7 @@ class Config:
     n_layers: int = 1
     ffn_dim: int = 192           # 4 × d_model
     predictor_dim: int = 96     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
-    dropout: float = 0.0
 
-    # EMA
-    ema_decay: float = 0.996
-    use_ema: bool = False  # if True, target = EMA_block(clean_latent); if False, target = clean_latent directly
 
     # Number of positions per sample (per block) replaced with real embeddings instead of null
     n_clean_tokens: int = 2
@@ -26,7 +22,7 @@ class Config:
     decoder_train_interval: int = 13
 
     # Contrastive / Equivalence Estimator
-    enable_contrastive: bool = True
+    enable_manifold: bool = True
     # Minimum attract scale: prevents the attract loss from hitting exactly 0
     # when the discriminator is fully certain about both target and pred.
     disc_eps: float = 0.1
@@ -36,7 +32,7 @@ class Config:
     recon_loss_weight: float = 0.0
 
     # JEPA triplet loss
-    jepa_repulsion_weight: float = 1.0
+    manifold_stablization_weight: float = 1.0
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
     r1_weight: float = 0.05
@@ -49,22 +45,11 @@ class Config:
     gradient_residual_amplification: bool = True
     gra_scale: float = 1.0
 
-    # SIGReg: Epps-Pulley normality test on random projections (per-sample, no batch stats)
-    enable_sigreg: bool = False
-    sigreg_weight: float = 15.0
-    sigreg_n_projections: int = 64
-
-    # VICReg regularization on target hidden states
-    enable_vicreg: bool = False
-    vicreg_var_weight: float = 0.0
-    vicreg_var_warmup_weight: float = 10.0   # var weight used before warmup step
-    vicreg_var_warmup_steps: int = 15_000    # step at which var weight drops to vicreg_var_weight
-    vicreg_cov_weight: float = 1.0
 
     # Training
     batch_size: int = 64
     decoder_lr: float = 3e-4
-    contrastive_lr: float = 1.4e-4
+    manifold_est_lr: float = 1.4e-4
     lr: float = 0.9e-4 #1e-4 lead to initial loss explotion mabye that could have been solved with more warmup
     predictor_lr: float = 1e-4
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"

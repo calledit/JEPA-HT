@@ -82,8 +82,6 @@ def main():
     decoder_a_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_a_")], args.layer)
     decoder_b_cols     = layer_filter([c for c in df.columns if c.startswith("decoder_loss_b_")], args.layer)
     decoder_layer_cols = decoder_a_cols if decoder_a_cols else layer_filter([c for c in df.columns if c.startswith("decoder_loss_") and c != "decoder_loss_avg"], args.layer)
-    vicreg_var_cols    = layer_filter([c for c in df.columns if c.startswith("vicreg_var_")   and c != "vicreg_var_avg"], args.layer)
-    vicreg_cov_cols    = layer_filter([c for c in df.columns if c.startswith("vicreg_cov_")   and c != "vicreg_cov_avg"], args.layer)
     n_layers = max(len(jepa_layer_cols), len(attract_cols), len(repel_cols),
                    len(decoder_a_cols) or len(decoder_layer_cols), 1)
 
@@ -124,8 +122,8 @@ def main():
         plot_line(ax, df["step"], df[col], f"at_σ{i}", layer_colors[i], args.smooth, "-")
     for i, col in enumerate(repel_std_cols):
         plot_line(ax, df["step"], df[col], f"rp_σ{i}", layer_colors[i], args.smooth, "--")
-    if "contrastive_std" in df.columns:
-        plot_line(ax, df["step"], df["contrastive_std"], "contra_σ", "darkorchid", args.smooth)
+    if "manifold_std" in df.columns:
+        plot_line(ax, df["step"], df["manifold_std"], "manifold_σ", "darkorchid", args.smooth)
     if "r1_penalty" in df.columns:
         plot_line(ax, df["step"], df["r1_penalty"], "r1", "tomato", args.smooth)
     ax.set_title("Loss variance (1k window) + R1")
@@ -135,14 +133,12 @@ def main():
 
     # Row 1: diagnostics
     ax = axes[1, 0]
-    if "contrastive_loss" in df.columns:
-        plot_line(ax, df["step"], df["contrastive_loss"], "contrastive", "darkorchid", args.smooth)
+    if "manifold_margin" in df.columns:
+        plot_line(ax, df["step"], df["manifold_margin"], "manifold margin", "darkorchid", args.smooth)
     if "clean_corrupt_loss" in df.columns:
         plot_line(ax, df["step"], df["clean_corrupt_loss"], "cc loss", "crimson", args.smooth)
-    if "vicreg_loss" in df.columns:
-        plot_line(ax, df["step"], df["vicreg_loss"], "vicreg", "darkorange", args.smooth)
-    ax.set_title("Contrastive / CC / VICReg loss")
-    ax.set_ylabel("loss")
+    ax.set_title("Manifold margin / CC loss")
+    ax.set_ylabel("margin")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -170,7 +166,7 @@ def main():
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Row 2: decoder + vicreg per-layer + val
+    # Row 2: decoder + val + latent diagnostics
     ax = axes[2, 0]
     if decoder_a_cols:
         for i, (ca, cb) in enumerate(zip(decoder_a_cols, decoder_b_cols)):
@@ -185,18 +181,18 @@ def main():
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 1]
-    for i, col in enumerate(vicreg_var_cols):
-        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
-    ax.set_title("Per-layer VICReg variance")
-    ax.set_ylabel("variance")
+    if "val_loss" in df.columns:
+        plot_line(ax, df["step"], df["val_loss"], "val loss", "steelblue", args.smooth)
+    ax.set_title("Validation loss")
+    ax.set_ylabel("loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 2]
-    for i, col in enumerate(vicreg_cov_cols):
-        plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
-    ax.set_title("Per-layer VICReg covariance")
-    ax.set_ylabel("covariance")
+    if "latent_mean" in df.columns:
+        plot_line(ax, df["step"], df["latent_mean"], "latent mean", "seagreen", args.smooth)
+    ax.set_title("Latent mean")
+    ax.set_ylabel("mean")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -243,7 +239,7 @@ def main():
 
     # Row 3, panel 0: loss direction lanes
     ax = axes[3, 0]
-    plot_deriv(ax, "contrastive_loss", "contrastive", "darkorchid", 0.70, 1.00)
+    plot_deriv(ax, "manifold_margin", "manifold", "darkorchid", 0.70, 1.00)
     for i, col in enumerate(attract_cols):
         plot_deriv(ax, col, f"attract {i}", layer_colors[i], 0.30, 0.60, "-")
     for i, col in enumerate(repel_cols):
@@ -251,7 +247,7 @@ def main():
     for y in (0.625, 0.275):
         ax.axhline(y, color="gray", linewidth=0.6, linestyle=":")
     ax.set_yticks([0.85, 0.45, 0.125])
-    ax.set_yticklabels(["contrastive", "attract", "repel"])
+    ax.set_yticklabels(["manifold", "attract", "repel"])
     ax.set_title("Loss direction (block = going up)")
     ax.set_ylabel("")
     ax.set_ylim(-0.05, 1.05)
@@ -299,7 +295,7 @@ def main():
         return np.array(xs), np.array(crossings)
 
     ax = axes[3, 2]
-    xs_c, cross_c = plot_crossing(ax, "contrastive_loss", "contrastive", "darkorchid")
+    xs_c, cross_c = plot_crossing(ax, "manifold_margin", "manifold", "darkorchid")
     if xs_c is not None:
         mask = cross_c < xs_c - 50_000
         if mask.any():
