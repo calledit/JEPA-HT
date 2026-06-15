@@ -325,6 +325,10 @@ class Generator(nn.Module):
                     xc = xc + (xc >= x).long()
                     xc_list.append(xc)
                 x_corr = torch.cat(xc_list, dim=0)  # [B*K, T]
+        elif corrupt_fn is not None:
+            # x_corr was provided by the prev module; still run the decoder forward for its
+            # training side-effect but keep the consistent x_corr from upstream
+            corrupt_fn(clean_latents, gen_hiddens)
         prev_c = prev_latent_corrupt if prev_latent_corrupt is not None else prev_latent_clean
         if prev_c is not None and x_corr_was_none:
             # prev_c is [B, T, D]; x_corr was freshly expanded to [B*K, T] so repeat to match

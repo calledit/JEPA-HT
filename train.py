@@ -157,7 +157,7 @@ def clean_corrupt_loss(manifold_est, h_clean, h_corrupt, n_samples):
 
 
 @torch.no_grad()
-def get_prev_latents(x: torch.Tensor, prev_generators: list):
+def get_prev_latents(x: torch.Tensor, prev_generators: list, corrupt_fn=None):
     """Run all frozen previous modules with their full three-stream forward pass, chaining
     clean/gen/corrupt outputs as inputs to the next module so corruption is consistent up the chain.
     Returns (prev_clean, prev_gen, prev_corrupt, x_corr), all None if no prev modules."""
@@ -172,6 +172,7 @@ def get_prev_latents(x: torch.Tensor, prev_generators: list):
             prev_latent_corrupt=prev_corrupt,
             x_corr=x_corr,
             clean_token_leak=False,
+            corrupt_fn=corrupt_fn,
         )
         prev_clean   = clean_latents[-1]
         prev_gen     = gen_hiddens[-1]
@@ -397,7 +398,15 @@ def train():
         batch = next_batch().to(device)
         x = batch[:, :-1]
 
-        prev_clean, prev_gen, prev_corrupt, prev_x_corr = get_prev_latents(x, prev_generators)
+        def decoder_sample_fn(clean_latents, gen_hiddens):
+            logits = layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach().float())
+            logits.scatter_(-1, x.unsqueeze(-1), float('-inf'))
+            probs = torch.softmax(logits, dim=-1)
+            B, T = x.shape
+            samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
+            return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
+
+        prev_clean, prev_gen, prev_corrupt, prev_x_corr = get_prev_latents(x, prev_generators, corrupt_fn=decoder_sample_fn)
 
         lr = get_lr(step, cfg) * adaptive_lr_scale
         for pg in gen_opt.param_groups:
@@ -432,15 +441,12 @@ def train():
                 dec_loss = sum((a + b + c) / 3 for a, b, c in dec_losses) / cfg.n_layers
             _dec_loss_ref[0] = dec_loss
             _dec_losses_ref[0] = dec_losses
-            with torch.no_grad():
-                logits = layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach().float())
-                logits.scatter_(-1, x.unsqueeze(-1), float('-inf'))
-                probs = torch.softmax(logits, dim=-1)
-                B, T = x.shape
-                samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
-                return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
+            return decoder_sample_fn(clean_latents, gen_hiddens)
 
-        corrupt_fn = decoder_corrupt_fn if step % cfg.decoder_train_interval == 0 else None
+        if step % cfg.decoder_train_interval == 0:
+            corrupt_fn = decoder_corrupt_fn
+        else:
+            corrupt_fn = decoder_sample_fn
 
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
