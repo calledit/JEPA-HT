@@ -24,7 +24,6 @@ class Config:
     corrupt_samples: int = 2
 
     # Contrastive / Equivalence Estimator
-    enable_manifold: bool = True
     # Minimum attract scale: prevents the attract loss from hitting exactly 0
     # when the discriminator is fully certain about both target and pred.
     disc_eps: float = 0.1
@@ -37,8 +36,8 @@ class Config:
     manifold_stablization_weight: float = 0.1
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
-    r1_weight: float = 0.1
-    r1_interval: int = 10
+    r1_weight: float = 0.10
+    r1_interval: int = 5
     # Jacobian regularization on the generator's clean stream: penalises ||J||^2 where J is the
     # gradient of clean latents w.r.t. input embeddings. Encourages a smooth/continuous latent
     # space so small input changes don't cause large representation jumps (stabilises self-chasing).

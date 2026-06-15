@@ -1,5 +1,4 @@
 import argparse
-import copy
 import csv
 import glob
 import math
@@ -30,7 +29,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_key)
 
 
-def save_checkpoint(generator, target_generator, layerwise_predictor, manifold_est,
+def save_checkpoint(generator, layerwise_predictor, manifold_est,
                     layerwise_decoder,
                     gen_opt, layerwise_pred_opt, manifold_opt, decoder_opt,
                     step, docs_consumed, cfg, extra=None):
@@ -38,7 +37,6 @@ def save_checkpoint(generator, target_generator, layerwise_predictor, manifold_e
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_s{step:07d}.pt")
     payload = {
         "generator": generator.state_dict(),
-        "target_generator": target_generator.state_dict(),
         "layerwise_predictor": layerwise_predictor.state_dict(),
         "manifold_est": manifold_est.state_dict(),
         "layerwise_decoder": layerwise_decoder.state_dict(),
@@ -128,34 +126,6 @@ def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: flo
 
 
 
-def clean_corrupt_loss(manifold_est, h_clean, h_corrupt):
-    """Contrastive loss between clean and 100%-corrupted latents.
-    Every (clean_i, corrupt_i) pair is a negative — score should be below -1.
-    """
-    B, T, D = h_clean.shape
-    hc = h_clean.reshape(B * T, D)
-    hn = h_corrupt.reshape(B * T, D)
-    return F.relu(1 + manifold_est(hc, hn)).mean()
-
-
-def clean_corrupt_loss(manifold_est, h_clean, h_corrupt, n_samples):
-    """Next-token contrastive loss.
-    Anchor: clean[t]. Positive: clean[t+1]. Negative: corrupt[t+1].
-    """
-    B, T, D = h_clean.shape
-    idx = torch.randint(T - 1, (B, n_samples), device=h_clean.device)
-    idx_next = idx + 1
-    expand = lambda i: i.unsqueeze(-1).expand(-1, -1, D)
-    h_anchor = h_clean.gather(1, expand(idx)).reshape(B * n_samples, D)
-    h_pos    = h_clean.gather(1, expand(idx_next)).reshape(B * n_samples, D)
-    h_neg    = h_corrupt.gather(1, expand(idx_next)).reshape(B * n_samples, D)
-    pos_scores = manifold_est(h_anchor, h_pos)
-    neg_scores = manifold_est(h_anchor, h_neg)
-    return (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
-
-
-
-
 @torch.no_grad()
 def get_prev_latents(x: torch.Tensor, prev_generators: list, corrupt_fn=None):
     """Run all frozen previous modules with their full three-stream forward pass, chaining
@@ -192,7 +162,6 @@ def train():
     print(f"Device: {device}  |  Training module {layer_idx}")
 
     generator = Generator(cfg, layer_idx=layer_idx).to(device)
-    target_generator = copy.deepcopy(generator)
     layerwise_predictor = LayerwisePredictor(cfg).to(device)
     manifold_est = ManifoldEstimator(cfg).to(device)
     layerwise_decoder = LayerwiseDecoder(cfg).to(device)
@@ -239,7 +208,6 @@ def train():
         print(f"Resuming from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         generator.load_state_dict(ckpt["generator"], strict=False)
-        target_generator.load_state_dict(ckpt["target_generator"], strict=False)
         skip_opts = set()
         try:
             layerwise_predictor.load_state_dict(ckpt["layerwise_predictor"])
@@ -362,6 +330,7 @@ def train():
     repel_layer_sums = [0.0] * cfg.n_layers
     jepa_sum = manifold_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
     jac_count = 0
+    r1_count = 0
     clean_corrupt_count = 0
     decoder_layer_sums_a = [0.0] * cfg.n_layers
     decoder_layer_sums_b = [0.0] * cfg.n_layers
@@ -387,7 +356,6 @@ def train():
     t0 = t_last_log = time.time()
 
     generator.train()
-    target_generator.train()
     layerwise_predictor.train()
     manifold_est.train()
     layerwise_decoder.train()
@@ -421,7 +389,7 @@ def train():
         _dec_loss_ref = [None]
         _dec_losses_ref = [None]
 
-        def decoder_corrupt_fn(clean_latents, gen_hiddens):
+        def _decoder_train(clean_latents, gen_hiddens):
             targets = x.reshape(-1)
             with autocast():
                 dec_losses = [
@@ -434,19 +402,24 @@ def train():
                             layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
                             targets,
                         ),
-                        torch.tensor(0.0),
                     )
                     for l in range(cfg.n_layers)
                 ]
-                dec_loss = sum((a + b + c) / 3 for a, b, c in dec_losses) / cfg.n_layers
+                dec_loss = sum((a + b) / 2 for a, b in dec_losses) / cfg.n_layers
             _dec_loss_ref[0] = dec_loss
             _dec_losses_ref[0] = dec_losses
+
+        def decoder_corrupt_fn(clean_latents, gen_hiddens):
+            _decoder_train(clean_latents, gen_hiddens)
             return decoder_sample_fn(clean_latents, gen_hiddens)
 
+        def decoder_train_fn(clean_latents, gen_hiddens):
+            _decoder_train(clean_latents, gen_hiddens)
+
         if step % cfg.decoder_train_interval == 0:
-            corrupt_fn = decoder_corrupt_fn
+            corrupt_fn = decoder_corrupt_fn if layer_idx == 0 else decoder_train_fn
         else:
-            corrupt_fn = decoder_sample_fn
+            corrupt_fn = decoder_sample_fn if layer_idx == 0 else None
 
         # ── Layerwise JEPA ───────────────────────────────────────────────────
         with autocast():
@@ -471,11 +444,11 @@ def train():
             dec_loss.backward()
             torch.nn.utils.clip_grad_norm_(layerwise_decoder.parameters(), cfg.grad_clip)
             decoder_opt.step()
-            step_dec_losses = [(da.item(), db.item(), dc.item()) for da, db, dc in dec_losses]
-            for l, (da, db, dc) in enumerate(dec_losses):
+            # c term removed from the decoder loss; kept as 0.0 in the logs for CSV compatibility
+            step_dec_losses = [(da.item(), db.item(), 0.0) for da, db in dec_losses]
+            for l, (da, db) in enumerate(dec_losses):
                 decoder_layer_sums_a[l] += da.item()
                 decoder_layer_sums_b[l] += db.item()
-                decoder_layer_sums_c[l] += dc.item()
             decoder_sum += dec_loss.item()
             decoder_count += 1
 
@@ -517,7 +490,8 @@ def train():
 
             # R1 gradient penalty on real (target) inputs only — computed every 5 steps
             r1_penalty = disc_base.new_zeros(1).squeeze()
-            if cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0:
+            r1_computed = cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0
+            if r1_computed:
                 for l in range(cfg.n_layers):
                     real_in = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
                     real_score = manifold_est.net(real_in).squeeze(-1)
@@ -608,11 +582,12 @@ def train():
             jac_sum += jac_penalty.item()
             jac_count += 1
             jac_window.append(jac_penalty.item())
-        if cfg.enable_manifold:
-            manifold_sum += disc_margin
-            manifold_window.append(disc_margin)
+        manifold_sum += disc_margin
+        manifold_window.append(disc_margin)
+        clean_corrupt_count += 1
+        if r1_computed:
             r1_sum += r1_penalty.item()
-            clean_corrupt_count += 1
+            r1_count += 1
         with torch.no_grad():
             latent = target_latents[-1].detach().float()
             step_latent_std  = latent.std(dim=[0, 1]).mean().item()
@@ -629,8 +604,8 @@ def train():
             [f"{r.item():.6f}" for r in repel_losses] +
             [
                 f"{jepa_loss.item():.6f}",
-                f"{disc_base.item():.6f}" if cfg.enable_manifold else "",
-                f"{r1_penalty.item():.6f}" if cfg.enable_manifold else "",
+                f"{disc_base.item():.6f}",
+                f"{r1_penalty.item():.6f}",
                 f"{jac_penalty.item():.6f}" if jac_penalty is not None else "",
                 f"{step_latent_std:.6f}",
                 f"{step_latent_mean:.6f}",
@@ -649,7 +624,7 @@ def train():
             avg_repel_layers        = [repel_layer_sums[l] / loss_count for l in range(cfg.n_layers)]
             avg_jepa              = jepa_sum          / loss_count
             avg_manifold       = manifold_sum   / loss_count
-            avg_r1                = r1_sum            / loss_count
+            avg_r1                = r1_sum            / max(r1_count, 1)
             avg_jac               = jac_sum           / max(jac_count, 1)
             avg_clean_corrupt     = clean_corrupt_sum / max(clean_corrupt_count, 1)
             avg_latent_std        = latent_std_sum     / loss_count
@@ -671,6 +646,7 @@ def train():
             repel_layer_sums = [0.0] * cfg.n_layers
             jepa_sum = manifold_sum = clean_corrupt_sum = latent_std_sum = latent_mean_sum = r1_sum = jac_sum = 0.0
             jac_count = 0
+            r1_count = 0
             clean_corrupt_count = 0
             decoder_layer_sums_a = [0.0] * cfg.n_layers
             decoder_layer_sums_b = [0.0] * cfg.n_layers
@@ -714,11 +690,11 @@ def train():
                 f"at_σ{l}={attract_std[l]:.4f} rp_σ{l}={repel_std[l]:.4f}"
                 for l in range(cfg.n_layers)
             )
-            dec_str  = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f},{avg_dec_layers_c[l]:.4f}" for l in range(cfg.n_layers))
+            dec_str  = " | ".join(f"d{l} {avg_dec_layers_a[l]:.4f},{avg_dec_layers_b[l]:.4f}" for l in range(cfg.n_layers))
             acc_str  = " | ".join(f"acc{l} pred={pred_char_acc[l]:.1f}% gen={gen_char_acc[l]:.1f}%" for l in range(cfg.n_layers))
             print(
                 f"  step {step:7d} | {layer_str} | "
-                f"margin {avg_manifold:.4f}(σ={manifold_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | cc {avg_clean_corrupt:.4f} | "
+                f"margin {avg_manifold:.4f}(σ={manifold_std:.4f}) r1={avg_r1:.4f} jac={avg_jac:.4f}(cv={jac_cv:.4f}) | "
                 f"{dec_str} | {acc_str} | val {val_loss:.4f} | "
                 f"{std_str} | "
                 f"std {avg_latent_std:.4f} | mean {avg_latent_mean:.4f} | lr {lr:.2e} | {int(tok_per_s / 1000)}k t/s | t {elapsed:.0f}s"
@@ -745,7 +721,7 @@ def train():
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
             save_checkpoint(
-                generator, target_generator, layerwise_predictor, manifold_est,
+                generator, layerwise_predictor, manifold_est,
                 layerwise_decoder,
                 gen_opt, layerwise_pred_opt, manifold_opt, decoder_opt,
                 step, train_dataset.docs_consumed, cfg,
