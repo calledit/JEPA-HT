@@ -21,7 +21,7 @@ class Config:
     # How often to train the layerwise decoder probes
     decoder_train_interval: int = 13
 
-    corrupt_samples: int = 3
+    corrupt_samples: int = 2
 
     # Contrastive / Equivalence Estimator
     enable_manifold: bool = True
@@ -34,18 +34,24 @@ class Config:
     recon_loss_weight: float = 0.0
 
     # JEPA triplet loss
-    manifold_stablization_weight: float = 1.0
+    manifold_stablization_weight: float = 0.1
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
-    r1_weight: float = 0.05
+    r1_weight: float = 0.1
+    r1_interval: int = 10
     # Jacobian regularization on the generator's clean stream: penalises ||J||^2 where J is the
     # gradient of clean latents w.r.t. input embeddings. Encourages a smooth/continuous latent
     # space so small input changes don't cause large representation jumps (stabilises self-chasing).
-    # Estimated cheaply via a single random projection. Applied every jacobian_interval steps.
-    jacobian_weight: float = 0.05
-    jacobian_interval: int = 134
+    # Should not be enabled on layer 0 since it takes uantized text as input and the jacobian makes
+    # sure that small changes in input leads to small changes in output. That said it does stabilize training.
+    # But i imagine one could use the jacobian loss to stop the network from falling in to som earliy bad local minima
+    # basicly have it on for the first 80 000 steps to make sure that initial training finds a good overarching fit.
+    enable_jacobian_loss: bool = True
+    jacobian_weight: float = 0.20
+    jacobian_interval: int = 1
     gradient_residual_amplification: bool = True
     gra_scale: float = 1.0
+    gra_warmup_steps: int = 20_000
 
 
     # Training
@@ -57,7 +63,7 @@ class Config:
     lr_schedule: str = "exponential"  # "cosine", "exponential", "linear"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 40_000
-    lr_min: float = 0.9e-4 # 0.9e-4
+    lr_min: float = 0.9e-4/2 # 0.9e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
 

@@ -434,9 +434,8 @@ def train():
             _dec_losses_ref[0] = dec_losses
             with torch.no_grad():
                 logits = layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach().float())
+                logits.scatter_(-1, x.unsqueeze(-1), float('-inf'))
                 probs = torch.softmax(logits, dim=-1)
-                probs.scatter_(-1, x.unsqueeze(-1), 0.0)
-                probs = probs / probs.sum(dim=-1, keepdim=True)
                 B, T = x.shape
                 samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
                 return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
@@ -499,16 +498,20 @@ def train():
                 neg_scores = manifold_est(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
                 layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
                 disc_margin_sum += (pos_scores.mean() - neg_scores.mean()).item()
-                if cfg.gradient_residual_amplification:
-                    layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
-                    layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
+
+                # We use GRA to speed up how fast the manifold estimator learns.
+                # This introduces more instablity in to thre training.
+                # But that istablity is worth it since the manifold estimator is tracking a moving target.
+                # and therefor has to move fast. (perferably faster than the generator)
+                layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
+                layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
                 disc_layer_losses.append(layer_disc)
             disc_base = sum(disc_layer_losses) / cfg.n_layers
             disc_margin = disc_margin_sum / cfg.n_layers
 
-            # R1 gradient penalty on real (target) inputs only
+            # R1 gradient penalty on real (target) inputs only — computed every 5 steps
             r1_penalty = disc_base.new_zeros(1).squeeze()
-            if cfg.r1_weight > 0.0:
+            if cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0:
                 for l in range(cfg.n_layers):
                     real_in = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
                     real_score = manifold_est.net(real_in).squeeze(-1)
@@ -539,8 +542,10 @@ def train():
                 #disc_pred  = manifold_est(preds[l].reshape(-1, cfg.d_model)).reshape(B, T)
 
                 attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
-                if cfg.gradient_residual_amplification:
+                if cfg.gradient_residual_amplification and step < 150_000:#GRA initially when the model is moving fast
                     attract = gra(attract, preds[l], cfg.gra_scale)
+                #preds_sg = layerwise_predictor.predictors[l](gen_hiddens[l].detach())
+                #attract = attract + gra(F.mse_loss(preds_sg, target_latents[l + 1].detach()), preds_sg, cfg.gra_scale)
 
                 manifold_stablization = (disc_corrupt - disc_target).mean()
 
@@ -553,22 +558,21 @@ def train():
 
 
             jac_penalty = None
-            if cfg.jacobian_weight > 0.0 and step % cfg.jacobian_interval == 0:
+            if cfg.enable_jacobian_loss and cfg.jacobian_weight > 0.0 and step < cfg.gra_warmup_steps and step % cfg.jacobian_interval == 0:
                 pos = torch.arange(x.shape[1], device=device)
-                if layer_idx == 0:
-                    emb = (generator.tok_emb(x) + generator.pos_emb(pos)).requires_grad_(True)
-                else:
-                    char = generator.char_emb(x)
-                    emb = torch.cat([prev_clean.detach(), char + generator.pos_emb(pos)], dim=-1).requires_grad_(True)
-                h = emb
-                for block in generator.blocks:
-                    h = block(h)
-                # Use the difference between pairs of real samples as the projection direction —
-                # measures sensitivity in directions that actually occur in the data.
-                v = (h[1:] - h[:-1]).detach()
-                v = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
-                grad = torch.autograd.grad((h[:-1] * v).sum(), emb, create_graph=True)[0]
-                jac_penalty = grad[:-1].pow(2).sum(dim=-1).mean()
+                with torch.autocast(device_type=device.type, enabled=False):
+                    if layer_idx == 0:
+                        emb = (generator.tok_emb(x) + generator.pos_emb(pos)).float().requires_grad_(True)
+                    else:
+                        char = generator.char_emb(x)
+                        emb = torch.cat([prev_clean.detach(), char + generator.pos_emb(pos)], dim=-1).float().requires_grad_(True)
+                    h = emb
+                    for block in generator.blocks:
+                        h = block(h.to(next(block.parameters()).dtype)).float()
+                    v = (h[1:] - h[:-1]).detach()
+                    v = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+                    grad = torch.autograd.grad((h[:-1] * v).sum(), emb, create_graph=True)[0]
+                    jac_penalty = grad[:-1].pow(2).sum(dim=-1).mean()
                 jepa_loss = jepa_loss + jac_penalty * cfg.jacobian_weight
 
         for param in manifold_est.parameters():

@@ -124,9 +124,7 @@ def main():
         plot_line(ax, df["step"], df[col], f"rp_σ{i}", layer_colors[i], args.smooth, "--")
     if "manifold_std" in df.columns:
         plot_line(ax, df["step"], df["manifold_std"], "manifold_σ", "darkorchid", args.smooth)
-    if "r1_penalty" in df.columns:
-        plot_line(ax, df["step"], df["r1_penalty"], "r1", "tomato", args.smooth)
-    ax.set_title("Loss variance (1k window) + R1")
+    ax.set_title("Loss variance (1k window)")
     ax.set_ylabel("std / penalty")
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -311,8 +309,13 @@ def main():
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    for ax in axes[3, 3:]:
-        ax.set_visible(False)
+    ax = axes[3, 3]
+    if "r1_penalty" in df.columns:
+        plot_line(ax, df["step"], df["r1_penalty"], "r1", "tomato", args.smooth)
+    ax.set_title("R1 penalty")
+    ax.set_ylabel("penalty")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
     for ax in axes.flat:
         ax.set_xlabel("step")
