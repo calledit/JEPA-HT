@@ -314,6 +314,7 @@ class Generator(nn.Module):
 
         # ── Corrupt stream ────────────────────────────────────────────────────
         K = self.cfg.corrupt_samples
+        x_corr_was_none = x_corr is None
         if x_corr is None:
             if corrupt_fn is not None:
                 x_corr = corrupt_fn(clean_latents, gen_hiddens)  # [B*K, T]
@@ -325,8 +326,10 @@ class Generator(nn.Module):
                     xc_list.append(xc)
                 x_corr = torch.cat(xc_list, dim=0)  # [B*K, T]
         prev_c = prev_latent_corrupt if prev_latent_corrupt is not None else prev_latent_clean
-        if prev_c is not None:
+        if prev_c is not None and x_corr_was_none:
+            # prev_c is [B, T, D]; x_corr was freshly expanded to [B*K, T] so repeat to match
             prev_c = prev_c.repeat(K, 1, 1)  # [B*K, T, D]
+        # if x_corr was passed in, it's already [B*K, T] and prev_c is already [B*K, T, D]
         hc = self._build_input(x_corr, prev_c)
         corrupt_latents = [hc]
         for i, block in enumerate(self.blocks):
