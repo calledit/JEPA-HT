@@ -64,26 +64,51 @@ def label_for(b: int) -> str:
 
 
 def _emb_weight(model):
-    return model.tok_emb.weight if model.layer_idx == 0 else model.char_emb.weight
+    if model.layer_idx != 0:
+        raise ValueError(
+            "module 1+ has no per-byte char embedding to plot — it uses a single learned "
+            "'not a prediction' vector (model.real_emb)."
+        )
+    return model.tok_emb.weight
 
 
-def load_embeddings(ckpt_path, device):
+def _generator_state(ckpt, layer=None):
+    """Return (generator_state_dict, layer_idx) for the requested module.
+
+    Supports the combined multi-module checkpoint ({'modules': [per-module state, ...]}) and the
+    old flat single-module format ({'generator': ..., 'layer_idx': ...}). When `layer` is None the
+    highest module is used (matching the --layer default).
+    """
+    if "modules" in ckpt:
+        mods = ckpt["modules"]
+        if layer is None:
+            ms = mods[-1]
+        else:
+            ms = next((m for m in mods if m.get("module_idx") == layer), None)
+            if ms is None:
+                present = [m.get("module_idx") for m in mods]
+                raise SystemExit(f"Module {layer} not in checkpoint (present: {present})")
+        return ms["generator"], ms.get("module_idx", 0)
+    return ckpt["generator"], ckpt.get("layer_idx", 0)
+
+
+def load_embeddings(ckpt_path, device, layer=None):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    layer_idx = ckpt.get("layer_idx", 0)
+    gen_state, layer_idx = _generator_state(ckpt, layer)
     model = Generator(ckpt["cfg"], layer_idx=layer_idx).to(device)
-    model.load_state_dict(ckpt["generator"], strict=False)
+    model.load_state_dict(gen_state, strict=False)
     model.eval()
     return _emb_weight(model).detach().cpu().float().numpy()
 
 
 def _load_emb(args):
     """Thread worker: load one checkpoint and return raw embedding slice."""
-    ckpt_path, byte_ids = args
+    ckpt_path, byte_ids, layer = args
     step = int(re.search(r"s(\d+)", ckpt_path).group(1))
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    layer_idx = ckpt.get("layer_idx", 0)
+    gen_state, layer_idx = _generator_state(ckpt, layer)
     model = Generator(ckpt["cfg"], layer_idx=layer_idx)
-    model.load_state_dict(ckpt["generator"], strict=False)
+    model.load_state_dict(gen_state, strict=False)
     model.eval()
     emb = _emb_weight(model).detach().float().numpy()[byte_ids]
     return step, emb
@@ -93,10 +118,10 @@ def run_umap(emb_subset, n_neighbors):
     return umap.UMAP(n_components=2, n_neighbors=n_neighbors).fit_transform(emb_subset)
 
 
-def plot_static(ckpt_path, byte_ids, n_neighbors, save):
+def plot_static(ckpt_path, byte_ids, n_neighbors, save, layer=None):
     cfg = Config()
     device = torch.device(cfg.device)
-    emb = load_embeddings(ckpt_path, device)
+    emb = load_embeddings(ckpt_path, device, layer)
 
     print(f"Running UMAP on {len(byte_ids)} tokens...")
     coords = run_umap(emb[byte_ids], n_neighbors)
@@ -126,7 +151,7 @@ def plot_static(ckpt_path, byte_ids, n_neighbors, save):
         plt.show()
 
 
-def plot_animation(ckpt_dir, byte_ids, n_neighbors, stride, interval, save, workers, interp, start):
+def plot_animation(ckpt_dir, byte_ids, n_neighbors, stride, interval, save, workers, interp, start, layer=None):
     # Prefer the lightweight .npy embedding exports if available
     emb_dir = os.path.join(ckpt_dir, "embeddings")
     npy_paths = sorted(glob.glob(os.path.join(emb_dir, "emb_s*.npy")),
@@ -149,7 +174,7 @@ def plot_animation(ckpt_dir, byte_ids, n_neighbors, stride, interval, save, work
             print("No checkpoints or embedding files found for animation.")
             return
         print(f"Loading embeddings from {len(paths)} checkpoints...")
-        load_args = [(p, byte_ids) for p in paths]
+        load_args = [(p, byte_ids, layer) for p in paths]
         embs = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_load_emb, a): a[0] for a in load_args}
@@ -560,13 +585,12 @@ def main():
     cfg = Config()
     if args.checkpoint_dir:
         ckpt_dir = args.checkpoint_dir
-    elif args.layer is not None:
-        ckpt_dir = find_module_dir(args.layer)
-        if not ckpt_dir:
-            print(f"No checkpoint directory found for layer {args.layer}")
-            return
     else:
-        ckpt_dir = find_latest_module_dir() or cfg.checkpoint_dir
+        # Old layout stored each module in its own checkpoints/module_* dir; the current layout
+        # keeps a single combined checkpoint in cfg.checkpoint_dir and selects the module via
+        # --layer at load time. Prefer a per-module dir if one exists, else fall back.
+        old_dir = find_module_dir(args.layer) if args.layer is not None else find_latest_module_dir()
+        ckpt_dir = old_dir or cfg.checkpoint_dir
 
     if args.character:
         plot_character_bars(ckpt_dir, args.character, args.start, args.stride,
@@ -580,7 +604,8 @@ def main():
         plot_live(ckpt_dir, byte_ids, args.neighbors, args.interval, args.interp)
     elif args.animate:
         plot_animation(ckpt_dir, byte_ids, args.neighbors,
-                       args.stride, args.interval, args.save, args.workers, args.interp, args.start)
+                       args.stride, args.interval, args.save, args.workers, args.interp, args.start,
+                       args.layer)
     else:
         device = torch.device(cfg.device)
         ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
@@ -588,7 +613,7 @@ def main():
             print("No checkpoint found.")
             return
         print(f"Loading {ckpt_path}")
-        plot_static(ckpt_path, byte_ids, args.neighbors, args.save)
+        plot_static(ckpt_path, byte_ids, args.neighbors, args.save, args.layer)
 
 
 if __name__ == "__main__":

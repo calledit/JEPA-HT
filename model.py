@@ -200,7 +200,11 @@ class Generator(nn.Module):
         if layer_idx == 0:
             self.tok_emb = nn.Embedding(cfg.vocab_size, d_in)
         else:
-            self.char_emb = nn.Embedding(cfg.vocab_size, cfg.char_emb_dim)
+            # module 1+ no longer embeds the actual characters. The char slot instead carries a
+            # single learned "this is observed / not a prediction" vector — the inverse of the gen
+            # null token ("this is a prediction"). All character content reaches this module only
+            # through prev_latent.
+            self.real_emb = nn.Parameter(torch.empty(cfg.char_emb_dim))
 
         # module 0: pos covers the full tok_emb (d_in); module 1+: pos covers only the char slot
         self.pos_emb = nn.Embedding(cfg.context_length, d_in if layer_idx == 0 else cfg.char_emb_dim)
@@ -214,6 +218,8 @@ class Generator(nn.Module):
         self.apply(self._init_weights)
         for p in self.null_embs:
             nn.init.normal_(p, std=0.5)
+        if layer_idx != 0:
+            nn.init.normal_(self.real_emb, std=0.5)
         for name, p in self.named_parameters():
             if name.endswith("out_proj.weight") or name.endswith("ff.net.4.weight"):
                 nn.init.normal_(p, std=0.02 / (2 * cfg.n_layers) ** 0.5)
@@ -234,7 +240,9 @@ class Generator(nn.Module):
         if self.layer_idx == 0:
             return self.tok_emb(x) + self.pos_emb(pos)
         assert prev_latent is not None, "prev_latent required for layer_idx > 0"
-        char = char_emb_in if char_emb_in is not None else self.char_emb(x)
+        # clean/corrupt streams use the learned "not a prediction" vector; the gen stream passes its
+        # own null char via char_emb_in. x is unused here for module 1+ (kept for shape/signature).
+        char = char_emb_in if char_emb_in is not None else self.real_emb.expand(x.shape[0], x.shape[1], -1)
         # pos_emb is char_emb_dim for module 1+, so it applies only to the char slot;
         # prev_latent already carries positional information from the previous module
         return torch.cat([prev_latent, char + self.pos_emb(pos)], dim=-1)
@@ -262,7 +270,8 @@ class Generator(nn.Module):
                                 prev_latent_corrupt: torch.Tensor = None,
                                 x_corr: torch.Tensor = None,
                                 clean_token_leak: bool = True,
-                                corrupt_fn=None):
+                                corrupt_fn=None,
+                                thread_genfree: bool = False):
         """Training-only forward with three parallel streams: clean, generative (null-init), corrupt.
         For module 0 all prev_latents are None. For module 1+ each stream receives the corresponding
         output from the frozen previous module so the corruption/generation is consistent up the chain.
@@ -271,7 +280,11 @@ class Generator(nn.Module):
         corrupt_fn: optional callable(clean_latents, gen_hiddens) -> x_corr tensor [B, T].
                     Called after clean/gen streams are computed but before the corrupt stream runs.
                     Allows the decoder to train on fresh latents and supply hard-negative tokens.
-        Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr).
+        thread_genfree: if True, also compute the last block's gen output with the clean-token leak
+                    disabled (under no_grad) and return it as gen_thread. This is the leak-free latent
+                    that should be threaded up to the next module's gen stream, matching inference
+                    (where no leak occurs). gen_thread is None when not requested.
+        Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread).
         """
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
@@ -312,6 +325,26 @@ class Generator(nn.Module):
             h = block.layer3.forward_cross_kv(h, *kv2)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
+        # ── Leak-free gen output for threading to the next module ─────────────
+        # Each gen block re-inits from null (independent of other blocks), so the last block's
+        # leak-free output is all the next module needs as prev_latent_gen. Computed detached.
+        gen_thread = None
+        if thread_genfree:
+            with torch.no_grad():
+                i = len(self.blocks) - 1
+                block = self.blocks[i]
+                if self.layer_idx == 0:
+                    h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+                else:
+                    null_char = self.null_embs[i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+                    h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
+                kv0, kv1, kv2 = cross_kvs[i]
+                h = h + block.input_mlp(h)
+                h = block.layer1.forward_cross_kv(h, *kv0)
+                h = block.layer2.forward_cross_kv(h, *kv1)
+                h = block.layer3.forward_cross_kv(h, *kv2)
+                gen_thread = h[:, :, :block.d_out] + block.output_mlp(h)
+
         # ── Corrupt stream ────────────────────────────────────────────────────
         K = self.cfg.corrupt_samples
         x_corr_was_none = x_corr is None
@@ -349,7 +382,7 @@ class Generator(nn.Module):
             corrupt_latents.append(hc_out)
             hc = hc_out.detach()
 
-        return gen_hiddens, clean_latents, corrupt_latents, x_corr
+        return gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread
 
     @torch.no_grad()
     def encode_clean(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
@@ -397,13 +430,19 @@ class Generator(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Per-layer predictor: d_model → predictor_dim × 3 → d_model."""
+    """Per-layer predictor: [d_model + d_model] → predictor_dim × 3 → d_model.
+
+    The input is twice d_model: the first half is the context-generator latent, the second half is
+    reserved for an extra conditioning signal. For now that second half is filled with a learned
+    null embedding (broadcast over batch/time), so the predictor can later be fed a real signal
+    there without changing its shape.
+    """
 
     def __init__(self, cfg: Config):
         super().__init__()
         h = cfg.predictor_dim
         self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, h, bias=False),
+            nn.Linear(2 * cfg.d_model, h, bias=False),
             nn.GELU(),
             nn.Linear(h, h, bias=False),
             nn.GELU(),
@@ -411,14 +450,18 @@ class Predictor(nn.Module):
             nn.GELU(),
             nn.Linear(h, cfg.d_model, bias=False),
         )
+        self.null_emb = nn.Parameter(torch.empty(cfg.d_model))
         self.apply(self._init_weights)
+        nn.init.normal_(self.null_emb, std=0.5)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x: torch.Tensor, extra: torch.Tensor = None) -> torch.Tensor:
+        if extra is None:
+            extra = self.null_emb.expand(*x.shape[:-1], -1)
+        return self.net(torch.cat([x, extra], dim=-1))
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

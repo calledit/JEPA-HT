@@ -2,24 +2,19 @@
 plot_loss.py — plot training curves from checkpoints/training_log.csv
 
 Usage:
-    python tools/plot_loss.py [--log PATH] [--smooth N] [--start STEP]
+    python tools/plot_loss.py [--log PATH] [--smooth N] [--start STEP] [--module M]
 """
 
 import argparse
-import glob
 import os
-import re
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def find_latest_module_log():
-    files = glob.glob(os.path.join("checkpoints", "module_*", "training_log.csv"))
-    if not files:
-        return "checkpoints/training_log.csv"
-    return max(files, key=lambda f: int(re.search(r"module_(\d+)", f).group(1)))
+def default_log():
+    return "checkpoints/training_log.csv"
 
 
 def smooth(values, window):
@@ -54,10 +49,11 @@ def plot_line(ax, x, y, label, color, window, linestyle="-"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log",    default=find_latest_module_log())
+    parser.add_argument("--log",    default=default_log())
     parser.add_argument("--smooth", type=int, default=20)
     parser.add_argument("--start",  type=int, default=0)
     parser.add_argument("--layer",  type=int, default=None)
+    parser.add_argument("--module", type=int, default=0, help="Which module to plot (default 0)")
     args = parser.parse_args()
 
     df = pd.read_csv(args.log)
@@ -65,6 +61,10 @@ def main():
     df = df.sort_values("step").reset_index(drop=True)
     if args.start > 0:
         df = df[df["step"] >= args.start].reset_index(drop=True)
+
+    # strip the m{module}_ prefix so the rest of the plotting code is unchanged
+    prefix = f"m{args.module}_"
+    df = df.rename(columns={c: c[len(prefix):] for c in df.columns if c.startswith(prefix)})
 
     print(f"Loaded {len(df)} rows | columns: {list(df.columns)}")
 
@@ -86,7 +86,7 @@ def main():
                    len(decoder_a_cols) or len(decoder_layer_cols), 1)
 
     fig, axes = plt.subplots(4, 4, figsize=(20, 16))
-    fig.suptitle("Training curves", fontsize=13)
+    fig.suptitle(f"Training curves — module {args.module}", fontsize=13)
 
     layer_colors = plt.cm.plasma(np.linspace(0.1, 0.9, n_layers))
 

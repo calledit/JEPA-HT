@@ -12,7 +12,7 @@ class Config:
     n_heads: int = 4             # d_head = (d_model + char_emb_dim) / n_heads = 16
     n_layers: int = 1
     ffn_dim: int = 192           # 4 × d_model
-    predictor_dim: int = 96     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
+    predictor_dim: int = 192     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
 
 
     # Number of positions per sample (per block) replaced with real embeddings instead of null
@@ -32,6 +32,15 @@ class Config:
     recon_net_dims: int = 8
     recon_loss_weight: float = 0.0
 
+    # Small next-char grounding on module 0: decode the (context-only) prediction stream with the
+    # module-0 decoder and push it toward the actual byte. The gradient flows (at this scale) into the
+    # generator + predictor AND into the decoder, so the readout co-adapts with the representation
+    # every step — in addition to the detached decoder probe that runs every decoder_train_interval.
+    # Keeps module 0 from compressing away character-predictive content when the JEPA / top-down brake
+    # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
+    # 0.0 = disabled.
+    gen_recon_weight: float = 0.05
+
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
@@ -50,7 +59,7 @@ class Config:
     jacobian_interval: int = 1
     gradient_residual_amplification: bool = True
     gra_scale: float = 1.0
-    gra_warmup_steps: int = 20_000
+    gra_warmup_steps: int = 3_000
 
 
     # Training
@@ -65,6 +74,14 @@ class Config:
     lr_min: float = 0.9e-4/2 # 0.9e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
+
+    # Multi-module training
+    n_modules: int = 2
+    module_warmup_steps: int = 50_000  # global steps before module i+1 starts training
+    # Top-down prediction feed: once module i+1 has trained this many local steps, its detached
+    # prediction is fed into module i's predictor extra slot (before that, a learned null is used).
+    cross_module_pred_feed: bool = True
+    cross_module_feed_start_step: int = 40_000  # = module_warmup_steps // 2
 
     # Eval / checkpointing
     eval_interval: int = 500

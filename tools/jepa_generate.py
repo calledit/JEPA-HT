@@ -1,7 +1,5 @@
 import argparse
-import glob
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,30 +8,44 @@ import torch
 import torch.nn.functional as F
 
 from data import ByteTokenizer
-from model import Generator, LayerwiseDecoder
+from model import Generator, LayerwiseDecoder, LayerwisePredictor
 from train import find_latest_checkpoint
 
 
-def find_latest_module_dir(base_dir):
-    dirs = glob.glob(os.path.join(base_dir, "module_*"))
-    if not dirs:
-        return base_dir
-    return max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
-
-
 def load_checkpoint(path, device):
+    """Load a multi-module checkpoint and rebuild the pieces needed for generation:
+    one Generator + LayerwisePredictor per module, plus module 0's LayerwiseDecoder.
+    Returns (cfg, step, modules, predictors, decoder) where modules/predictors are
+    dicts keyed by module index.
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    if "modules" not in ckpt:
+        sys.exit(f"Checkpoint {path!r} is not in the multi-module format (no 'modules' key). "
+                 "It predates the current architecture and can't be used here.")
     cfg = ckpt["cfg"]
-    generator = Generator(cfg).to(device)
-    generator.load_state_dict(ckpt["generator"], strict=False)
-    generator.eval()
-    layerwise_decoder = LayerwiseDecoder(cfg).to(device)
-    if "layerwise_decoder" not in ckpt:
-        print("Warning: no layerwise_decoder in checkpoint")
-    else:
-        layerwise_decoder.load_state_dict(ckpt["layerwise_decoder"])
-    layerwise_decoder.eval()
-    return generator, layerwise_decoder, cfg
+    step = ckpt.get("step", 0)
+
+    modules, predictors, decoder = {}, {}, None
+    for md in ckpt["modules"]:
+        idx = md["module_idx"]
+        gen = Generator(cfg, layer_idx=idx).to(device)
+        gen.load_state_dict(md["generator"], strict=False)
+        gen.eval()
+        modules[idx] = gen
+
+        pred = LayerwisePredictor(cfg).to(device)
+        pred.load_state_dict(md["layerwise_predictor"])
+        pred.eval()
+        predictors[idx] = pred
+
+        if "layerwise_decoder" in md:
+            decoder = LayerwiseDecoder(cfg).to(device)
+            decoder.load_state_dict(md["layerwise_decoder"])
+            decoder.eval()
+
+    if decoder is None:
+        sys.exit("Checkpoint has no module that owns a LayerwiseDecoder (module 0).")
+    return cfg, step, modules, predictors, decoder
 
 
 def _byte_repr(b: int) -> str:
@@ -43,47 +55,97 @@ def _byte_repr(b: int) -> str:
 
 
 @torch.no_grad()
-def _predict_next_logits(generator, layerwise_decoder, pos: int, ctx_kv, device):
-    """Prediction pass: each block independently queries from its null embedding,
-    attending to the context KV cache. Returns logits [1, vocab_size] via LayerwiseDecoder.
-    LayerwiseDecoder is trained on raw block outputs (no norm), so we skip generator.norm.
+def _clean_gen_streams(gen, x, prev_clean=None, prev_gen=None):
+    """Inference mirror of Generator.forward_cross_layerwise's clean + (leak-free) generative streams.
+
+    The clean stream encodes the real context with self-attention; the generative stream re-inits each
+    block from its null embedding and cross-attends (strict causal, no clean-token leak) to the clean
+    stream's per-layer K/V — exactly as during training but without the corrupt stream or the leak.
+
+    Returns (gen_hiddens, clean_last):
+      gen_hiddens: list of n_layers tensors [B, T, d_model] — the generative prediction stream.
+      clean_last:  [B, T, d_model] last block's clean latent (threaded up as the next module's prev_clean).
     """
-    pos_t = torch.tensor([pos], device=device)
-    pred_h = None
-    for i, (block, (kv1, kv2, kv3)) in enumerate(zip(generator.blocks, ctx_kv)):
-        h = (generator.null_embs[i] + generator.pos_emb(pos_t)).unsqueeze(0)  # [1, 1, D]
-        h, _, _, _ = block.forward_with_cache(h, kv1, kv2, kv3)
-        pred_h = h  # [1, 1, D]
-    n_layers = len(generator.blocks)
-    return layerwise_decoder(n_layers - 1, pred_h[:, 0, :])  # [1, vocab_size]
+    B, T = x.shape
+    pos = torch.arange(T, device=x.device)
+
+    # ── Clean (context) stream — also collects per-layer cross K/V for the gen stream ──
+    h_clean = gen._build_input(x, prev_clean)
+    cross_kvs = []
+    clean_last = None
+    for block in gen.blocks:
+        h_clean = h_clean + block.input_mlp(h_clean)
+        h_clean, k0, v0 = block.layer1.forward_kv(h_clean)
+        h_clean, k1, v1 = block.layer2.forward_kv(h_clean)
+        h_clean, k2, v2 = block.layer3.forward_kv(h_clean)
+        cross_kvs.append(((k0, v0), (k1, v1), (k2, v2)))
+        h_clean = h_clean[:, :, :block.d_out] + block.output_mlp(h_clean)
+        clean_last = h_clean
+
+    # ── Generative (null-init) stream ──
+    gen_hiddens = []
+    for i, block in enumerate(gen.blocks):
+        if gen.layer_idx == 0:
+            h = (gen.null_embs[i] + gen.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+        else:
+            null_char = gen.null_embs[i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+            h = gen._build_input(x, prev_gen, char_emb_in=null_char)
+        (k0, v0), (k1, v1), (k2, v2) = cross_kvs[i]
+        h = h + block.input_mlp(h)
+        h = block.layer1.forward_cross_kv(h, k0, v0)
+        h = block.layer2.forward_cross_kv(h, k1, v1)
+        h = block.layer3.forward_cross_kv(h, k2, v2)
+        gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
+    return gen_hiddens, clean_last
 
 
 @torch.no_grad()
-def jepa_generate(generator, layerwise_decoder, prompt_ids, max_new_tokens, temperature, top_k, device, debug=False):
-    """Two-pass JEPA generation:
-      1. Prediction pass — null embedding at `pos` queries context KV → sample token
-      2. Context pass   — real sampled token extends the KV cache
+def _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg, ctx, device):
+    """Compute next-token logits for context `ctx` (list of ints).
+
+    Pads one placeholder position so the strict-causal gen stream yields a prediction at index
+    len(ctx) (the next token). Runs bottom-up clean+gen streams per active module threading
+    clean/gen latents up, then top-down per-module predictors (each conditioned on the module above's
+    prediction via the `extra` slot when the feed is active), and finally module 0's decoder.
     """
-    cfg = generator.cfg
+    n_layers = cfg.n_layers
+    last_layer = n_layers - 1
+    x = torch.tensor([list(ctx) + [0]], dtype=torch.long, device=device)  # placeholder at index len(ctx)
+
+    # Bottom-up: clean + generative streams, threading detached latents up the hierarchy.
+    gens = {}
+    prev_clean = prev_gen = None
+    for i in active:
+        g, clean_last = _clean_gen_streams(modules[i], x, prev_clean, prev_gen)
+        gens[i] = g
+        prev_clean = clean_last
+        prev_gen = g[-1]
+
+    # Top-down: each module's predictor, conditioned on the module above's prediction when fed.
+    preds = {}
+    for i in reversed(active):
+        nxt = i + 1
+        extra_list = preds[nxt] if (feed_active.get(i, False) and nxt in preds) else None
+        preds[i] = [
+            predictors[i].predictors[l](
+                gens[i][l],
+                extra_list[l] if extra_list is not None else None,
+            )
+            for l in range(n_layers)
+        ]
+
+    # Module 0's decoder reads its top-layer predictor output at the next-token position.
+    return decoder(last_layer, preds[0][last_layer][:, -1, :])  # [1, vocab_size]
+
+
+@torch.no_grad()
+def jepa_generate(modules, predictors, decoder, active, feed_active, cfg,
+                  prompt_ids, max_new_tokens, temperature, top_k, device, debug=False):
     tokens = list(prompt_ids)
 
-    ctx = tokens[-(cfg.context_length - 1):]
-    T = len(ctx)
-    x = torch.tensor([ctx], dtype=torch.long, device=device)
-    _, ctx_kv = generator.encode_kv(x)
-
     for step_i in range(max_new_tokens):
-        pos = T + step_i
-
-        if pos >= cfg.context_length:
-            # Slide the window and re-encode from scratch
-            ctx_window = tokens[-(cfg.context_length - 1):]
-            x = torch.tensor([ctx_window], dtype=torch.long, device=device)
-            _, ctx_kv = generator.encode_kv(x)
-            pos = len(ctx_window)
-
-        # === Prediction pass ===
-        logits = _predict_next_logits(generator, layerwise_decoder, pos, ctx_kv, device)  # [1, vocab_size]
+        ctx = tokens[-(cfg.context_length - 1):]
+        logits = _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg, ctx, device)
 
         if temperature != 1.0:
             logits = logits / temperature
@@ -108,17 +170,13 @@ def jepa_generate(generator, layerwise_decoder, prompt_ids, max_new_tokens, temp
 
         tokens.append(next_token)
 
-        # === Context pass: extend KV cache with the real sampled token ===
-        token_t = torch.tensor([[next_token]], dtype=torch.long, device=device)
-        _, ctx_kv = generator.decode_one(token_t, pos, ctx_kv)
-
     return tokens
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate text using JEPA two-pass inference "
-                    "(null-embedding prediction → sample → context KV update)"
+        description="Generate text using JEPA hierarchical inference "
+                    "(null-embedding generative stream → per-module predictors → module-0 decoder)"
     )
     parser.add_argument("checkpoint", nargs="?",
                         help="Path to checkpoint .pt file (default: latest in --checkpoint-dir)")
@@ -134,18 +192,29 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = ByteTokenizer()
 
-    ckpt_dir = find_latest_module_dir(args.checkpoint_dir)
-    ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
+    ckpt_path = args.checkpoint or find_latest_checkpoint(args.checkpoint_dir)
     if ckpt_path is None:
-        sys.exit(f"No checkpoint found in {ckpt_dir!r}")
+        sys.exit(f"No checkpoint found in {args.checkpoint_dir!r}")
     print(f"Loading checkpoint: {ckpt_path}")
-    generator, layerwise_decoder, cfg = load_checkpoint(ckpt_path, device)
+    cfg, step, modules, predictors, decoder = load_checkpoint(ckpt_path, device)
+
+    # Mirror the training loop's gating: a module is active once global step has passed its warmup,
+    # and module i's predictor is fed module i+1's prediction once i+1 has trained past the feed-start.
+    active = [i for i in sorted(modules) if step >= i * cfg.module_warmup_steps]
+    feed_active = {
+        i: (cfg.cross_module_pred_feed
+            and (i + 1) in active
+            and (step - (i + 1) * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step)
+        for i in active
+    }
+    print(f"Checkpoint step {step:,} | active modules {active} | "
+          f"top-down feed {[i for i, f in feed_active.items() if f]}")
     print(f"Generating {args.max_tokens} tokens on {device}...")
 
     prompt_ids = tokenizer.encode(args.prompt)
     output_ids = jepa_generate(
-        generator, layerwise_decoder, prompt_ids, args.max_tokens,
-        args.temperature, args.top_k, device, debug=args.debug,
+        modules, predictors, decoder, active, feed_active, cfg,
+        prompt_ids, args.max_tokens, args.temperature, args.top_k, device, debug=args.debug,
     )
     print(tokenizer.decode(output_ids))
 
