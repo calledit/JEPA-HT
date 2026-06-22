@@ -28,6 +28,31 @@ class Config:
     # when the discriminator is fully certain about both target and pred.
     disc_eps: float = 0.1
 
+    # ── Sameness (equivalence) discriminator ────────────────────────────────
+    # Replaces/augments the MSE attract loss. A two-latent discriminator D(a, b) learns
+    # "same content" (positive: a latent vs a noised copy of itself) vs "different" (a random
+    # cross-pairing of pred/target/corrupt + a shuffled same-type pair). The predictor is then
+    # trained adversarially to make D(pred, target) read "same". Because D is bounded it gives a
+    # mode-seeking signal (commit to a real latent) instead of MSE's mean-seeking blur.
+    enable_sameness: bool = False
+    sameness_est_lr: float = 1.4e-4
+    sameness_weight: float = 1.0           # scale of the adversarial attract term (generator side)
+    sameness_pos_noise: float = 0.01        # positive-pair noise std, relative to per-batch latent std
+    sameness_r1_weight: float = 0.10       # R1 penalty on the sameness discriminator's positive inputs
+    sameness_r1_interval: int = 5
+    # MSE bootstrap: a decaying MSE attract term pulls pred close enough for the (saturating)
+    # discriminator to give gradient early on. Anneals linearly to 0 over mse_anneal_steps (local).
+    mse_attract_weight: float = 1.0
+    mse_anneal_steps: int = 1145000
+    # Fraction of discriminator steps that label (pred, target) as "same" instead of a hard negative
+    # — one-sided label smoothing on the adversarial pair: stops an overconfident D from saturating
+    # the generator gradient. Becomes truthful as pred→target. Only affects the generator once
+    # sameness_weight > 0; applies only to (pred, target), never to the corrupt pairs.
+    sameness_pred_target_pos_frac: float = 0.10
+    # Optional linear ramp of the above fraction from 0 → its value over this many local steps
+    # (0 = no ramp; use the flat fraction immediately).
+    sameness_pos_frac_ramp_steps: int = 0
+
     # Small reconstruction probe on first N latent dims
     recon_net_dims: int = 8
     recon_loss_weight: float = 0.0
@@ -39,7 +64,7 @@ class Config:
     # Keeps module 0 from compressing away character-predictive content when the JEPA / top-down brake
     # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
     # 0.0 = disabled.
-    gen_recon_weight: float = 0.05
+    gen_recon_weight: float = 0.05 #CHANGE 2919000 Again 3521000
 
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
@@ -82,6 +107,21 @@ class Config:
     # prediction is fed into module i's predictor extra slot (before that, a learned null is used).
     cross_module_pred_feed: bool = True
     cross_module_feed_start_step: int = 40_000  # = module_warmup_steps // 2
+    # Let the fed-down prediction carry gradient: module i's loss then trains module i+1's PREDICTOR
+    # weights (one hop only — never i+1's context generator, never i+2). So the higher module learns
+    # to emit predictions that are useful as top-down context for the module below, without a lower
+    # objective reshaping the higher manifold. Gated by cross_module_feed_start_step (same as the feed).
+    cross_module_pred_grad: bool = True #CHANGE 2919000 Again 3521000
+    # Scale applied to that cross-module gradient only (the fed value is unchanged). Auxiliary on top of
+    # the predictor's own loss — keep small.
+    cross_module_pred_grad_weight: float = 0.05
+    # Let that cross-module gradient reach module i+1's CONTEXT GENERATOR as well as its predictor, so
+    # the higher module also shapes its representation to be useful downstream. Still one hop only —
+    # the generator's own inputs are the detached up-threaded latents (Phase A), so it never reaches
+    # module i. Off → the feed-copy detaches gen_hiddens and only the predictor is coupled. This is a
+    # larger relaxation of the per-module isolation: a lower objective now nudges the higher manifold,
+    # bounded by cross_module_pred_grad_weight and dominated by the higher module's own local loss.
+    cross_module_grad_include_generator: bool = True
 
     # Eval / checkpointing
     eval_interval: int = 500

@@ -504,6 +504,42 @@ class ManifoldEstimator(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class SamenessEstimator(nn.Module):
+    """Two-latent discriminator: scores whether a and b encode the same content.
+
+    Positives (a latent vs a noised copy of itself) score high; different latents score low.
+    The predictor is later trained adversarially to make D(pred, target) read "same".
+    Fed symmetric relational features [a+b, |a-b|, a*b] so it measures a *relation* between the two
+    latents (and is order-invariant), rather than learning to classify which stream a latent came
+    from — that would just re-derive the single-input ManifoldEstimator.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        D = cfg.d_model
+        self.net = nn.Sequential(
+            nn.Linear(3 * D, 3 * D, bias=False), nn.GELU(),
+            nn.Linear(3 * D, 2 * D, bias=False), nn.GELU(),
+            nn.Linear(2 * D, D,     bias=False), nn.GELU(),
+            nn.Linear(D,     1,     bias=False),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    @staticmethod
+    def _features(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.cat([a + b, (a - b).abs(), a * b], dim=-1)
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return self.net(self._features(a, b)).squeeze(-1)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 class SmallReconNet(nn.Module):
     """Tiny reconstruction probe: takes first `dims` dimensions of a latent, predicts tokens."""
 

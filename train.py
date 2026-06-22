@@ -13,7 +13,7 @@ import torch.nn.functional as F
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 from config import Config
-from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder
+from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder, SamenessEstimator
 from data import build_dataset
 
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
@@ -80,6 +80,15 @@ class ModuleState:
         self.generator          = Generator(cfg, layer_idx=module_idx).to(device)
         self.layerwise_predictor = LayerwisePredictor(cfg).to(device)
         self.manifold_est       = ManifoldEstimator(cfg).to(device)
+        # Two-latent "sameness" discriminator: replaces/augments the MSE attract loss.
+        if cfg.enable_sameness:
+            self.sameness_est = SamenessEstimator(cfg).to(device)
+            self.sameness_opt = torch.optim.AdamW(
+                self.sameness_est.parameters(), lr=cfg.sameness_est_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+            )
+        else:
+            self.sameness_est = None
+            self.sameness_opt = None
         # Only module 0 owns a decoder. It produces the hard-negative corrupt tokens for the
         # whole hierarchy (they propagate up the chain) and acts as module 0's reconstruction probe.
         if module_idx == 0:
@@ -124,6 +133,7 @@ class ModuleState:
         self.toward_zero_layer_sums = [0.0] * n
         self.repel_layer_sums       = [0.0] * n
         self.jepa_sum = self.manifold_sum = self.clean_corrupt_sum = 0.0
+        self.sameness_sum = self.sameness_margin_sum = 0.0
         self.latent_std_sum = self.latent_mean_sum = self.r1_sum = self.jac_sum = 0.0
         self.jac_count = self.r1_count = self.clean_corrupt_count = 0
         self.decoder_layer_sums_a = [0.0] * n
@@ -154,6 +164,9 @@ class ModuleState:
         if self.layerwise_decoder is not None:
             d["layerwise_decoder"] = self.layerwise_decoder.state_dict()
             d["decoder_opt"]       = self.decoder_opt.state_dict()
+        if self.sameness_est is not None:
+            d["sameness_est"] = self.sameness_est.state_dict()
+            d["sameness_opt"] = self.sameness_opt.state_dict()
         return d
 
     def load_state_dict(self, d: dict):
@@ -165,6 +178,8 @@ class ModuleState:
         ]
         if self.layerwise_decoder is not None:
             sub_models.append(("layerwise_decoder", self.layerwise_decoder, "decoder_opt"))
+        if self.sameness_est is not None:
+            sub_models.append(("sameness_est", self.sameness_est, "sameness_opt"))
         for key, model, opt_key in sub_models:
             try:
                 model.load_state_dict(d[key])
@@ -178,6 +193,8 @@ class ModuleState:
         ]
         if self.decoder_opt is not None:
             opt_specs.append((self.decoder_opt, "decoder_opt"))
+        if self.sameness_opt is not None:
+            opt_specs.append((self.sameness_opt, "sameness_opt"))
         for opt, key in opt_specs:
             if key in skip_opts or key not in d:
                 continue
@@ -217,6 +234,8 @@ class ModuleState:
         self.manifold_est.train()
         if self.layerwise_decoder is not None:
             self.layerwise_decoder.train()
+        if self.sameness_est is not None:
+            self.sameness_est.train()
 
 
 # ── Per-module training step ────────────────────────────────────────────────
@@ -334,11 +353,16 @@ def module_predict_gen(
     cfg: Config,
     device: torch.device,
     decoder_ms: "ModuleState",
+    retain_graph_for_feed: bool = False,
 ) -> dict:
     """Phase B: compute the predictor output (conditioned on the next module's detached prediction
     via the predictor's extra slot), train the decoder (module 0), and run the generator+predictor
-    backward/step. `extra_preds` is the per-layer detached prediction from the module above, or None
-    (→ the predictor's learned null embedding). Returns step metrics including this module's preds.
+    backward. `extra_preds` is the per-layer detached prediction from the module above, or None
+    (→ the predictor's learned null embedding). The generator and predictor optimizer steps are NOT
+    taken here — they are deferred to the end of Phase B so the cross-module term from the module below
+    can accumulate first. `retain_graph_for_feed` keeps this module's generator graph alive so a lower
+    module can backprop into it (needed only when cross_module_grad_include_generator is on).
+    Returns step metrics including this module's preds.
     """
     autocast        = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     module_idx      = ms.module_idx
@@ -394,6 +418,71 @@ def module_predict_gen(
         while ms.decoder_hist[0][0] < step - 50_000:
             ms.decoder_hist.popleft()
 
+    # ── Sameness discriminator step ───────────────────────────────────────────
+    # D(a, b) learns "same content" (a latent vs a noised copy) vs "different" (a random cross-pairing
+    # of pred/target/corrupt this step, plus a shuffled same-type pair). Trained on detached latents;
+    # the predictor later tries to make D(pred, target) read "same" (see the attract term below).
+    sameness_disc_val   = 0.0
+    sameness_margin_val = 0.0
+    if cfg.enable_sameness:
+        B, T = x.shape
+        D    = cfg.d_model
+        K    = cfg.corrupt_samples
+        # With probability pt_frac, label (pred, target) as "same" this step (one-sided label
+        # smoothing on the adversarial pair) instead of training it as a hard negative.
+        pt_frac = cfg.sameness_pred_target_pos_frac
+        if cfg.sameness_pos_frac_ramp_steps > 0:
+            pt_frac *= min(1.0, local_step / cfg.sameness_pos_frac_ramp_steps)
+        pred_target_positive = torch.rand(1).item() < pt_frac
+        with autocast():
+            same_layer_losses = []
+            pos_sum = neg_sum = 0.0
+            for l in range(cfg.n_layers):
+                pred_l = preds[l].detach().reshape(-1, D)
+                targ_l = target_latents[l + 1].detach().reshape(-1, D)
+                corr_l = corrupt_latents[l + 1].detach().reshape(K, B, T, D)[0].reshape(-1, D)
+                if pred_target_positive:
+                    # train D that (pred, target) is "same"; draw the negative from the corrupt pairs
+                    s_pos = ms.sameness_est(pred_l, targ_l)
+                    nk    = torch.randint(1, 4, (1,)).item()
+                else:
+                    # positive: a latent vs a noised copy; base stream chosen at random this step
+                    pos_base = (pred_l, targ_l, corr_l)[torch.randint(0, 3, (1,)).item()]
+                    noise    = cfg.sameness_pos_noise * pos_base.std() * torch.randn_like(pos_base)
+                    s_pos    = ms.sameness_est(pos_base, pos_base + noise)
+                    nk       = torch.randint(0, 4, (1,)).item()
+                # negative: a "different" pairing (excludes pred,target when it was the positive)
+                if   nk == 0: a, b = pred_l, targ_l
+                elif nk == 1: a, b = targ_l, corr_l
+                elif nk == 2: a, b = pred_l, corr_l
+                else:         a, b = targ_l, targ_l[torch.randperm(targ_l.shape[0], device=device)]
+                s_neg = ms.sameness_est(a, b)
+
+                layer_same = (F.relu(1 - s_pos).mean() + F.relu(1 + s_neg).mean()) / 2
+                layer_same = gra(layer_same, s_pos, cfg.gra_scale)
+                layer_same = gra(layer_same, s_neg, cfg.gra_scale)
+                same_layer_losses.append(layer_same)
+                pos_sum += s_pos.mean().item()
+                neg_sum += s_neg.mean().item()
+            same_base = sum(same_layer_losses) / cfg.n_layers
+
+            same_r1 = same_base.new_zeros(1).squeeze()
+            if cfg.sameness_r1_weight > 0.0 and step % cfg.sameness_r1_interval == 0:
+                for l in range(cfg.n_layers):
+                    base  = target_latents[l + 1].detach().reshape(-1, D).requires_grad_(True)
+                    noise = cfg.sameness_pos_noise * base.detach().std() * torch.randn_like(base)
+                    s     = ms.sameness_est(base, base + noise)
+                    grad  = torch.autograd.grad(s.sum(), base, create_graph=True)[0]
+                    same_r1 = same_r1 + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
+            same_total = same_base + same_r1 * cfg.sameness_r1_weight
+
+        ms.sameness_opt.zero_grad()
+        same_total.backward()
+        torch.nn.utils.clip_grad_norm_(ms.sameness_est.parameters(), cfg.grad_clip)
+        ms.sameness_opt.step()
+        sameness_disc_val   = same_base.item()
+        sameness_margin_val = (pos_sum - neg_sum) / cfg.n_layers
+
     disc_margin = ctx["disc_margin"]
     disc_base   = ctx["disc_base"]
     r1_penalty  = ctx["r1_penalty"]
@@ -413,7 +502,16 @@ def module_predict_gen(
             K            = cfg.corrupt_samples
             disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(K, B, T).mean(0)
 
-            attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
+            if cfg.enable_sameness:
+                # Adversarial attract: push D(pred, target) toward "same" (non-saturating form, so the
+                # predictor still gets gradient while it is far from the target and D is saturated).
+                s_same  = ms.sameness_est(preds[l], target_latents[l + 1].detach())
+                attract = cfg.sameness_weight * F.softplus(-s_same).mean()
+                mse_w   = cfg.mse_attract_weight * max(0.0, 1.0 - local_step / cfg.mse_anneal_steps)
+                if mse_w > 0.0:
+                    attract = attract + mse_w * F.mse_loss(preds[l], target_latents[l + 1].detach())
+            else:
+                attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
             if cfg.gradient_residual_amplification and local_step < 30_000:
                 attract = gra(attract, preds[l], cfg.gra_scale)
 
@@ -461,23 +559,28 @@ def module_predict_gen(
 
     for param in ms.manifold_est.parameters():
         param.requires_grad_(False)
-    ms.gen_opt.zero_grad()
-    ms.layerwise_pred_opt.zero_grad()
+    if cfg.enable_sameness:
+        for param in ms.sameness_est.parameters():
+            param.requires_grad_(False)
+    # NB: neither gen_opt nor layerwise_pred_opt is zeroed or stepped here. Generator and predictor
+    # grads accumulate across the Phase B reversed pass — this module's own loss plus the cross-module
+    # term from the module below (which trains this predictor's weights, and its generator's too when
+    # cross_module_grad_include_generator is on). Both opts are zeroed once at the start of Phase B and
+    # clipped+stepped once at the end (see train loop). retain_graph_for_feed keeps this generator graph
+    # alive so the module below can backprop into it.
     # Isolate the recon term's gradient on the decoder (the every-13-steps probe has already stepped
     # and left stale grads on these params) so decoder_opt applies only the small attached update.
     if recon_ce is not None:
         ms.decoder_opt.zero_grad()
-    jepa_loss.backward()
-    torch.nn.utils.clip_grad_norm_(
-        list(ms.generator.parameters()) + list(ms.layerwise_predictor.parameters()), cfg.grad_clip
-    )
-    ms.gen_opt.step()
-    ms.layerwise_pred_opt.step()
+    jepa_loss.backward(retain_graph=retain_graph_for_feed)
     if recon_ce is not None:
         torch.nn.utils.clip_grad_norm_(ms.layerwise_decoder.parameters(), cfg.grad_clip)
         ms.decoder_opt.step()
     for param in ms.manifold_est.parameters():
         param.requires_grad_(True)
+    if cfg.enable_sameness:
+        for param in ms.sameness_est.parameters():
+            param.requires_grad_(True)
     if recon_ce is not None:
         for l, rt in enumerate(recon_terms):
             ms.decoder_layer_sums_c[l] += rt.item()
@@ -499,6 +602,8 @@ def module_predict_gen(
         ms.jac_window.append(jac_penalty.item())
     ms.manifold_sum        += disc_margin
     ms.manifold_window.append(disc_margin)
+    ms.sameness_sum        += sameness_disc_val
+    ms.sameness_margin_sum += sameness_margin_val
     ms.clean_corrupt_count += 1
     if r1_computed:
         ms.r1_sum   += r1_penalty.item()
@@ -525,12 +630,33 @@ def module_predict_gen(
         "jac_penalty":     jac_penalty,
         "step_latent_std": step_latent_std,
         "step_latent_mean": step_latent_mean,
+        "sameness_disc":   sameness_disc_val,
+        "sameness_margin": sameness_margin_val,
         "lr":              ctx["lr"],
         "step_dec_losses": step_dec_losses,
         "r1_computed":     r1_computed,
         "target_latents":  target_latents,
         "preds":           preds,
     }
+
+
+def build_feed_copy(ms, gen_hiddens, extra_used, cfg, device, include_generator):
+    """Re-run a module's predictor to produce the prediction handed down to the module below.
+
+    The extra slot is always detached, so the gradient stops at this module — one hop, never the module
+    above it. gen_hiddens is detached only when include_generator is False: then the downstream loss
+    reaches this predictor's weights alone. When include_generator is True, gen_hiddens stays in-graph,
+    so the downstream loss also flows through this module's context generator (back to its detached
+    Phase A inputs, never further down). The predictor forward is cheap; the generator graph it rides
+    on (when included) must have been kept alive via retain_graph in this module's backward."""
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        return [
+            ms.layerwise_predictor.predictors[l](
+                gen_hiddens[l] if include_generator else gen_hiddens[l].detach(),
+                extra_used[l].detach() if extra_used is not None else None,
+            )
+            for l in range(cfg.n_layers)
+        ]
 
 
 # ── Log headers ─────────────────────────────────────────────────────────────
@@ -551,7 +677,7 @@ def _build_log_header(cfg: Config) -> list[str]:
         cols += [f"{p}decoder_loss_avg", f"{p}latent_std", f"{p}latent_mean", f"{p}lr"]
         cols += [f"{p}attract_std_{l}"        for l in _ll]
         cols += [f"{p}repel_std_{l}"          for l in _ll]
-        cols += [f"{p}manifold_std", f"{p}r1_penalty", f"{p}jacobian_penalty", f"{p}jacobian_cv"]
+        cols += [f"{p}manifold_std", f"{p}sameness", f"{p}sameness_margin", f"{p}r1_penalty", f"{p}jacobian_penalty", f"{p}jacobian_cv"]
         cols += [f"{p}pred_char_acc_{l}"      for l in _ll]
         cols += [f"{p}gen_char_acc_{l}"       for l in _ll]
     cols += ["tok_per_s", "elapsed_s"]
@@ -566,7 +692,7 @@ def _build_steps_header(cfg: Config) -> list[str]:
         cols += [f"{p}attract_{l}"   for l in range(cfg.n_layers)]
         cols += [f"{p}repel_{l}"     for l in range(cfg.n_layers)]
         cols += [
-            f"{p}jepa_total", f"{p}manifold", f"{p}r1", f"{p}jacobian",
+            f"{p}jepa_total", f"{p}manifold", f"{p}sameness", f"{p}sameness_margin", f"{p}r1", f"{p}jacobian",
             f"{p}latent_std", f"{p}latent_mean", f"{p}lr",
         ]
         cols += [f"{p}decoder_a_{l}" for l in range(cfg.n_layers)]
@@ -576,13 +702,13 @@ def _build_steps_header(cfg: Config) -> list[str]:
 
 # ── Column counts (for padding inactive modules with empty strings) ──────────
 def _cols_per_module_log(n_layers: int) -> int:
-    # 4*n_l + 3 + 3*n_l + 4 + 2*n_l + 4 + 2*n_l = 11*n_l + 11
-    return 11 * n_layers + 11
+    # 4*n_l + 3 + 3*n_l + 4 + 2*n_l + 6 + 2*n_l = 11*n_l + 13
+    return 11 * n_layers + 13
 
 
 def _cols_per_module_steps(n_layers: int) -> int:
-    # 3*n_l + 7 + 2*n_l = 5*n_l + 7
-    return 5 * n_layers + 7
+    # 3*n_l + 9 + 2*n_l = 5*n_l + 9
+    return 5 * n_layers + 9
 
 
 # ── Main training loop ───────────────────────────────────────────────────────
@@ -597,10 +723,12 @@ def train():
     for ms in module_states:
         ms.set_train()
         dec_str = f"{ms.layerwise_decoder.num_params():,}" if ms.layerwise_decoder is not None else "—"
+        same_str = f"{ms.sameness_est.num_params():,}" if ms.sameness_est is not None else "—"
         print(
             f"  Module {ms.module_idx}: gen={ms.generator.num_params():,}  "
             f"pred={ms.layerwise_predictor.num_params():,}  "
             f"disc={ms.manifold_est.num_params():,}  "
+            f"same={same_str}  "
             f"dec={dec_str}"
         )
 
@@ -696,9 +824,19 @@ def train():
                 }
 
         # ── Phase B: top-down predictor + generator step; feed each module's pred down ──
-        # Module i's predictor is conditioned on module i+1's detached prediction once i+1 has
-        # trained past cross_module_feed_start_step local steps (else its learned null is used).
+        # Module i's predictor is conditioned on module i+1's prediction once i+1 has trained past
+        # cross_module_feed_start_step local steps (else its learned null is used). When
+        # cross_module_pred_grad is on, that fed-down prediction also carries gradient (scaled by
+        # cross_module_pred_grad_weight): module i's loss trains module i+1's PREDICTOR weights — one
+        # hop, never i+1's generator (gen_hiddens detached) nor i+2 (extra detached). Predictor steps
+        # are therefore deferred: grads accumulate across this reversed pass (each module's own loss +
+        # the cross term from the module below) and every predictor is clipped+stepped once at the end.
+        for i in active:
+            module_states[i].gen_opt.zero_grad()
+            module_states[i].layerwise_pred_opt.zero_grad()
+        incl_gen = cfg.cross_module_pred_grad and cfg.cross_module_grad_include_generator
         detached_preds = {}
+        feed_preds     = {}
         for i in reversed(active):
             nxt  = i + 1
             feed = (
@@ -706,11 +844,42 @@ def train():
                 and nxt in ctxs
                 and (step - nxt * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
-            extra = detached_preds[nxt] if feed else None
+            if feed and cfg.cross_module_pred_grad:
+                # Same value as the detached feed, but gradient w.r.t. module nxt scaled by w.
+                w     = cfg.cross_module_pred_grad_weight
+                extra = [fp.detach() + w * (fp - fp.detach()) for fp in feed_preds[nxt]]
+            elif feed:
+                extra = detached_preds[nxt]
+            else:
+                extra = None
+            # Whether the module below (i-1) will consume a gradient feed from this module this step:
+            # it exists and its feed gate (keyed on this module's local step) is open. Only then do we
+            # build the feed-copy / retain this generator graph for that backward.
+            below_feeds = (
+                cfg.cross_module_pred_feed
+                and i != active[0]
+                and (step - i * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
+            )
             last_results[i] = module_predict_gen(
-                module_states[i], x, ctxs[i], extra, step, cfg, device, decoder_ms=module_states[0]
+                module_states[i], x, ctxs[i], extra, step, cfg, device,
+                decoder_ms=module_states[0],
+                retain_graph_for_feed=(incl_gen and below_feeds),
             )
             detached_preds[i] = [p.detach() for p in last_results[i]["preds"]]
+            if cfg.cross_module_pred_grad and below_feeds:
+                feed_preds[i] = build_feed_copy(
+                    module_states[i], ctxs[i]["gen_hiddens"], extra, cfg, device,
+                    include_generator=incl_gen,
+                )
+        # All cross-module contributions are in; clip + step every generator and predictor once
+        # (clipped jointly per module, matching the original combined-norm clip).
+        for i in active:
+            ms = module_states[i]
+            torch.nn.utils.clip_grad_norm_(
+                list(ms.generator.parameters()) + list(ms.layerwise_predictor.parameters()), cfg.grad_clip
+            )
+            ms.gen_opt.step()
+            ms.layerwise_pred_opt.step()
 
         step             += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
@@ -730,6 +899,8 @@ def train():
             row += [
                 f"{r['jepa_loss'].item():.6f}",
                 f"{r['disc_base'].item():.6f}",
+                f"{r['sameness_disc']:.6f}",
+                f"{r['sameness_margin']:.6f}",
                 f"{r['r1_penalty'].item():.6f}",
                 f"{r['jac_penalty'].item():.6f}" if r["jac_penalty"] is not None else "",
                 f"{r['step_latent_std']:.6f}",
@@ -769,6 +940,8 @@ def train():
                 avg_repel = [ms.repel_layer_sums[l]       / lc for l in range(nl)]
                 avg_jepa  = ms.jepa_sum     / lc
                 avg_mfld  = ms.manifold_sum / lc
+                avg_same        = ms.sameness_sum        / lc
+                avg_same_margin = ms.sameness_margin_sum / lc
                 avg_cc    = ms.clean_corrupt_sum / max(ms.clean_corrupt_count, 1)
                 avg_dec_a = [ms.decoder_layer_sums_a[l] / dc for l in range(nl)]
                 avg_dec_b = [ms.decoder_layer_sums_b[l] / dc for l in range(nl)]
@@ -824,7 +997,7 @@ def train():
                 eval_row += [f"{avg_dec:.6f}", f"{avg_std:.6f}", f"{avg_mean:.6f}", f"{lr_val:.6e}"]
                 eval_row += [f"{attr_std[l]:.6f}"  for l in range(nl)]
                 eval_row += [f"{repel_std[l]:.6f}" for l in range(nl)]
-                eval_row += [f"{mfld_std:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"]
+                eval_row += [f"{mfld_std:.6f}", f"{avg_same:.6f}", f"{avg_same_margin:.6f}", f"{avg_r1:.6f}", f"{avg_jac:.6f}", f"{jac_cv:.6f}"]
                 eval_row += [f"{pred_char_acc[l]:.2f}" for l in range(nl)]
                 eval_row += [f"{gen_char_acc[l]:.2f}"  for l in range(nl)]
 
@@ -838,7 +1011,7 @@ def train():
                 )
                 print(
                     f"  [m{i}] step {step:7d} | {layer_str} | "
-                    f"margin {avg_mfld:.4f}(σ={mfld_std:.4f}) r1={avg_r1:.4f} "
+                    f"margin {avg_mfld:.4f}(σ={mfld_std:.4f}) same {avg_same:.4f}(m={avg_same_margin:.3f}) r1={avg_r1:.4f} "
                     f"jac={avg_jac:.4f}(cv={jac_cv:.4f}) | "
                     f"dec {avg_dec_a_mean:.4f} rec {avg_dec_c_mean:.4f} | {acc_str} | "
                     f"std {avg_std:.4f} mean {avg_mean:.4f} | lr {lr_val:.2e}"

@@ -3,8 +3,6 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
-import glob
-import re
 import torch
 import torch.nn.functional as F
 
@@ -14,19 +12,11 @@ from train import find_latest_checkpoint
 from data import ByteTokenizer
 
 
-def find_latest_module_dir(base_dir):
-    dirs = glob.glob(os.path.join(base_dir, "module_*"))
-    if not dirs:
-        return base_dir, 0
-    latest = max(dirs, key=lambda d: int(re.search(r"module_(\d+)", d).group(1)))
-    idx = int(re.search(r"module_(\d+)", latest).group(1))
-    return latest, idx
-
-
 def main():
     parser = argparse.ArgumentParser(description="Test Generator→LayerwiseDecoder round-trip on a dataset sample.")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--checkpoint-dir", default=None, help="Override checkpoint directory from config")
+    parser.add_argument("--module", type=int, default=None, help="Module index to run decoder on (default: the module that owns a decoder)")
     parser.add_argument("--n-samples", type=int, default=4, help="Number of sequences to test")
     parser.add_argument("--skip-docs", type=int, default=0, help="Skip N documents before sampling")
     parser.add_argument("--layer", type=int, default=None, help="Layer to show text reconstructions for (default: last)")
@@ -39,43 +29,57 @@ def main():
     if args.checkpoint_dir:
         cfg.checkpoint_dir = args.checkpoint_dir
 
-    base_dir = args.checkpoint_dir or cfg.checkpoint_dir
-    ckpt_dir, module_idx = find_latest_module_dir(base_dir)
-    ckpt_path = args.checkpoint or find_latest_checkpoint(ckpt_dir)
+    ckpt_path = args.checkpoint or find_latest_checkpoint(cfg.checkpoint_dir)
     if not ckpt_path:
         print("No checkpoint found.")
         return
 
-    print(f"Loading final module {module_idx} from {ckpt_path}\n")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     ckpt_cfg = ckpt.get("cfg", cfg)
+
+    # New checkpoint format: a single file holding a list of per-module state_dicts.
+    modules = ckpt.get("modules")
+    if not modules:
+        print("No 'modules' list in this checkpoint.")
+        return
+
+    # Only the decoder-owning module (module 0) carries a layerwise_decoder, and that decoder is
+    # trained to reconstruct from *that* module's latents — so default the probe to it.
+    decoder_modules = [i for i, m in enumerate(modules) if "layerwise_decoder" in m]
+    if args.module is not None:
+        module_idx = args.module
+    elif decoder_modules:
+        module_idx = decoder_modules[0]
+    else:
+        print("No module in this checkpoint owns a layerwise_decoder.")
+        return
+    if not (0 <= module_idx < len(modules)):
+        print(f"--module {module_idx} out of range (checkpoint has {len(modules)} modules, 0..{len(modules)-1})")
+        return
+
+    print(f"Loading module {module_idx} from {ckpt_path}\n")
 
     # Load all previous frozen modules to compute prev_latent
     prev_generators = []
     for i in range(module_idx):
-        prev_ckpt_dir = os.path.join(base_dir, f"module_{i}")
-        prev_ckpt_path = find_latest_checkpoint(prev_ckpt_dir)
-        if not prev_ckpt_path:
-            print(f"No checkpoint found for module {i} in {prev_ckpt_dir}")
-            return
-        prev_ckpt = torch.load(prev_ckpt_path, map_location=device, weights_only=False)
         prev_gen = Generator(ckpt_cfg, layer_idx=i).to(device)
-        prev_gen.load_state_dict(prev_ckpt["generator"], strict=False)
+        prev_gen.load_state_dict(modules[i]["generator"], strict=False)
         prev_gen.eval()
         for p in prev_gen.parameters():
             p.requires_grad_(False)
         prev_generators.append(prev_gen)
-        print(f"  Loaded frozen module {i} from {prev_ckpt_path}")
+        print(f"  Loaded frozen module {i}")
 
+    final_state = modules[module_idx]
     final_generator = Generator(ckpt_cfg, layer_idx=module_idx).to(device)
-    final_generator.load_state_dict(ckpt["generator"], strict=False)
+    final_generator.load_state_dict(final_state["generator"], strict=False)
     final_generator.eval()
 
-    if "layerwise_decoder" not in ckpt:
-        print("No layerwise_decoder in this checkpoint.")
+    if "layerwise_decoder" not in final_state:
+        print("No layerwise_decoder in this module's checkpoint.")
         return
     layerwise_decoder = LayerwiseDecoder(ckpt_cfg).to(device)
-    layerwise_decoder.load_state_dict(ckpt["layerwise_decoder"])
+    layerwise_decoder.load_state_dict(final_state["layerwise_decoder"])
     layerwise_decoder.eval()
 
     n_layers = ckpt_cfg.n_layers
