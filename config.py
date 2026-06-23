@@ -15,7 +15,7 @@ class Config:
     predictor_dim: int = 192     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
 
 
-    # Number of positions per sample (per block) replaced with real embeddings instead of null
+    # Number of positions per sample (per block) replaced with real embeddings instead of null. Makes sure that reconstruction loss pusehes the net to use the incomming data if it is avalible
     n_clean_tokens: int = 2
 
     # How often to train the layerwise decoder probes
@@ -101,14 +101,14 @@ class Config:
     grad_clip: float = 1.0
 
     # Multi-module training
-    n_modules: int = 3
+    n_modules: int = 5
     # Per-module prediction horizon: module i predicts its own latent h_i tokens ahead by masking the
     # gen-stream cross-attention to <= t - h_i (clean/target stream is unchanged). Higher modules look
-    # further ahead, which forces them to drop unpredictable detail (the "leaves"). Module 0 must stay
+    # further ahead, which forces them to drop unpredictable detail. Module 0 must stay
     # at 1 (it is the byte-level next-char predictor, grounded by the decoder). len must == n_modules.
     # The gap g_i = h_{i+1} - h_i also sets the top-down look-ahead feed shift and the bottom-up input
     # shift between modules i and i+1. (1, 1, ...) reproduces the original same-horizon behaviour.
-    prediction_horizons: tuple = (1, 2, 4)
+    prediction_horizons: tuple = (1, 2, 4, 8, 16)
     # Variable-horizon "reveal": fraction of training steps on which a module's gen/prediction stream
     # drops its horizon mask back to strict-causal (offset 1) so it DOES attend the otherwise-masked
     # window (t-h, t-1]. The clean encoder is shared between the target and the KV the gen attends to,
@@ -129,7 +129,7 @@ class Config:
     cross_module_pred_grad: bool = True #CHANGE 2919000 Again 3521000
     # Scale applied to that cross-module gradient only (the fed value is unchanged). Auxiliary on top of
     # the predictor's own loss — keep small.
-    cross_module_pred_grad_weight: float = 0.05
+    cross_module_pred_grad_weight: float = 0.15
     # Let that cross-module gradient reach module i+1's CONTEXT GENERATOR as well as its predictor, so
     # the higher module also shapes its representation to be useful downstream. Still one hop only —
     # the generator's own inputs are the detached up-threaded latents (Phase A), so it never reaches

@@ -287,10 +287,10 @@ class Generator(nn.Module):
         corrupt_fn: optional callable(clean_latents, gen_hiddens) -> x_corr tensor [B, T].
                     Called after clean/gen streams are computed but before the corrupt stream runs.
                     Allows the decoder to train on fresh latents and supply hard-negative tokens.
-        thread_genfree: if True, also compute the last block's gen output with the clean-token leak
-                    disabled (under no_grad) and return it as gen_thread. This is the leak-free latent
-                    that should be threaded up to the next module's gen stream, matching inference
-                    (where no leak occurs). gen_thread is None when not requested.
+        thread_genfree: if True, return the last block's gen output as gen_thread — the latent threaded
+                    up to the next module's gen stream. We reuse the in-graph (with-leak) gen output
+                    rather than recomputing a leak-free copy (train.py detaches it). None when not
+                    requested.
         Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread).
         """
         B, T = x.shape
@@ -341,25 +341,12 @@ class Generator(nn.Module):
             h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=gen_offset)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
-        # ── Leak-free gen output for threading to the next module ─────────────
-        # Each gen block re-inits from null (independent of other blocks), so the last block's
-        # leak-free output is all the next module needs as prev_latent_gen. Computed detached.
-        gen_thread = None
-        if thread_genfree:
-            with torch.no_grad():
-                i = len(self.blocks) - 1
-                block = self.blocks[i]
-                if self.layer_idx == 0:
-                    h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
-                else:
-                    null_char = self.null_embs[i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
-                    h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
-                kv0, kv1, kv2 = cross_kvs[i]
-                h = h + block.input_mlp(h)
-                h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon)
-                h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=self.horizon)
-                h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon)
-                gen_thread = h[:, :, :block.d_out] + block.output_mlp(h)
+        # ── Gen output threaded up to the next module ─────────────────────────
+        # Reuse the (with-leak) last-block gen output rather than recomputing a leak-free copy: the
+        # n_clean_tokens leak touches only a couple positions, so the train/inference mismatch is
+        # negligible, and this saves an extra last-block forward for every non-top module. train.py
+        # detaches it before threading.
+        gen_thread = gen_hiddens[-1] if thread_genfree else None
 
         # ── Corrupt stream ────────────────────────────────────────────────────
         K = self.cfg.corrupt_samples

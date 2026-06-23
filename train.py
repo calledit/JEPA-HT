@@ -9,8 +9,11 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
-torch.backends.cuda.enable_mem_efficient_sdp(False)
+# Efficient/flash SDPA kernels are left ENABLED. (Previously globally disabled, which forced the slow
+# math kernel for every masked attention — the dominant cost for this tiny model.) The only path that
+# needs the math kernel is the Jacobian double-backward, which is scoped to MATH locally below.
 
 from config import Config
 from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder, SamenessEstimator
@@ -587,8 +590,10 @@ def module_predict_gen(
                     char = ms.generator.real_emb.expand(x.shape[0], x.shape[1], -1)
                     emb  = torch.cat([prev_clean.detach(), char + ms.generator.pos_emb(pos)], dim=-1).float().requires_grad_(True)
                 h = emb
-                for block in ms.generator.blocks:
-                    h = block(h.to(next(block.parameters()).dtype)).float()
+                # Double-backward through attention (create_graph below) needs the math kernel.
+                with sdpa_kernel(SDPBackend.MATH):
+                    for block in ms.generator.blocks:
+                        h = block(h.to(next(block.parameters()).dtype)).float()
                 v    = (h[1:] - h[:-1]).detach()
                 v    = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
                 grad = torch.autograd.grad((h[:-1] * v).sum(), emb, create_graph=True)[0]
