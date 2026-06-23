@@ -63,6 +63,22 @@ def gra(loss: torch.Tensor, tensor: torch.Tensor, scale: float = 1.0) -> torch.T
     return loss + scale * (g_centered.detach() * tensor).sum()
 
 
+def _shift_time(t: torch.Tensor, shift: int) -> torch.Tensor:
+    """Shift a [B, T, ...] tensor along the time axis, zero-filling the exposed end.
+    shift > 0 moves content to later positions (out[:, shift:] = t[:, :-shift]) — the bottom-up input
+    feed, so module i+1 reads module i's latent from `shift` positions back. shift < 0 moves content
+    earlier (out[:, :shift] = t[:, -shift:]) — the top-down look-ahead feed, so module i reads module
+    i+1's prediction `-shift` positions ahead. The zero-filled end positions are masked from the loss."""
+    if shift == 0:
+        return t
+    out = torch.zeros_like(t)
+    if shift > 0:
+        out[:, shift:] = t[:, :-shift]
+    else:
+        out[:, :shift] = t[:, -shift:]
+    return out
+
+
 def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     sample_dims = tuple(range(pred.dim() - 1)) if pred.dim() > 1 else (0,)
     pred_res   = pred   - pred.mean(dim=sample_dims, keepdim=True)
@@ -283,12 +299,22 @@ def module_forward(
 
     corrupt_fn = decoder_sample_fn if module_idx == 0 else None
 
+    # Bottom-up input shift: module i+1's gen stream looks `gap` positions further back than module i,
+    # so its prev_latent_gen must come from `gap` positions earlier (out[:, gap:] = gen_i[:, :-gap]).
+    # This keeps module i+1 genuinely h_{i+1}-ahead (otherwise gen_i[p] would leak context up to p-1)
+    # and makes the top-down look-ahead computable at inference. Clean/corrupt prev stay position-aligned
+    # — they build the full-context target/negative manifold, only the prediction stream looks back.
+    prev_gen = prev["gen"]
+    if module_idx > 0 and prev_gen is not None:
+        gap = cfg.prediction_horizons[module_idx] - cfg.prediction_horizons[module_idx - 1]
+        prev_gen = _shift_time(prev_gen, gap)
+
     # ── Forward pass ────────────────────────────────────────────────────────
     with autocast():
         gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread = ms.generator.forward_cross_layerwise(
             x,
             prev_latent_clean=prev["clean"],
-            prev_latent_gen=prev["gen"],
+            prev_latent_gen=prev_gen,
             prev_latent_corrupt=prev["corrupt"],
             x_corr=prev["x_corr"],
             corrupt_fn=corrupt_fn,
@@ -497,23 +523,32 @@ def module_predict_gen(
         toward_zero_losses = []
         repel_losses       = []
         B, T = x.shape
+        # Valid prediction window for this module: [lo, hi) = [h_i, T - g_i). Front cut = empty attention
+        # context (gen sees <= t - h_i); tail cut = no top-down extra (extra_i[t] = pred_{i+1}[t + g_i]).
+        h_i    = cfg.prediction_horizons[module_idx]
+        g_i    = (cfg.prediction_horizons[module_idx + 1] - h_i) if module_idx < cfg.n_modules - 1 else 0
+        lo, hi = h_i, T - g_i
         for l in range(cfg.n_layers):
             disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
             K            = cfg.corrupt_samples
             disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(K, B, T).mean(0)
 
+            # Restrict the prediction loss to the valid window; the gen stream has no meaningful
+            # prediction before `lo` (empty context) or at/after `hi` (no top-down extra).
+            pred_v = preds[l][:, lo:hi]
+            targ_v = target_latents[l + 1].detach()[:, lo:hi]
             if cfg.enable_sameness:
                 # Adversarial attract: push D(pred, target) toward "same" (non-saturating form, so the
                 # predictor still gets gradient while it is far from the target and D is saturated).
-                s_same  = ms.sameness_est(preds[l], target_latents[l + 1].detach())
+                s_same  = ms.sameness_est(pred_v, targ_v)
                 attract = cfg.sameness_weight * F.softplus(-s_same).mean()
                 mse_w   = cfg.mse_attract_weight * max(0.0, 1.0 - local_step / cfg.mse_anneal_steps)
                 if mse_w > 0.0:
-                    attract = attract + mse_w * F.mse_loss(preds[l], target_latents[l + 1].detach())
+                    attract = attract + mse_w * F.mse_loss(pred_v, targ_v)
             else:
-                attract = F.mse_loss(preds[l], target_latents[l + 1].detach())
+                attract = F.mse_loss(pred_v, targ_v)
             if cfg.gradient_residual_amplification and local_step < 30_000:
-                attract = gra(attract, preds[l], cfg.gra_scale)
+                attract = gra(attract, pred_v, cfg.gra_scale)
 
             manifold_stablization = (disc_corrupt - disc_target).mean()
             layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
@@ -531,7 +566,10 @@ def module_predict_gen(
         if module_idx == 0 and cfg.gen_recon_weight > 0.0:
             dec = decoder_ms.layerwise_decoder
             recon_terms = [
-                F.cross_entropy(dec(l, preds[l]).reshape(-1, cfg.vocab_size), x.reshape(-1))
+                F.cross_entropy(
+                    dec(l, preds[l][:, lo:hi]).reshape(-1, cfg.vocab_size),
+                    x[:, lo:hi].reshape(-1),
+                )
                 for l in range(cfg.n_layers)
             ]
             recon_ce  = sum(recon_terms) / cfg.n_layers
@@ -844,12 +882,15 @@ def train():
                 and nxt in ctxs
                 and (step - nxt * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
+            # Top-down look-ahead: module i reads module nxt's prediction `gap` positions ahead
+            # (extra_i[t] = pred_nxt[t + gap]); the last `gap` positions get no extra and are masked.
+            gap = cfg.prediction_horizons[nxt] - cfg.prediction_horizons[i] if feed else 0
             if feed and cfg.cross_module_pred_grad:
                 # Same value as the detached feed, but gradient w.r.t. module nxt scaled by w.
                 w     = cfg.cross_module_pred_grad_weight
-                extra = [fp.detach() + w * (fp - fp.detach()) for fp in feed_preds[nxt]]
+                extra = [_shift_time(fp.detach() + w * (fp - fp.detach()), -gap) for fp in feed_preds[nxt]]
             elif feed:
-                extra = detached_preds[nxt]
+                extra = [_shift_time(p, -gap) for p in detached_preds[nxt]]
             else:
                 extra = None
             # Whether the module below (i-1) will consume a gradient feed from this module this step:

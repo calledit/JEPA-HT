@@ -6,7 +6,9 @@ Usage:
 """
 
 import argparse
+import csv
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,55 @@ import matplotlib.pyplot as plt
 
 def default_log():
     return "checkpoints/training_log.csv"
+
+
+def load_log(path):
+    """Read training_log.csv, tolerating rows that gained columns mid-file.
+
+    When a module is added mid-training the loop appends rows with an extra
+    per-module block (inserted *before* the trailing tok_per_s/elapsed_s
+    columns) but never rewrites the header. The per-module columns follow a
+    fixed, repeating pattern, so we rebuild the header for however many modules
+    the widest row contains (using the existing m0_ block as a template) and
+    align each row by hand: the first columns map to the leading fields, the
+    last columns to the trailing fields, and whatever sits between fills the
+    module blocks left-to-right — so short early rows leave the later modules
+    NaN instead of shoving tok_per_s/elapsed_s into them.
+    """
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return pd.DataFrame()
+    header, data = rows[0], [r for r in rows[1:] if r]
+
+    mod_re  = re.compile(r"^m(\d+)_")
+    mod_idx = [i for i, c in enumerate(header) if mod_re.match(c)]
+    if not mod_idx:                                   # legacy file, no m*_ prefix
+        return pd.read_csv(path)
+
+    front = header[:mod_idx[0]]
+    tail  = header[mod_idx[-1] + 1:]
+    block = [c for c in header if (m := mod_re.match(c)) and m.group(1) == "0"]
+    nf, nt, nb = len(front), len(tail), len(block)
+
+    max_fields = max((len(r) for r in data), default=len(header))
+    n_modules  = max(1, (max_fields - nf - nt) // nb)
+    mid_total  = n_modules * nb
+
+    columns = list(front)
+    for m in range(n_modules):
+        columns += [mod_re.sub(f"m{m}_", c) for c in block]
+    columns += tail
+
+    aligned = []
+    for r in data:
+        f_vals = r[:nf]
+        t_vals = r[len(r) - nt:] if nt else []
+        mid    = r[nf:len(r) - nt] if nt else r[nf:]
+        mid   += [""] * (mid_total - len(mid))        # pad missing later modules
+        aligned.append(f_vals + mid[:mid_total] + t_vals)
+
+    return pd.DataFrame(aligned, columns=columns)
 
 
 def smooth(values, window):
@@ -56,7 +107,7 @@ def main():
     parser.add_argument("--module", type=int, default=0, help="Which module to plot (default 0)")
     args = parser.parse_args()
 
-    df = pd.read_csv(args.log)
+    df = load_log(args.log)
     df = df.apply(pd.to_numeric, errors="coerce")
     df = df.sort_values("step").reset_index(drop=True)
     if args.start > 0:

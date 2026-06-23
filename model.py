@@ -28,16 +28,17 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
         """Q from x, K/V from context using the same qkv weights.
-        Strict causal mask: position i attends only to target positions j < i, not itself.
+        Causal mask shifted by causal_offset: position i attends only to target positions j <= i - offset
+        (offset=1 is the strict next-step mask; offset=h makes this an h-step-ahead prediction).
         Own state is preserved via the residual connection in TransformerBlock.
         """
         B, T, C = x.shape
         q, _, _ = self.qkv(x).split(C, dim=-1)
         k, v = self.get_kv(context)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -45,12 +46,14 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
-    def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Q from x, precomputed K/V — avoids recomputing context projection for shared contexts."""
+    def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         causal_offset: int = 1) -> torch.Tensor:
+        """Q from x, precomputed K/V — avoids recomputing context projection for shared contexts.
+        causal_offset shifts the causal mask to j <= i - offset (h-step-ahead prediction when offset=h)."""
         B, T, C = x.shape
         q, _, _ = self.qkv(x).split(C, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -112,13 +115,14 @@ class TransformerBlock(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn.forward_cross(self.norm1(x), self.norm1(context))
+    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
+        x = x + self.attn.forward_cross(self.norm1(x), self.norm1(context), causal_offset=causal_offset)
         x = x + self.ff(self.norm2(x))
         return x
 
-    def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn.forward_cross_kv(self.norm1(x), k, v)
+    def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         causal_offset: int = 1) -> torch.Tensor:
+        x = x + self.attn.forward_cross_kv(self.norm1(x), k, v, causal_offset=causal_offset)
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -195,6 +199,9 @@ class Generator(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.layer_idx = layer_idx
+        # Prediction horizon for this module: the gen stream cross-attends to clean context <= t - horizon,
+        # so the predictor learns an h-step-ahead forecast (module 0 stays at 1, the byte next-step task).
+        self.horizon = cfg.prediction_horizons[layer_idx]
         d_in = cfg.d_model + cfg.char_emb_dim  # internal block dimension, e.g. 48+16=64
 
         if layer_idx == 0:
@@ -306,6 +313,15 @@ class Generator(nn.Module):
             h_clean = h_out.detach()
 
         # ── Generative (null) stream ──────────────────────────────────────────
+        # Variable-horizon reveal: on a few percent of training steps drop this stream's mask back to
+        # strict-causal (offset 1) so it attends the otherwise-masked window. The clean encoder is
+        # shared between target and KV, so this forces it to keep recent positions informative instead
+        # of dropping the masked-window content (which would make the h-ahead target trivial). offset
+        # stays >= 1, so the target position t is never revealed. gen_thread (threaded up to the next
+        # module) keeps the true horizon, so this is a purely local encoder regularizer.
+        gen_offset = self.horizon
+        if self.training and self.horizon > 1 and torch.rand(1).item() < self.cfg.gen_reveal_prob:
+            gen_offset = 1
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
             if self.layer_idx == 0:
@@ -320,9 +336,9 @@ class Generator(nn.Module):
                 h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             kv0, kv1, kv2 = cross_kvs[i]
             h = h + block.input_mlp(h)
-            h = block.layer1.forward_cross_kv(h, *kv0)
-            h = block.layer2.forward_cross_kv(h, *kv1)
-            h = block.layer3.forward_cross_kv(h, *kv2)
+            h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=gen_offset)
+            h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=gen_offset)
+            h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=gen_offset)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
         # ── Leak-free gen output for threading to the next module ─────────────
@@ -340,9 +356,9 @@ class Generator(nn.Module):
                     h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
                 kv0, kv1, kv2 = cross_kvs[i]
                 h = h + block.input_mlp(h)
-                h = block.layer1.forward_cross_kv(h, *kv0)
-                h = block.layer2.forward_cross_kv(h, *kv1)
-                h = block.layer3.forward_cross_kv(h, *kv2)
+                h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon)
+                h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=self.horizon)
+                h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon)
                 gen_thread = h[:, :, :block.d_out] + block.output_mlp(h)
 
         # ── Corrupt stream ────────────────────────────────────────────────────

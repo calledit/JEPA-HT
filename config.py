@@ -64,7 +64,7 @@ class Config:
     # Keeps module 0 from compressing away character-predictive content when the JEPA / top-down brake
     # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
     # 0.0 = disabled.
-    gen_recon_weight: float = 0.05 #CHANGE 2919000 Again 3521000
+    gen_recon_weight: float = 0.15 #CHANGE 2919000 Again 3521000
 
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
@@ -79,7 +79,7 @@ class Config:
     # sure that small changes in input leads to small changes in output. That said it does stabilize training.
     # But i imagine one could use the jacobian loss to stop the network from falling in to som earliy bad local minima
     # basicly have it on for the first 80 000 steps to make sure that initial training finds a good overarching fit.
-    enable_jacobian_loss: bool = True
+    enable_jacobian_loss: bool = False
     jacobian_weight: float = 0.20
     jacobian_interval: int = 1
     gradient_residual_amplification: bool = True
@@ -101,7 +101,22 @@ class Config:
     grad_clip: float = 1.0
 
     # Multi-module training
-    n_modules: int = 2
+    n_modules: int = 3
+    # Per-module prediction horizon: module i predicts its own latent h_i tokens ahead by masking the
+    # gen-stream cross-attention to <= t - h_i (clean/target stream is unchanged). Higher modules look
+    # further ahead, which forces them to drop unpredictable detail (the "leaves"). Module 0 must stay
+    # at 1 (it is the byte-level next-char predictor, grounded by the decoder). len must == n_modules.
+    # The gap g_i = h_{i+1} - h_i also sets the top-down look-ahead feed shift and the bottom-up input
+    # shift between modules i and i+1. (1, 1, ...) reproduces the original same-horizon behaviour.
+    prediction_horizons: tuple = (1, 2, 4)
+    # Variable-horizon "reveal": fraction of training steps on which a module's gen/prediction stream
+    # drops its horizon mask back to strict-causal (offset 1) so it DOES attend the otherwise-masked
+    # window (t-h, t-1]. The clean encoder is shared between the target and the KV the gen attends to,
+    # so without this the encoder can quietly stop encoding the masked-window content (gen never reads
+    # it) — making the h-ahead target trivial / "ignoring" the masked tokens. A few percent keeps every
+    # position used as a key sometimes, forcing the encoder to keep it informative. Never reveals
+    # position t itself (offset stays >= 1), so the target is never leaked. No-op on module 0 (h=1).
+    gen_reveal_prob: float = 0.05
     module_warmup_steps: int = 50_000  # global steps before module i+1 starts training
     # Top-down prediction feed: once module i+1 has trained this many local steps, its detached
     # prediction is fed into module i's predictor extra slot (before that, a learned null is used).
@@ -136,3 +151,14 @@ class Config:
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def __post_init__(self):
+        assert len(self.prediction_horizons) == self.n_modules, (
+            f"prediction_horizons {self.prediction_horizons} must have n_modules={self.n_modules} entries"
+        )
+        assert self.prediction_horizons[0] == 1, (
+            "module 0 must predict 1 step ahead (it is the byte-level next-char predictor)"
+        )
+        assert all(b >= a for a, b in zip(self.prediction_horizons, self.prediction_horizons[1:])), (
+            f"prediction_horizons {self.prediction_horizons} must be non-decreasing"
+        )
