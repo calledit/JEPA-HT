@@ -50,7 +50,7 @@ representation on them is wasted; the only thing predictable that far out is the
 structure: the topic, the kind of sentence, the register. A high module is therefore pressured to keep
 only that abstract content. Module 0, predicting just the next byte, faces the opposite pressure: the
 next byte is largely fixed by the exact recent characters, so it pays to track them precisely.
-Abstraction is not hoped for as an emergent side effect — it is the direct consequence of the prediction
+Abstraction is not hoped for as an emergent side effect like in a standard LLM, it is the direct consequence of the prediction
 distance, dialled in per module.
 
 **How the modules connect.** Information flows in both directions every step:
@@ -75,7 +75,10 @@ touches characters. The remaining sections describe what happens *inside* one su
 ## Training Architecture
 
 ```
-Input Tokens        erroneus tokens sampled from Decoder
+
+Module setup
+
+Input Token/Latent        erroneus tokens sampled from Decoder/Erroneus and Clean input Latents
      │                        │
      ▼                        ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -95,7 +98,7 @@ Input Tokens        erroneus tokens sampled from Decoder
             │                  │                    │
             │           ┌──────┴──────┐             │
             │           │  Predictor  │             │
-            │           │(for stablity)             │
+            │           │             │             │
             │           └──────┬──────┘             │
             │                  │                    │
             │────► MSE ◄───────┘                    │
@@ -111,7 +114,7 @@ Input Tokens        erroneus tokens sampled from Decoder
 
 -------------------------------------------------------------
 
-                 latent in
+        module 0 predicted latent in
                      │
                      ▼
       ┌─────────────────────────────┐
@@ -135,16 +138,10 @@ This is achieved using a causal mask that is one step behind, with the predictio
 
 **At inference time**, the model first generates a prediction. A sample is then drawn from that prediction and used to generate the correct context state.
 
-Each `DoubleTransformerBlock` is structured to support this:
-```
-input_mlp → layer1 (cross-attn in prediction task / self-attn in context generation task) → layer2 .... → output_mlp
-```
-The `input_mlp` runs first on every forward pass, allowing the block to detect and adapt to whether its input is real data or if it should predict. A small fraction of positions (2 out of every 256) use the real input token instead of the special null token (signaling the prediction task), preventing the model from ignoring real token input entirely at inference time.
-
 
 ## Training Losses
 
-The context generator is trained with a standard MSE loss toward the target latent, plus a stabilization term derived from the manifold estimator (described below).
+The context generator and predictor is trained with a standard MSE loss toward the target latent (standard JEPA), plus a JEPA stabilization term derived from the manifold estimator (described below).
 
 ### Collapse and the Manifold Estimator
 
@@ -152,7 +149,7 @@ A predictive (JEPA) objective trained with MSE has a degenerate optimum. If the 
 
 JEPA-HT avoids it with a learned scoring function, the **Manifold Estimator**, trained as a discriminator: latents from the clean stream (real continuations) should score high, latents from the corrupt stream (incorrect continuations) should score low. The generator is then trained to keep its clean latents scoring high *and* its corrupt latents scoring low. A collapsed, constant latent cannot sit on both sides of that boundary at once, so the only way to satisfy the objective is for the latent to genuinely encode the content that separates a correct continuation from an incorrect one. The collapse optimum is removed without ever imposing a hand-chosen variance or covariance penalty.
 
-The name "**Manifold Estimator** "reflects what this discriminator has to learn. To separate real latents from corrupt ones, it must learn where the valid latents actually lie — the shape of the manifold the generator produces for real data. That structure becomes encoded in the estimator's weights: whatever information the latent space holds about valid continuations is mirrored in the estimator's compute graph as the decision surface that bounds the manifold. The Manifold Estimator is, in effect, a learned model of the JEPA latent manifold itself.
+The name "**Manifold Estimator**" reflects what this discriminator has to learn. To separate real latents from corrupt ones, it must learn where the valid latents actually lie — the shape of the manifold the generator produces for real data. That structure becomes encoded in the estimator's weights: whatever information the latent space holds about valid continuations is mirrored in the estimator's compute graph as the decision surface that bounds the manifold. The Manifold Estimator is, in effect, a learned model of the JEPA latent manifold itself.
 
 ### Self-Generated Contrastive Negatives
 
@@ -162,7 +159,7 @@ The clean and corrupt streams share the same weights and attend to the same cont
 
 This makes the training signal self-correcting. Whenever the generator produces a latent that decodes toward a plausible-but-wrong continuation, that very continuation becomes the negative it is pushed away from. The difficulty of the contrastive task scales automatically with the model's competence: as the model improves, its mistakes grow subtler and so do the negatives. The model paces its own curriculum.
 
-In this respect this part of the setup is closer to reinforcement learning / self-play than to standard language-model pretraining. Standard pretraining regresses toward fixed, teacher-forced labels drawn from a static corpus. Here the negatives are sampled from the model's own current distribution, so the data the loss is measured against is non-stationary and tracks the model as it learns, and the discriminator provides a relative signal (correct vs. incorrect) rather than an absolute target. What make the use here a bit spiecial compared to some other training setups is that this mechanism operates in latent space and is repurposed as the anti-collapse constraint on the encoder rather than as the final training objective.
+In this respect this part of the setup is closer to reinforcement learning / self-play than to standard language-model pretraining. Standard pretraining regresses toward fixed, teacher-forced labels drawn from a static corpus. Here the negatives are sampled from the model's own current distribution, so the data the loss is measured against is non-stationary and tracks the model as it learns, and the discriminator provides a relative signal (correct vs. incorrect) rather than an absolute target. What make the use here a bit special compared to some other training setups is that this mechanism operates in latent space and is repurposed as the anti-collapse constraint on the encoder rather than as the final training objective.
 
 ### Learning Rate and Batch Size
 
