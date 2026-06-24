@@ -346,7 +346,7 @@ def module_forward(
         if r1_computed:
             for l in range(cfg.n_layers):
                 real_in    = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
-                real_score = ms.manifold_est.net(real_in).squeeze(-1)
+                real_score = ms.manifold_est(real_in, apply_dropout=False)
                 grad       = torch.autograd.grad(outputs=real_score.sum(), inputs=real_in, create_graph=True)[0]
                 r1_penalty = r1_penalty + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
         disc_total = disc_base + r1_penalty * cfg.r1_weight
@@ -533,9 +533,9 @@ def module_predict_gen(
         g_i    = (cfg.prediction_horizons[module_idx + 1] - h_i) if module_idx < cfg.n_modules - 1 else 0
         lo, hi = h_i, T - g_i
         for l in range(cfg.n_layers):
-            disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
+            disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(B, T)
             K            = cfg.corrupt_samples
-            disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(K, B, T).mean(0)
+            disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(K, B, T).mean(0)
 
             # Restrict the prediction loss to the valid window; the gen stream has no meaningful
             # prediction before `lo` (empty context) or at/after `hi` (no top-down extra).

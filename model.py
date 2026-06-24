@@ -506,13 +506,25 @@ class LayerwisePredictor(nn.Module):
 
 
 class ManifoldEstimator(nn.Module):
-    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative."""
+    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative.
+
+    Feature masking (when training the discriminator): a random ~manifold_feature_dropout fraction of
+    the input dims is hidden each forward, forcing D to read validity from MANY dims rather than leaning
+    on a few — so its gradient into the encoder (dD/dh) shapes all dims and fights dimensional collapse.
+    Crucially we do NOT merely zero the hidden dims: a collapsed latent ALSO has near-zero dims, so plain
+    zeroing would teach D that zeros are normal and blunt the very collapse signal it exists to detect.
+    Instead we hide a dim's value AND pass a parallel mask channel (1 = present, 0 = hidden), so D can
+    tell a deliberately-hidden dim from a genuinely-zero (collapsed) one. Input width is therefore
+    2*d_model = [masked_h, mask]. Masking applies only when training D (apply_dropout=True); when D is
+    used as a loss on the encoder (apply_dropout=False) the mask is all-ones, so the floor gradient
+    reflects the full deterministic D."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         D = cfg.d_model
+        self.feat_drop = cfg.manifold_feature_dropout
         self.net = nn.Sequential(
-            nn.Linear(D,     D * 2, bias=False), nn.GELU(),
+            nn.Linear(2 * D, D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
             nn.Linear(D * 4, D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D,     bias=False), nn.GELU(),
@@ -524,8 +536,15 @@ class ManifoldEstimator(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h).squeeze(-1)
+    def forward(self, h: torch.Tensor, apply_dropout: bool = True) -> torch.Tensor:
+        # mask channel: 1 = dim present, 0 = dim hidden. Hidden dims have their value removed (so D can't
+        # read them) but are flagged by the channel (so D doesn't mistake them for a collapsed zero).
+        if apply_dropout and self.training and self.feat_drop > 0.0:
+            mask = (torch.rand_like(h) >= self.feat_drop).to(h.dtype)
+            h = h * mask
+        else:
+            mask = torch.ones_like(h)
+        return self.net(torch.cat([h, mask], dim=-1)).squeeze(-1)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

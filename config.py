@@ -68,11 +68,14 @@ class Config:
 
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
-    # Feature dropout on the ManifoldEstimator's input latent. Randomly zeros this fraction of the
-    # d_model dims (rescaling the rest) before the discriminator, so it cannot detect on/off-manifold
-    # from a few dims — forcing the manifold floor's gradient (dD/dh) to shape ALL dims and spreading
-    # the representation across the latent instead of collapsing into a low-dim subspace. 0.0 = off.
-    manifold_feature_dropout: float = 0.0
+    # Feature masking on the ManifoldEstimator's input latent (discriminator-training only). Randomly
+    # HIDES this fraction of the d_model dims so D must read validity from many dims, not a few —
+    # forcing the manifold floor's gradient (dD/dh) to shape ALL dims and spreading the representation
+    # instead of collapsing into a low-dim subspace. A hidden dim's value is removed AND flagged via a
+    # parallel mask channel (input becomes 2*d_model), so D never mistakes a deliberately-hidden dim for
+    # a genuinely-zero (collapsed) one — which plain zeroing dropout did, blunting collapse detection.
+    # 0.0 = off. (Changing this reshapes D's first layer; old checkpoints reinit the discriminator.)
+    manifold_feature_dropout: float = 0.04
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
     r1_weight: float = 0.10
