@@ -9,10 +9,9 @@ Key contributions:
 - **Novel JEPA training setup:**
     - JEPA training always pushes the latent manifold towards zero, to stop that we train a secondary model "the Manifold Estimator". That model is then use to stablize the manifold.
 - Solves the representational lag present in standard causal transformers.
-- Enables compartmentalized training of neural networks.
+- Enables partially compartmentalized training of neural networks.
     - Training time to convergence grows exponentially with parameter count. Training many small networks sequentially mitigates this exponential growth.
-    - Each module is independently reusable; the same module can serve sentence embedding and next-token prediction.
-- Module outputs can be concatenated and used as input to subsequent modules, allowing the effective context window to grow without retraining the full network. Possibly eliminating the exponential growth of context length.
+    - As lower layer modules reach maturity they can be frozen.
 
 
 
@@ -23,13 +22,12 @@ property is what each module predicts: **its own latent representation some dist
 That prediction distance — the *horizon* — is the only thing that differs between modules, and it is what
 manufactures the abstraction hierarchy.
 
-**The target is a summary, not a far-off token.** This is the key idea to keep straight. The latent at
-position `t` is not a representation of the single byte at `t` — it is a running summary of *the entire
-text up to and including `t`* (a sufficient statistic of the prefix). So when module 7 predicts its latent
-128 positions ahead, it is **not** predicting the byte 128 steps away. It is predicting the *summary of
-the conversation as it will stand 128 bytes from now* — a representation that lossily captures the whole
-span of the next 128 tokens at once, compressed into a single vector. Predicting far ahead therefore means
-"predict the gist of everything about to happen," not "predict one distant character."
+**What the target actually is.** The latent at position `t` is a running summary of *the entire text up
+to and including `t`* — a single vector that compresses the whole prefix (a sufficient statistic of it).
+So when module 7 predicts its latent 128 positions ahead, the thing it is predicting is *the summary of
+the conversation as it will stand 128 bytes from now*: a representation that lossily captures the whole
+span of the next 128 tokens at once. Predicting far ahead therefore means predicting the gist of
+everything about to happen — not pinning down one distant character.
 
 ```
   abstraction          module     horizon   predicts its own latent…        what that latent summarises
