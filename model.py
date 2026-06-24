@@ -313,15 +313,12 @@ class Generator(nn.Module):
             h_clean = h_out.detach()
 
         # ── Generative (null) stream ──────────────────────────────────────────
-        # Variable-horizon reveal: on a few percent of training steps drop this stream's mask back to
-        # strict-causal (offset 1) so it attends the otherwise-masked window. The clean encoder is
-        # shared between target and KV, so this forces it to keep recent positions informative instead
-        # of dropping the masked-window content (which would make the h-ahead target trivial). offset
-        # stays >= 1, so the target position t is never revealed. gen_thread (threaded up to the next
-        # module) keeps the true horizon, so this is a purely local encoder regularizer.
-        gen_offset = self.horizon
-        if self.training and self.horizon > 1 and torch.rand(1).item() < self.cfg.gen_reveal_prob:
-            gen_offset = 1
+        # The gen stream is strict-causal (offset 1) for every module: gen[t] cross-attends clean KV at
+        # positions <= t-1. Offset stays at 1 (not 0) so gen[t] can never read clean[t], its own target.
+        # The prediction horizon no longer lives in this mask — it lives entirely in the target offset
+        # (train.py: the MSE target is clean[t + h_i - 1]), so clean and gen now share one mask and the
+        # encoder behaves identically at train and inference. (Old gen_reveal_prob is obsolete.)
+        gen_offset = 1
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
             if self.layer_idx == 0:
@@ -482,11 +479,20 @@ class LayerwisePredictor(nn.Module):
 
 
 class ManifoldEstimator(nn.Module):
-    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative."""
+    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative.
+
+    Feature dropout on the input forces the discriminator to spread its validity detection across many
+    dimensions: any small subset it might lean on can be masked out, so it must read signal from many
+    dims. Since the manifold floor's gradient into the encoder is dD/dh, broadening D's support
+    broadens the anti-collapse pressure to (over steps) every dimension — preventing the latent from
+    collapsing into a few dims that alone "look valid". Active only in train mode (identity at eval),
+    and only while training the discriminator itself — disabled (apply_dropout=False) when D is used as
+    a loss on the encoder, so the manifold floor gradient reflects the full deterministic D."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         D = cfg.d_model
+        self.feat_drop = nn.Dropout(cfg.manifold_feature_dropout)
         self.net = nn.Sequential(
             nn.Linear(D,     D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
@@ -500,7 +506,11 @@ class ManifoldEstimator(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, apply_dropout: bool = True) -> torch.Tensor:
+        # apply_dropout=True when training the discriminator (spread its support across dims);
+        # apply_dropout=False when D is used as a loss on the encoder, so the manifold floor
+        # gradient dD/dh reflects the full deterministic discriminator rather than a masked subset.
+        h = self.feat_drop(h) if apply_dropout else h
         return self.net(h).squeeze(-1)
 
     def num_params(self) -> int:

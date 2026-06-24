@@ -68,6 +68,11 @@ class Config:
 
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
+    # Feature dropout on the ManifoldEstimator's input latent. Randomly zeros this fraction of the
+    # d_model dims (rescaling the rest) before the discriminator, so it cannot detect on/off-manifold
+    # from a few dims — forcing the manifold floor's gradient (dD/dh) to shape ALL dims and spreading
+    # the representation across the latent instead of collapsing into a low-dim subspace. 0.0 = off.
+    manifold_feature_dropout: float = 0.0
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
     r1_weight: float = 0.10
@@ -101,21 +106,16 @@ class Config:
     grad_clip: float = 1.0
 
     # Multi-module training
-    n_modules: int = 5
-    # Per-module prediction horizon: module i predicts its own latent h_i tokens ahead by masking the
-    # gen-stream cross-attention to <= t - h_i (clean/target stream is unchanged). Higher modules look
-    # further ahead, which forces them to drop unpredictable detail. Module 0 must stay
-    # at 1 (it is the byte-level next-char predictor, grounded by the decoder). len must == n_modules.
-    # The gap g_i = h_{i+1} - h_i also sets the top-down look-ahead feed shift and the bottom-up input
-    # shift between modules i and i+1. (1, 1, ...) reproduces the original same-horizon behaviour.
-    prediction_horizons: tuple = (1, 2, 4, 8, 16)
-    # Variable-horizon "reveal": fraction of training steps on which a module's gen/prediction stream
-    # drops its horizon mask back to strict-causal (offset 1) so it DOES attend the otherwise-masked
-    # window (t-h, t-1]. The clean encoder is shared between the target and the KV the gen attends to,
-    # so without this the encoder can quietly stop encoding the masked-window content (gen never reads
-    # it) — making the h-ahead target trivial / "ignoring" the masked tokens. A few percent keeps every
-    # position used as a key sometimes, forcing the encoder to keep it informative. Never reveals
-    # position t itself (offset stays >= 1), so the target is never leaked. No-op on module 0 (h=1).
+    n_modules: int = 8
+    # Per-module prediction horizon: module i predicts its own latent f_i = h_i - 1 positions ahead.
+    # The gen stream is strict-causal (offset 1) for every module — it cross-attends clean context
+    # <= t-1 — and the horizon lives entirely in the target offset: the MSE target is clean[t + f_i].
+    # Higher modules predict further ahead, which forces them to drop unpredictable detail. Module 0
+    # must stay at 1 (f_0 = 0, a same-position byte-level next-char predictor grounded by the decoder).
+    # len must == n_modules. Bottom-up gen feed and top-down extra feed are both position-aligned now.
+    prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
+    # OBSOLETE: with the gen stream always at offset 1 there is no horizon mask to "reveal". Kept only
+    # so old checkpoints/configs load; no longer read by the model.
     gen_reveal_prob: float = 0.05
     module_warmup_steps: int = 50_000  # global steps before module i+1 starts training
     # Top-down prediction feed: once module i+1 has trained this many local steps, its detached

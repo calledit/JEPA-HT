@@ -16,6 +16,67 @@ Key contributions:
 
 
 
+## The Abstraction Hierarchy
+
+The system is a stack of independent JEPA modules (currently 8), each a small transformer. The defining
+property is what each module predicts: **its own latent representation some distance into the future.**
+That prediction distance — the *horizon* — is the only thing that differs between modules, and it is what
+manufactures the abstraction hierarchy.
+
+**The target is a summary, not a far-off token.** This is the key idea to keep straight. The latent at
+position `t` is not a representation of the single byte at `t` — it is a running summary of *the entire
+text up to and including `t`* (a sufficient statistic of the prefix). So when module 7 predicts its latent
+128 positions ahead, it is **not** predicting the byte 128 steps away. It is predicting the *summary of
+the conversation as it will stand 128 bytes from now* — a representation that lossily captures the whole
+span of the next 128 tokens at once, compressed into a single vector. Predicting far ahead therefore means
+"predict the gist of everything about to happen," not "predict one distant character."
+
+```
+  abstraction          module     horizon   predicts its own latent…        what that latent summarises
+  ───────────────────────────────────────────────────────────────────────────────────────────────────
+     most abstract     module 7   h = 128    the summary 127 positions ahead the whole next ~128-byte span
+          ▲            module 6   h = 64       "       63 ahead                       ⋮  (lossy gist)
+          │            module 5   h = 32       "       31 ahead
+          │            module 4   h = 16       "       15 ahead              a clause / phrase's worth
+          │            module 3   h =  8        "        7 ahead
+          │            module 2   h =  4        "        3 ahead             a word / sub-word's worth
+          │            module 1   h =  2        "        1 ahead
+     most concrete     module 0   h =  1       the next byte (0 ahead)       the exact characters so far
+  ───────────────────────────────────────────────────────────────────────────────────────────────────
+                                  ▲ bytes in        ▼ next-byte logits out (module 0's decoder)
+```
+
+**Why predicting further ahead forces abstraction.** Because each target is a summary-of-the-prefix, a
+longer horizon asks the module to summarise a future prefix that includes a longer stretch of
+not-yet-seen text. The exact characters in that stretch are unknowable, so any capacity spent trying to
+pin them down is wasted; the only thing predictable about "the summary 128 bytes from now" is its coarse
+structure — the topic, the kind of sentence, the register. The module is therefore *pressured* to keep a
+representation in which only horizon-survivable, abstract content is encoded, because that is the only
+content its own prediction can ever match. Module 0, at horizon 1, faces the opposite pressure: the next
+byte is largely determined by the exact recent characters, so it pays to track them precisely. Abstraction
+is not hoped for as an emergent side effect — it is the direct consequence of the prediction distance,
+dialled in per module. (Mechanically the horizon lives in how far ahead the training target is sampled;
+the module's context window itself is always strict-causal.)
+
+**How the modules connect.** Information flows in both directions every step:
+
+- **Bottom-up:** module 0 encodes the raw bytes; its latent is detached and handed to module 1 as that
+  module's only input; module 1's latent feeds module 2, and so on. Modules 1+ have **no character
+  table at all** — everything they know about the text arrives as the compressed latent from below. Each
+  level builds its abstraction on top of the level beneath it.
+- **Top-down:** the higher (more abstract) module's *prediction* is fed back down into the module below
+  as a look-ahead conditioning hint ("the gist is heading here — use it"). Only module 0 ever converts a
+  latent back into characters, via its byte decoder; the modules above act as a top-down plan that biases
+  that byte-level prediction.
+
+**Contrast with a standard LLM.** A conventional decoder-only transformer is one stack trained by a single
+next-token cross-entropy loss; abstraction, if it appears, is an implicit by-product distributed opaquely
+across layers, and every layer ultimately serves the same token-prediction objective. Here each module has
+its **own** self-supervised objective (predict my own latent, h steps ahead), is trained largely
+independently of the others, predicts **vectors rather than token distributions** (MSE, not cross-entropy),
+and occupies an **explicit, named rung** on the abstraction ladder set by its horizon. Only the bottom rung
+touches characters. The remaining sections describe what happens *inside* one such module.
+
 ## Training Architecture
 
 ```
