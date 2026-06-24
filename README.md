@@ -18,43 +18,40 @@ Key contributions:
 ## The Abstraction Hierarchy
 
 The system is a stack of independent JEPA modules (currently 8), each a small transformer. The defining
-property is what each module predicts: **its own latent representation some distance into the future.**
-That prediction distance — the *horizon* — is the only thing that differs between modules, and it is what
-manufactures the abstraction hierarchy.
+property is what each module predicts: **its own latent some distance into the future.** That distance —
+the *horizon* `h` — is the only thing that differs between modules, and it is what manufactures the
+abstraction hierarchy. Module 0 predicts just one step ahead (the next byte); module 7 predicts 128 ahead.
 
-**What the target actually is.** The latent at position `t` is a running summary of *the entire text up
-to and including `t`* — a single vector that compresses the whole prefix (a sufficient statistic of it).
-So when module 7 predicts its latent 128 positions ahead, the thing it is predicting is *the summary of
-the conversation as it will stand 128 bytes from now*: a representation that lossily captures the whole
-span of the next 128 tokens at once. Predicting far ahead therefore means predicting the gist of
-everything about to happen — not pinning down one distant character.
+**What the target is.** The latent at position `t` is a running summary of *the entire text up to and
+including `t`* — a single vector that compresses the whole prefix (a sufficient statistic of it). A
+module predicts this summary from a vantage point `h` bytes back: its predictor only sees context up to
+`t-h` and must produce the summary at the current position `t`. So it is always forecasting its own
+latent `h` steps beyond where its view ends — a little ahead for the low modules, far ahead for the high
+ones.
 
 ```
-  abstraction          module     horizon   predicts its own latent…        what that latent summarises
-  ───────────────────────────────────────────────────────────────────────────────────────────────────
-     most abstract     module 7   h = 128    the summary 127 positions ahead the whole next ~128-byte span
-          ▲            module 6   h = 64       "       63 ahead                       ⋮  (lossy gist)
-          │            module 5   h = 32       "       31 ahead
-          │            module 4   h = 16       "       15 ahead              a clause / phrase's worth
-          │            module 3   h =  8        "        7 ahead
-          │            module 2   h =  4        "        3 ahead             a word / sub-word's worth
-          │            module 1   h =  2        "        1 ahead
-     most concrete     module 0   h =  1       the next byte (0 ahead)       the exact characters so far
-  ───────────────────────────────────────────────────────────────────────────────────────────────────
-                                  ▲ bytes in        ▼ next-byte logits out (module 0's decoder)
+  abstraction          module    horizon   predictor sees      must reconstruct clean[t] relying on…
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+     most abstract     module 7   h = 128   context ≤ t-128     only distant context → coarse, durable gist
+          ▲            module 6   h = 64    context ≤ t-64                   ⋮
+          │            module 5   h = 32    context ≤ t-32
+          │            module 4   h = 16    context ≤ t-16      clause / phrase-level structure
+          │            module 3   h =  8    context ≤ t-8
+          │            module 2   h =  4    context ≤ t-4       word / sub-word shape
+          │            module 1   h =  2    context ≤ t-2
+     most concrete     module 0   h =  1    context ≤ t-1 (all) the exact recent characters → next byte
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+                                  ▲ bytes in       ▼ next-byte logits out (module 0's decoder)
 ```
 
-**Why predicting further ahead forces abstraction.** Because each target is a summary-of-the-prefix, a
-longer horizon asks the module to summarise a future prefix that includes a longer stretch of
-not-yet-seen text. The exact characters in that stretch are unknowable, so any capacity spent trying to
-pin them down is wasted; the only thing predictable about "the summary 128 bytes from now" is its coarse
-structure — the topic, the kind of sentence, the register. The module is therefore *pressured* to keep a
-representation in which only horizon-survivable, abstract content is encoded, because that is the only
-content its own prediction can ever match. Module 0, at horizon 1, faces the opposite pressure: the next
-byte is largely determined by the exact recent characters, so it pays to track them precisely. Abstraction
-is not hoped for as an emergent side effect — it is the direct consequence of the prediction distance,
-dialled in per module. (Mechanically the horizon lives in how far ahead the training target is sampled;
-the module's context window itself is always strict-causal.)
+**Why predicting further ahead forces abstraction.** The further ahead a module must predict, the less
+the exact upcoming characters can be known — they depend on text it cannot see yet. Spending the
+representation on them is wasted; the only thing predictable that far out is the durable, long-range
+structure: the topic, the kind of sentence, the register. A high module is therefore pressured to keep
+only that abstract content. Module 0, predicting just the next byte, faces the opposite pressure: the
+next byte is largely fixed by the exact recent characters, so it pays to track them precisely.
+Abstraction is not hoped for as an emergent side effect — it is the direct consequence of the prediction
+distance, dialled in per module.
 
 **How the modules connect.** Information flows in both directions every step:
 

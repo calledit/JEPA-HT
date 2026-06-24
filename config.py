@@ -107,16 +107,23 @@ class Config:
 
     # Multi-module training
     n_modules: int = 8
-    # Per-module prediction horizon: module i predicts its own latent f_i = h_i - 1 positions ahead.
-    # The gen stream is strict-causal (offset 1) for every module — it cross-attends clean context
-    # <= t-1 — and the horizon lives entirely in the target offset: the MSE target is clean[t + f_i].
-    # Higher modules predict further ahead, which forces them to drop unpredictable detail. Module 0
-    # must stay at 1 (f_0 = 0, a same-position byte-level next-char predictor grounded by the decoder).
-    # len must == n_modules. Bottom-up gen feed and top-down extra feed are both position-aligned now.
+    # Per-module prediction horizon: module i predicts its own latent at the SAME position by masking
+    # the gen-stream cross-attention to clean context <= t - h_i (the clean/target stream is unchanged,
+    # so target = clean[t]). The horizon lives in the mask, NOT the target offset — so the target is a
+    # present-anchored prefix summary and is never a forecast-of-a-forecast (no telescoping). Higher
+    # modules mask a wider recent window, which forces them to drop unpredictable recent detail. Module
+    # 0 must stay at 1 (h_0 = 1, a byte-level next-char predictor grounded by the decoder). len must ==
+    # n_modules. The gap g_i = h_{i+1} - h_i sets the bottom-up gen-feed shift and the top-down extra
+    # look-ahead shift between modules i and i+1.
     prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
-    # OBSOLETE: with the gen stream always at offset 1 there is no horizon mask to "reveal". Kept only
-    # so old checkpoints/configs load; no longer read by the model.
-    gen_reveal_prob: float = 0.05
+    # Stochastic horizon reveal (per-key). A fixed tril(-h) mask means gen[t] never attends keys in the
+    # recent band (t-h, t-1], so the shared encoder stops keeping those positions informative and the
+    # target goes trivial. Instead each recent-band key is revealed INDEPENDENTLY with this probability
+    # (fresh per step and per sample); far context (d >= h) is always visible and the target position t
+    # (d <= 0) never is. Small r keeps the recent window hidden in expectation (preserving abstraction)
+    # while still exercising every recent relative position. No-op on module 0 (h=1, empty band) and at
+    # inference (eval falls back to the deterministic tril(-h)).
+    gen_reveal_prob: float = 0.2
     module_warmup_steps: int = 50_000  # global steps before module i+1 starts training
     # Top-down prediction feed: once module i+1 has trained this many local steps, its detached
     # prediction is fed into module i's predictor extra slot (before that, a learned null is used).

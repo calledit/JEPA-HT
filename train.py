@@ -66,6 +66,22 @@ def gra(loss: torch.Tensor, tensor: torch.Tensor, scale: float = 1.0) -> torch.T
     return loss + scale * (g_centered.detach() * tensor).sum()
 
 
+def _shift_time(t: torch.Tensor, shift: int) -> torch.Tensor:
+    """Shift a [B, T, ...] tensor along the time axis, zero-filling the exposed end.
+    shift > 0 moves content to later positions (out[:, shift:] = t[:, :-shift]) — the bottom-up input
+    feed, so module i+1 reads module i's latent from `shift` positions back. shift < 0 moves content
+    earlier (out[:, :shift] = t[:, -shift:]) — the top-down look-ahead feed, so module i reads module
+    i+1's prediction `-shift` positions ahead. The zero-filled end positions are masked from the loss."""
+    if shift == 0:
+        return t
+    out = torch.zeros_like(t)
+    if shift > 0:
+        out[:, shift:] = t[:, :-shift]
+    else:
+        out[:, :shift] = t[:, -shift:]
+    return out
+
+
 def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     sample_dims = tuple(range(pred.dim() - 1)) if pred.dim() > 1 else (0,)
     pred_res   = pred   - pred.mean(dim=sample_dims, keepdim=True)
@@ -287,10 +303,15 @@ def module_forward(
 
     corrupt_fn = decoder_sample_fn if module_idx == 0 else None
 
-    # Every gen stream is now strict-causal (offset 1), so module i and i+1 both encode context <= t-1
-    # at position t — no bottom-up shift is needed to reconcile differing masks. prev_latent_gen is fed
-    # position-aligned, like prev_clean/prev_corrupt. The horizon lives in the target offset instead.
+    # Bottom-up input shift: module i+1's gen stream looks `gap` positions further back than module i,
+    # so its prev_latent_gen must come from `gap` positions earlier (out[:, gap:] = gen_i[:, :-gap]).
+    # This keeps module i+1 genuinely h_{i+1}-ahead (otherwise gen_i[p] would leak context up to p-1)
+    # and makes the top-down look-ahead computable at inference. Clean/corrupt prev stay position-aligned
+    # — they build the full-context target/negative manifold, only the prediction stream looks back.
     prev_gen = prev["gen"]
+    if module_idx > 0 and prev_gen is not None:
+        gap = cfg.prediction_horizons[module_idx] - cfg.prediction_horizons[module_idx - 1]
+        prev_gen = _shift_time(prev_gen, gap)
 
     # ── Forward pass ────────────────────────────────────────────────────────
     with autocast():
@@ -506,20 +527,20 @@ def module_predict_gen(
         toward_zero_losses = []
         repel_losses       = []
         B, T = x.shape
-        # gen[t] sees clean context <= t-1 (offset 1) and predicts the clean latent f_i positions ahead:
-        # target = clean[t + f_i], f_i = h_i - 1. Front cut: t=0 has empty context. Tail cut: the target
-        # clean[t + f_i] must exist, so t < T - f_i. Module 0 (f_0=0) reduces to a same-position target.
-        f_i    = cfg.prediction_horizons[module_idx] - 1
-        lo, hi = 1, T - f_i
+        # Valid prediction window for this module: [lo, hi) = [h_i, T - g_i). Front cut = empty attention
+        # context (gen sees <= t - h_i); tail cut = no top-down extra (extra_i[t] = pred_{i+1}[t + g_i]).
+        h_i    = cfg.prediction_horizons[module_idx]
+        g_i    = (cfg.prediction_horizons[module_idx + 1] - h_i) if module_idx < cfg.n_modules - 1 else 0
+        lo, hi = h_i, T - g_i
         for l in range(cfg.n_layers):
-            disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(B, T)
+            disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model)).reshape(B, T)
             K            = cfg.corrupt_samples
-            disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(K, B, T).mean(0)
+            disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model)).reshape(K, B, T).mean(0)
 
-            # Restrict the prediction loss to the valid window and shift the target f_i ahead:
-            # pred at position t is compared to the clean latent at t + f_i.
+            # Restrict the prediction loss to the valid window; the gen stream has no meaningful
+            # prediction before `lo` (empty context) or at/after `hi` (no top-down extra).
             pred_v = preds[l][:, lo:hi]
-            targ_v = target_latents[l + 1].detach()[:, lo + f_i : hi + f_i]
+            targ_v = target_latents[l + 1].detach()[:, lo:hi]
             if cfg.enable_sameness:
                 # Adversarial attract: push D(pred, target) toward "same" (non-saturating form, so the
                 # predictor still gets gradient while it is far from the target and D is saturated).
@@ -868,18 +889,15 @@ def train():
                 and nxt in ctxs
                 and (step - nxt * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
-            # Top-down conditioning, position-aligned: extra_i[t] = pred_nxt[t]. Every gen stream is
-            # offset-1, so module i and nxt share the same context budget at position t; nxt simply
-            # predicts a further-out target (clean[t + f_nxt]), so its pred is the look-ahead hint for
-            # module i. No shift: pred_nxt[t] is computed by a shared predictor on valid gen_nxt[t] at
-            # every t (it's just unsupervised past T - f_nxt), so it stays well-defined at module i's
-            # frontier — which is exactly the position autoregressive generation conditions on.
+            # Top-down look-ahead: module i reads module nxt's prediction `gap` positions ahead
+            # (extra_i[t] = pred_nxt[t + gap]); the last `gap` positions get no extra and are masked.
+            gap = cfg.prediction_horizons[nxt] - cfg.prediction_horizons[i] if feed else 0
             if feed and cfg.cross_module_pred_grad:
                 # Same value as the detached feed, but gradient w.r.t. module nxt scaled by w.
                 w     = cfg.cross_module_pred_grad_weight
-                extra = [fp.detach() + w * (fp - fp.detach()) for fp in feed_preds[nxt]]
+                extra = [_shift_time(fp.detach() + w * (fp - fp.detach()), -gap) for fp in feed_preds[nxt]]
             elif feed:
-                extra = detached_preds[nxt]
+                extra = [_shift_time(p, -gap) for p in detached_preds[nxt]]
             else:
                 extra = None
             # Whether the module below (i-1) will consume a gradient feed from this module this step:
@@ -1001,7 +1019,7 @@ def train():
 
                 # Participation ratio of the clean latent: (Σ v_d)² / Σ v_d² over per-dim variances.
                 # Ranges 1..d_model = effective number of dimensions actually carrying variance; a low
-                # value flags dimensional collapse (the thing the manifold feature-dropout fights).
+                # value flags dimensional collapse.
                 part_ratio = 0.0
                 if ms.last_clean is not None:
                     with torch.no_grad():

@@ -61,9 +61,8 @@ def _clean_gen_streams(gen, x, prev_clean=None, prev_gen=None):
     The clean stream encodes the real context with self-attention; the generative stream re-inits each
     block from its null embedding and cross-attends (no clean-token leak) to the clean stream's
     per-layer K/V — exactly as during training but without the corrupt stream or the leak. The gen
-    cross-attention is strict-causal (offset 1) for every module: gen[t] sees clean context <= t-1.
-    Forecasting further ahead lives in the target offset (the predictor is trained against clean[t+f]),
-    not in this mask, so all modules share it — matching training's tril(-1) gen mask.
+    cross-attention uses this module's prediction horizon (gen[t] sees clean context <= t - horizon),
+    so a higher module forecasts further ahead, matching training's tril(-horizon) mask.
 
     Returns (gen_hiddens, clean_last):
       gen_hiddens: list of n_layers tensors [B, T, d_model] — the generative prediction stream.
@@ -95,32 +94,47 @@ def _clean_gen_streams(gen, x, prev_clean=None, prev_gen=None):
             h = gen._build_input(x, prev_gen, char_emb_in=null_char)
         (k0, v0), (k1, v1), (k2, v2) = cross_kvs[i]
         h = h + block.input_mlp(h)
-        h = block.layer1.forward_cross_kv(h, k0, v0, causal_offset=1)
-        h = block.layer2.forward_cross_kv(h, k1, v1, causal_offset=1)
-        h = block.layer3.forward_cross_kv(h, k2, v2, causal_offset=1)
+        h = block.layer1.forward_cross_kv(h, k0, v0, causal_offset=gen.horizon)
+        h = block.layer2.forward_cross_kv(h, k1, v1, causal_offset=gen.horizon)
+        h = block.layer3.forward_cross_kv(h, k2, v2, causal_offset=gen.horizon)
         gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
     return gen_hiddens, clean_last
+
+
+def _shift_time(t: torch.Tensor, shift: int) -> torch.Tensor:
+    """Mirror of train._shift_time. shift > 0 = right shift (bottom-up gen-input shift);
+    shift < 0 = left shift (top-down look-ahead feed). Vacated ends are zero-filled."""
+    if shift == 0:
+        return t
+    out = torch.zeros_like(t)
+    if shift > 0:
+        out[:, shift:] = t[:, :-shift]
+    else:
+        out[:, :shift] = t[:, -shift:]
+    return out
 
 
 @torch.no_grad()
 def _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg, ctx, device):
     """Compute next-token logits for context `ctx` (list of ints).
 
-    Every gen stream is strict-causal (offset 1) and the prediction horizon lives in the target offset,
-    so all conditioning is position-aligned: module 0's next-token prediction at index P = len(ctx)
-    reads module 1's prediction at P, which reads module 2's at P, ... all at the single index P. So we
-    append just one placeholder position. gen[P] cross-attends clean context <= P-1 only, so the garbage
-    placeholder token at index P never leaks in.
+    Pads `horizons[top]` placeholder positions: module 0 needs its prediction at the next-token index
+    P = len(ctx), whose top-down `extra` is the module-above prediction at P + gap, recursively up the
+    active chain to index P + (horizons[top] - 1). All those positions only ever cross-attend to clean
+    context <= P-1 (each module's gen mask is tril(-horizon)), so the garbage at placeholder positions
+    never leaks in — this is exactly what makes the look-ahead inference-computable.
 
-    Runs bottom-up clean+gen streams per active module (the gen latent threaded up position-aligned,
-    matching training), then top-down per-module predictors (each conditioned on the module above's
-    prediction at the same position via the `extra` slot when the feed is active), then module 0's
-    decoder.
+    Runs bottom-up clean+gen streams per active module (the gen latent threaded up is right-shifted by
+    the inter-module horizon gap, matching training's bottom-up input shift), then top-down per-module
+    predictors (each conditioned on the module above's prediction, left-shifted by the gap, via the
+    `extra` slot when the feed is active), and finally module 0's decoder.
     """
     n_layers = cfg.n_layers
     last_layer = n_layers - 1
+    horizons = cfg.prediction_horizons
     P = len(ctx)                       # next-token position
-    x = torch.tensor([list(ctx) + [0]], dtype=torch.long, device=device)  # one placeholder at index P
+    n_pad = horizons[active[-1]]       # placeholders for the top-down look-ahead chain
+    x = torch.tensor([list(ctx) + [0] * n_pad], dtype=torch.long, device=device)
 
     # Bottom-up: clean + generative streams, threading detached latents up the hierarchy.
     gens = {}
@@ -129,14 +143,17 @@ def _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg,
         g, clean_last = _clean_gen_streams(modules[i], x, prev_clean, prev_gen)
         gens[i] = g
         prev_clean = clean_last
-        prev_gen = g[-1]               # position-aligned, like prev_clean
+        # Right-shift the gen latent fed up by the gap to module i+1 so i+1 is genuinely h-ahead.
+        gap_up = (horizons[i + 1] - horizons[i]) if (i + 1) < cfg.n_modules else 0
+        prev_gen = _shift_time(g[-1], gap_up)
 
-    # Top-down: each module's predictor, conditioned on the module above's prediction (same position).
+    # Top-down: each module's predictor, conditioned on the module above's prediction when fed.
     preds = {}
     for i in reversed(active):
         nxt = i + 1
         if feed_active.get(i, False) and nxt in preds:
-            extra_list = preds[nxt]    # position-aligned: extra_i[t] = pred_nxt[t]
+            gap = horizons[nxt] - horizons[i]
+            extra_list = [_shift_time(p, -gap) for p in preds[nxt]]  # look-ahead: extra_i[t] = pred_nxt[t+gap]
         else:
             extra_list = None
         preds[i] = [

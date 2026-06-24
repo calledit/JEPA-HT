@@ -47,16 +47,19 @@ class CausalSelfAttention(nn.Module):
         return self.out_proj(y)
 
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                         causal_offset: int = 1) -> torch.Tensor:
+                         causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """Q from x, precomputed K/V — avoids recomputing context projection for shared contexts.
-        causal_offset shifts the causal mask to j <= i - offset (h-step-ahead prediction when offset=h)."""
+        causal_offset shifts the causal mask to j <= i - offset (h-step-ahead prediction when offset=h).
+        attn_mask: optional precomputed boolean mask (True = attend) that overrides causal_offset —
+        used for the stochastic horizon mask (the deterministic tril is built here when it's None)."""
         B, T, C = x.shape
         q, _, _ = self.qkv(x).split(C, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
+        if attn_mask is None:
+            attn_mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
         y = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=mask,
+            attn_mask=attn_mask,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
@@ -121,8 +124,8 @@ class TransformerBlock(nn.Module):
         return x
 
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                         causal_offset: int = 1) -> torch.Tensor:
-        x = x + self.attn.forward_cross_kv(self.norm1(x), k, v, causal_offset=causal_offset)
+                         causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        x = x + self.attn.forward_cross_kv(self.norm1(x), k, v, causal_offset=causal_offset, attn_mask=attn_mask)
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -271,6 +274,22 @@ class Generator(nn.Module):
             hiddens.append(h)
         return hiddens
 
+    def _build_stochastic_gen_mask(self, B: int, T: int, device) -> torch.Tensor:
+        """Per-sample stochastic horizon mask for the gen stream, shape [B, 1, T, T] (True = attend).
+
+        Distance d = i - j between query i and key j. Far context (d >= horizon) is always visible;
+        recent-band keys (1 <= d < horizon) are each revealed independently with prob gen_reveal_prob;
+        keys at j >= i (d <= 0) are never visible, so the target position i is never leaked. With
+        horizon == 1 the recent band is empty and this reduces to a plain tril(-1)."""
+        h = self.horizon
+        i = torch.arange(T, device=device).view(T, 1)
+        j = torch.arange(T, device=device).view(1, T)
+        d = i - j
+        far    = d >= h                                   # [T, T] always-visible far context
+        recent = (d >= 1) & (d < h)                       # [T, T] maskable recent band
+        reveal = (torch.rand(B, T, T, device=device) < self.cfg.gen_reveal_prob) & recent.unsqueeze(0)
+        return (far.unsqueeze(0) | reveal).unsqueeze(1)   # [B, 1, T, T]
+
     def forward_cross_layerwise(self, x: torch.Tensor,
                                 prev_latent_clean: torch.Tensor = None,
                                 prev_latent_gen: torch.Tensor = None,
@@ -313,12 +332,19 @@ class Generator(nn.Module):
             h_clean = h_out.detach()
 
         # ── Generative (null) stream ──────────────────────────────────────────
-        # The gen stream is strict-causal (offset 1) for every module: gen[t] cross-attends clean KV at
-        # positions <= t-1. Offset stays at 1 (not 0) so gen[t] can never read clean[t], its own target.
-        # The prediction horizon no longer lives in this mask — it lives entirely in the target offset
-        # (train.py: the MSE target is clean[t + h_i - 1]), so clean and gen now share one mask and the
-        # encoder behaves identically at train and inference. (Old gen_reveal_prob is obsolete.)
-        gen_offset = 1
+        # Horizon mask with a STOCHASTIC reveal (training only). The deterministic mask is tril(-h):
+        # gen[t] attends clean context <= t-h. But a fixed tril(-h) means a query at t NEVER attends
+        # keys in the recent band (t-h, t-1], so the shared encoder never learns to keep those
+        # positions informative (it can drop the masked-window content and make the target trivial).
+        # Instead of the old all-or-nothing per-step reveal, we reveal each recent-band key
+        # INDEPENDENTLY with probability cfg.gen_reveal_prob, fresh per step and per sample:
+        #   far context (d = t-j >= h): always visible        recent band (1 <= d < h): visible w.p. r
+        #   j >= t: never visible (the target position t is never leaked)
+        # So every recent relative position is exercised on most steps, partially, keeping the encoder
+        # honest while the expectation still hides the recent window (preserving the abstraction). At
+        # inference (eval) we fall back to the deterministic tril(-h) — the module's characteristic mask.
+        use_stochastic = self.training and self.horizon > 1
+        gen_mask = self._build_stochastic_gen_mask(B, T, x.device) if use_stochastic else None
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
             if self.layer_idx == 0:
@@ -333,9 +359,10 @@ class Generator(nn.Module):
                 h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             kv0, kv1, kv2 = cross_kvs[i]
             h = h + block.input_mlp(h)
-            h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=gen_offset)
-            h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=gen_offset)
-            h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=gen_offset)
+            # When gen_mask is None (module 0 or eval) the tril(-horizon) is built inside from causal_offset.
+            h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon, attn_mask=gen_mask)
+            h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=self.horizon, attn_mask=gen_mask)
+            h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon, attn_mask=gen_mask)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
         # ── Gen output threaded up to the next module ─────────────────────────
@@ -479,20 +506,11 @@ class LayerwisePredictor(nn.Module):
 
 
 class ManifoldEstimator(nn.Module):
-    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative.
-
-    Feature dropout on the input forces the discriminator to spread its validity detection across many
-    dimensions: any small subset it might lean on can be masked out, so it must read signal from many
-    dims. Since the manifold floor's gradient into the encoder is dD/dh, broadening D's support
-    broadens the anti-collapse pressure to (over steps) every dimension — preventing the latent from
-    collapsing into a few dims that alone "look valid". Active only in train mode (identity at eval),
-    and only while training the discriminator itself — disabled (apply_dropout=False) when D is used as
-    a loss on the encoder, so the manifold floor gradient reflects the full deterministic D."""
+    """Single-input latent discriminator: clean latents → positive scores, corrupt → negative."""
 
     def __init__(self, cfg: Config):
         super().__init__()
         D = cfg.d_model
-        self.feat_drop = nn.Dropout(cfg.manifold_feature_dropout)
         self.net = nn.Sequential(
             nn.Linear(D,     D * 2, bias=False), nn.GELU(),
             nn.Linear(D * 2, D * 4, bias=False), nn.GELU(),
@@ -506,11 +524,7 @@ class ManifoldEstimator(nn.Module):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, h: torch.Tensor, apply_dropout: bool = True) -> torch.Tensor:
-        # apply_dropout=True when training the discriminator (spread its support across dims);
-        # apply_dropout=False when D is used as a loss on the encoder, so the manifold floor
-        # gradient dD/dh reflects the full deterministic discriminator rather than a masked subset.
-        h = self.feat_drop(h) if apply_dropout else h
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
         return self.net(h).squeeze(-1)
 
     def num_params(self) -> int:
