@@ -38,24 +38,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
-        """Q from x, K/V from context using the same qkv weights.
-        Causal mask shifted by causal_offset: position i attends only to target positions j <= i - offset
-        (offset=1 is the strict next-step mask; offset=h makes this an h-step-ahead prediction).
-        Own state is preserved via the residual connection in TransformerBlock.
-        """
-        B, T, C = x.shape
-        q = F.linear(x, self.qkv.weight[:C])  # Q-only; K/V come from context
-        k, v = self.get_kv(context)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = self._causal_mask(T, causal_offset, x.device)
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=mask,
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(y)
-
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """Q from x, precomputed K/V — avoids recomputing context projection for shared contexts.
@@ -87,19 +69,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y), k, v
 
-    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
-        """Single-token forward attending to cached past K, V."""
-        B, T_new, C = x.shape
-        q, k_new, v_new = self.qkv(x).split(C, dim=-1)
-        q     = q.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        k_new = k_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        v_new = v_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        k = torch.cat([past_k, k_new], dim=2)
-        v = torch.cat([past_v, v_new], dim=2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(B, T_new, C)
-        return self.out_proj(y), k, v
-
 
 class FeedForward(nn.Module):
     def __init__(self, d_model: int):
@@ -129,11 +98,6 @@ class TransformerBlock(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
-        x = x + self.attn.forward_cross(self.norm1(x), self.norm1(context), causal_offset=causal_offset)
-        x = x + self.ff(self.norm2(x))
-        return x
-
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
         x = x + self.attn.forward_cross_kv(self.norm1(x), k, v, causal_offset=causal_offset, attn_mask=attn_mask)
@@ -142,12 +106,6 @@ class TransformerBlock(nn.Module):
 
     def forward_kv(self, x: torch.Tensor):
         attn_out, k, v = self.attn.forward_kv(self.norm1(x))
-        x = x + attn_out
-        x = x + self.ff(self.norm2(x))
-        return x, k, v
-
-    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
-        attn_out, k, v = self.attn.forward_with_cache(self.norm1(x), past_k, past_v)
         x = x + attn_out
         x = x + self.ff(self.norm2(x))
         return x, k, v
@@ -189,23 +147,6 @@ class DoubleTransformerBlock(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         return x[:, :, :self.d_out] + self.output_mlp(x)
-
-    def forward_kv(self, x: torch.Tensor):
-        x = x + self.input_mlp(x)
-        x, k1, v1 = self.layer1.forward_kv(x)
-        x, k2, v2 = self.layer2.forward_kv(x)
-        x, k3, v3 = self.layer3.forward_kv(x)
-        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
-
-    def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2, past_kv3):
-        x = x + self.input_mlp(x)
-        pk1, pv1 = past_kv1
-        pk2, pv2 = past_kv2
-        pk3, pv3 = past_kv3
-        x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
-        x, k2, v2 = self.layer2.forward_with_cache(x, pk2, pv2)
-        x, k3, v3 = self.layer3.forward_with_cache(x, pk3, pv3)
-        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
 
 
 class Generator(nn.Module):
@@ -468,39 +409,6 @@ class Generator(nn.Module):
         for block in self.blocks:
             h = block(h)
         return h
-
-    def encode_kv(self, x: torch.Tensor, prev_latent: torch.Tensor = None):
-        """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
-        h = self._build_input(x, prev_latent)
-        kv_cache = []
-        for block in self.blocks:
-            h, kv1, kv2, kv3 = block.forward_kv(h)
-            kv_cache.append((kv1, kv2, kv3))
-        return h[:, -1, :], kv_cache
-
-    def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
-        """Decode a single new token position using a KV cache (layer_idx=0 only)."""
-        pos_tensor = torch.tensor([pos], device=token_id.device)
-        h = self.tok_emb(token_id) + self.pos_emb(pos_tensor)
-        new_kv = []
-        for block, (kv1, kv2, kv3) in zip(self.blocks, kv_cache):
-            h, new_kv1, new_kv2, new_kv3 = block.forward_with_cache(h, kv1, kv2, kv3)
-            new_kv.append((new_kv1, new_kv2, new_kv3))
-        return h[:, 0, :], new_kv
-
-    @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int,
-                 temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -self.cfg.context_length:]
-            logits = self(ctx)[:, -1, :]
-            if temperature != 1.0:
-                logits = logits / temperature
-            if top_k is not None:
-                v, _ = logits.topk(min(top_k, logits.size(-1)))
-                logits[logits < v[:, -1:]] = float("-inf")
-            idx = torch.cat([idx, torch.multinomial(F.softmax(logits, dim=-1), 1)], dim=1)
-        return idx
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
