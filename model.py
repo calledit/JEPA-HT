@@ -38,24 +38,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
-        """Q from x, K/V from context using the same qkv weights.
-        Causal mask shifted by causal_offset: position i attends only to target positions j <= i - offset
-        (offset=1 is the strict next-step mask; offset=h makes this an h-step-ahead prediction).
-        Own state is preserved via the residual connection in TransformerBlock.
-        """
-        B, T, C = x.shape
-        q = F.linear(x, self.qkv.weight[:C])  # Q-only; K/V come from context
-        k, v = self.get_kv(context)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = self._causal_mask(T, causal_offset, x.device)
-        y = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=mask,
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(y)
-
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """Q from x, precomputed K/V — avoids recomputing context projection for shared contexts.
@@ -129,11 +111,6 @@ class TransformerBlock(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
-    def forward_cross(self, x: torch.Tensor, context: torch.Tensor, causal_offset: int = 1) -> torch.Tensor:
-        x = x + self.attn.forward_cross(self.norm1(x), self.norm1(context), causal_offset=causal_offset)
-        x = x + self.ff(self.norm2(x))
-        return x
-
     def forward_cross_kv(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                          causal_offset: int = 1, attn_mask: torch.Tensor = None) -> torch.Tensor:
         x = x + self.attn.forward_cross_kv(self.norm1(x), k, v, causal_offset=causal_offset, attn_mask=attn_mask)
@@ -190,22 +167,6 @@ class DoubleTransformerBlock(nn.Module):
         x = self.layer3(x)
         return x[:, :, :self.d_out] + self.output_mlp(x)
 
-    def forward_kv(self, x: torch.Tensor):
-        x = x + self.input_mlp(x)
-        x, k1, v1 = self.layer1.forward_kv(x)
-        x, k2, v2 = self.layer2.forward_kv(x)
-        x, k3, v3 = self.layer3.forward_kv(x)
-        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
-
-    def forward_with_cache(self, x: torch.Tensor, past_kv1, past_kv2, past_kv3):
-        x = x + self.input_mlp(x)
-        pk1, pv1 = past_kv1
-        pk2, pv2 = past_kv2
-        pk3, pv3 = past_kv3
-        x, k1, v1 = self.layer1.forward_with_cache(x, pk1, pv1)
-        x, k2, v2 = self.layer2.forward_with_cache(x, pk2, pv2)
-        x, k3, v3 = self.layer3.forward_with_cache(x, pk3, pv3)
-        return x[:, :, :self.d_out] + self.output_mlp(x), (k1, v1), (k2, v2), (k3, v3)
 
 
 class Generator(nn.Module):
@@ -267,11 +228,6 @@ class Generator(nn.Module):
         # pos_emb is char_emb_dim for module 1+, so it applies only to the char slot;
         # prev_latent already carries positional information from the previous module
         return torch.cat([prev_latent, char + self.pos_emb(pos)], dim=-1)
-
-    def forward_hidden(self, x: torch.Tensor, prev_latent: torch.Tensor = None) -> torch.Tensor:
-        h = self._build_input(x, prev_latent)
-        h = self.blocks(h)
-        return h
 
     def forward_hidden_layerwise(self, x: torch.Tensor, prev_latent: torch.Tensor = None,
                                  detach_emb: bool = False) -> list:
@@ -469,39 +425,6 @@ class Generator(nn.Module):
             h = block(h)
         return h
 
-    def encode_kv(self, x: torch.Tensor, prev_latent: torch.Tensor = None):
-        """Encode full context, return (last_hidden [B, d_model], kv_cache)."""
-        h = self._build_input(x, prev_latent)
-        kv_cache = []
-        for block in self.blocks:
-            h, kv1, kv2, kv3 = block.forward_kv(h)
-            kv_cache.append((kv1, kv2, kv3))
-        return h[:, -1, :], kv_cache
-
-    def decode_one(self, token_id: torch.Tensor, pos: int, kv_cache):
-        """Decode a single new token position using a KV cache (layer_idx=0 only)."""
-        pos_tensor = torch.tensor([pos], device=token_id.device)
-        h = self.tok_emb(token_id) + self.pos_emb(pos_tensor)
-        new_kv = []
-        for block, (kv1, kv2, kv3) in zip(self.blocks, kv_cache):
-            h, new_kv1, new_kv2, new_kv3 = block.forward_with_cache(h, kv1, kv2, kv3)
-            new_kv.append((new_kv1, new_kv2, new_kv3))
-        return h[:, 0, :], new_kv
-
-    @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int,
-                 temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -self.cfg.context_length:]
-            logits = self(ctx)[:, -1, :]
-            if temperature != 1.0:
-                logits = logits / temperature
-            if top_k is not None:
-                v, _ = logits.topk(min(top_k, logits.size(-1)))
-                logits[logits < v[:, -1:]] = float("-inf")
-            idx = torch.cat([idx, torch.multinomial(F.softmax(logits, dim=-1), 1)], dim=1)
-        return idx
-
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
@@ -595,66 +518,6 @@ class ManifoldEstimator(nn.Module):
         else:
             mask = torch.ones_like(h)
         return self.net(torch.cat([h, mask], dim=-1)).squeeze(-1)
-
-    def num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-class SamenessEstimator(nn.Module):
-    """Two-latent discriminator: scores whether a and b encode the same content.
-
-    Positives (a latent vs a noised copy of itself) score high; different latents score low.
-    The predictor is later trained adversarially to make D(pred, target) read "same".
-    Fed symmetric relational features [a+b, |a-b|, a*b] so it measures a *relation* between the two
-    latents (and is order-invariant), rather than learning to classify which stream a latent came
-    from — that would just re-derive the single-input ManifoldEstimator.
-    """
-
-    def __init__(self, cfg: Config):
-        super().__init__()
-        D = cfg.d_model
-        self.net = nn.Sequential(
-            nn.Linear(3 * D, 3 * D, bias=False), nn.GELU(),
-            nn.Linear(3 * D, 2 * D, bias=False), nn.GELU(),
-            nn.Linear(2 * D, D,     bias=False), nn.GELU(),
-            nn.Linear(D,     1,     bias=False),
-        )
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-
-    @staticmethod
-    def _features(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.cat([a + b, (a - b).abs(), a * b], dim=-1)
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return self.net(self._features(a, b)).squeeze(-1)
-
-    def num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
-class SmallReconNet(nn.Module):
-    """Tiny reconstruction probe: takes first `dims` dimensions of a latent, predicts tokens."""
-
-    def __init__(self, dims: int, vocab_size: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dims, 64, bias=False), nn.GELU(),
-            nn.Linear(64, 128, bias=False), nn.GELU(),
-            nn.Linear(128, 128, bias=False), nn.GELU(),
-            nn.Linear(128, vocab_size, bias=False),
-        )
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h)
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

@@ -23,40 +23,6 @@ class Config:
 
     corrupt_samples: int = 2
 
-    # Contrastive / Equivalence Estimator
-    # Minimum attract scale: prevents the attract loss from hitting exactly 0
-    # when the discriminator is fully certain about both target and pred.
-    disc_eps: float = 0.1
-
-    # ── Sameness (equivalence) discriminator ────────────────────────────────
-    # Replaces/augments the MSE attract loss. A two-latent discriminator D(a, b) learns
-    # "same content" (positive: a latent vs a noised copy of itself) vs "different" (a random
-    # cross-pairing of pred/target/corrupt + a shuffled same-type pair). The predictor is then
-    # trained adversarially to make D(pred, target) read "same". Because D is bounded it gives a
-    # mode-seeking signal (commit to a real latent) instead of MSE's mean-seeking blur.
-    enable_sameness: bool = False
-    sameness_est_lr: float = 1.4e-4
-    sameness_weight: float = 1.0           # scale of the adversarial attract term (generator side)
-    sameness_pos_noise: float = 0.01        # positive-pair noise std, relative to per-batch latent std
-    sameness_r1_weight: float = 0.10       # R1 penalty on the sameness discriminator's positive inputs
-    sameness_r1_interval: int = 5
-    # MSE bootstrap: a decaying MSE attract term pulls pred close enough for the (saturating)
-    # discriminator to give gradient early on. Anneals linearly to 0 over mse_anneal_steps (local).
-    mse_attract_weight: float = 1.0
-    mse_anneal_steps: int = 1145000
-    # Fraction of discriminator steps that label (pred, target) as "same" instead of a hard negative
-    # — one-sided label smoothing on the adversarial pair: stops an overconfident D from saturating
-    # the generator gradient. Becomes truthful as pred→target. Only affects the generator once
-    # sameness_weight > 0; applies only to (pred, target), never to the corrupt pairs.
-    sameness_pred_target_pos_frac: float = 0.10
-    # Optional linear ramp of the above fraction from 0 → its value over this many local steps
-    # (0 = no ramp; use the flat fraction immediately).
-    sameness_pos_frac_ramp_steps: int = 0
-
-    # Small reconstruction probe on first N latent dims
-    recon_net_dims: int = 8
-    recon_loss_weight: float = 0.0
-
     # Small next-char grounding on module 0: decode the (context-only) prediction stream with the
     # module-0 decoder and push it toward the actual byte. The gradient flows (at this scale) into the
     # generator + predictor AND into the decoder, so the readout co-adapts with the representation
@@ -89,16 +55,6 @@ class Config:
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
     r1_weight: float = 0.10
     r1_interval: int = 5
-    # Jacobian regularization on the generator's clean stream: penalises ||J||^2 where J is the
-    # gradient of clean latents w.r.t. input embeddings. Encourages a smooth/continuous latent
-    # space so small input changes don't cause large representation jumps (stabilises self-chasing).
-    # Should not be enabled on layer 0 since it takes uantized text as input and the jacobian makes
-    # sure that small changes in input leads to small changes in output. That said it does stabilize training.
-    # But i imagine one could use the jacobian loss to stop the network from falling in to som earliy bad local minima
-    # basicly have it on for the first 80 000 steps to make sure that initial training finds a good overarching fit.
-    enable_jacobian_loss: bool = False
-    jacobian_weight: float = 0.20
-    jacobian_interval: int = 1
     gradient_residual_amplification: bool = True
     gra_scale: float = 1.0
     gra_warmup_steps: int = 3_000

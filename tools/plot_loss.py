@@ -246,10 +246,10 @@ def main():
     ax.grid(True, alpha=0.3)
 
     ax = axes[2, 3]
-    if "jacobian_penalty" in df.columns:
-        plot_line(ax, df["step"], df["jacobian_penalty"], "jacobian", "darkcyan", args.smooth)
-    ax.set_title("Jacobian penalty")
-    ax.set_ylabel("penalty")
+    if "participation_ratio" in df.columns:
+        plot_line(ax, df["step"], df["participation_ratio"], "participation ratio", "darkcyan", args.smooth)
+    ax.set_title("Participation ratio (collapse indicator)")
+    ax.set_ylabel("effective dims")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
