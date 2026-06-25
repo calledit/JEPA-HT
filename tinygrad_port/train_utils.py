@@ -68,7 +68,7 @@ def _vicreg_cov(z: Tensor) -> Tensor:
     N, D = z.shape
     z = z - z.mean(axis=0)
     cov = (z.T @ z) / (N - 1)
-    eye = Tensor.eye(D, dtype=dtypes.bool_)
+    eye = Tensor.eye(D, dtype=dtypes.bool)
     off_diag = eye.where(Tensor.zeros_like(cov), cov)
     return (off_diag ** 2).sum() / D
 

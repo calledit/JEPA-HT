@@ -26,8 +26,8 @@ CKPT_PATH = find_latest_checkpoint(CKPT_DIR)
 PROMPT     = b"The quick brown fox"
 PROMPT_IDS = list(PROMPT)
 
-GOLDEN_NEXT_TOKEN = 105                                        # b'i'
-GOLDEN_8_TOKENS   = [105, 100, 101, 32, 116, 104, 101, 32]   # b'ide the '
+GOLDEN_NEXT_TOKEN = 105                                              # b'i'
+GOLDEN_8_TOKENS   = [105, 109, 105, 110, 103, 32, 116, 104]   # b'iming th'
 
 needs_checkpoint = pytest.mark.skipif(
     CKPT_PATH is None,
@@ -207,7 +207,7 @@ def test_tinygrad_greedy_sequence_golden(tg_loaded):
     """8-token greedy completion must match b'ting the' — the primary port acceptance criterion.
 
     Prompt:  b'The quick brown fox'
-    Golden:  b'ting the'
+    Golden:  b'iming th'
     """
     from tinygrad_port.jepa_generate import _predict_next_logits as tg_logits
     cfg, _, modules, predictors, decoder, active, feed_active = tg_loaded

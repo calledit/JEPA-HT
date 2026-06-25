@@ -455,6 +455,7 @@ class ManifoldEstimator:
         self.l3 = nn.Linear(D * 2, D,     bias=False)
         self.l4 = nn.Linear(D,     1,     bias=False)
         self.training = True
+        self._ones_cache: dict = {}
         self._init_weights()
 
     def _init_weights(self):
@@ -466,7 +467,10 @@ class ManifoldEstimator:
             mask = (Tensor.rand(*h.shape) >= self.feat_drop).cast(h.dtype)
             h = h * mask
         else:
-            mask = Tensor.ones(*h.shape, dtype=h.dtype)
+            k = (tuple(h.shape), h.dtype)
+            if k not in self._ones_cache:
+                self._ones_cache[k] = Tensor.ones(*h.shape, dtype=h.dtype).realize()
+            mask = self._ones_cache[k]
         inp = h.cat(mask, dim=-1)
         return self.l4(self.l3(self.l2(self.l1(self.l0(inp).gelu(approximate='none')).gelu(approximate='none')).gelu(approximate='none')).gelu(approximate='none')).squeeze(-1)
 

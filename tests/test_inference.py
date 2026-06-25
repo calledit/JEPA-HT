@@ -27,10 +27,10 @@ CKPT_PATH = find_latest_checkpoint(CKPT_DIR)
 PROMPT     = b"The quick brown fox"
 PROMPT_IDS = list(PROMPT)
 
-# Golden values verified from the PyTorch implementation at checkpoint_s0495000.pt.
+# Golden values verified from the PyTorch implementation at checkpoint_s0505000.pt.
 # Re-run generate_golden.py if the checkpoint changes (it saves these to golden/inference.npz).
-GOLDEN_NEXT_TOKEN = 105                                            # b'i'
-GOLDEN_8_TOKENS   = [105, 100, 101, 32, 116, 104, 101, 32]   # b'ide the '
+GOLDEN_NEXT_TOKEN = 105                                              # b'i'
+GOLDEN_8_TOKENS   = [105, 109, 105, 110, 103, 32, 116, 104]   # b'iming th'
 
 needs_checkpoint = pytest.mark.skipif(
     CKPT_PATH is None,
@@ -182,7 +182,7 @@ def test_greedy_sequence_golden(loaded):
     """8-token greedy completion of the fixed prompt must match the golden sequence.
 
     Prompt:  b'The quick brown fox'
-    Golden:  b'ting the'
+    Golden:  b'iming th'
     """
     cfg, modules, predictors, decoder, active, feed_active = loaded
     tokens = list(PROMPT_IDS)
