@@ -66,6 +66,15 @@ class Config:
     # 0.0 = disabled.
     gen_recon_weight: float = 0.15 #CHANGE 2919000 Again 3521000
 
+    # Weak VICReg on the clean latents. Variance term pushes per-dim std above vicreg_gamma
+    # (hinge: max(0, gamma - std_d), averaged over dims) so the encoder can't collapse to a
+    # low-dimensional subspace. Covariance term penalises off-diagonal elements of the feature
+    # covariance matrix, decorrelating dimensions. Both are applied to target_latents (un-detached)
+    # so the gradient flows directly into the encoder. 0.0 = off.
+    vicreg_var_weight: float = 0.000001
+    vicreg_cov_weight: float = 0.000001 / 25
+    vicreg_gamma: float = 1.0      # variance hinge threshold (std must exceed this)
+
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
     # Feature masking on the ManifoldEstimator's input latent (discriminator-training only). Randomly
@@ -75,7 +84,7 @@ class Config:
     # parallel mask channel (input becomes 2*d_model), so D never mistakes a deliberately-hidden dim for
     # a genuinely-zero (collapsed) one — which plain zeroing dropout did, blunting collapse detection.
     # 0.0 = off. (Changing this reshapes D's first layer; old checkpoints reinit the discriminator.)
-    manifold_feature_dropout: float = 0.04
+    manifold_feature_dropout: float = 0.0
     # R1 gradient penalty weight on the discriminator. Penalises large gradients w.r.t. real (positive)
     # inputs, smoothing the discriminator decision surface and damping GAN oscillations. 0.0 = disabled.
     r1_weight: float = 0.10
@@ -119,14 +128,17 @@ class Config:
     # n_modules. The gap g_i = h_{i+1} - h_i sets the bottom-up gen-feed shift and the top-down extra
     # look-ahead shift between modules i and i+1.
     prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
-    # Stochastic horizon reveal (per-key). A fixed tril(-h) mask means gen[t] never attends keys in the
-    # recent band (t-h, t-1], so the shared encoder stops keeping those positions informative and the
-    # target goes trivial. Instead each recent-band key is revealed INDEPENDENTLY with this probability
-    # (fresh per step and per sample); far context (d >= h) is always visible and the target position t
-    # (d <= 0) never is. Small r keeps the recent window hidden in expectation (preserving abstraction)
-    # while still exercising every recent relative position. No-op on module 0 (h=1, empty band) and at
-    # inference (eval falls back to the deterministic tril(-h)).
-    gen_reveal_prob: float = 0.2
+    # Stochastic horizon reveal. A fixed tril(-h) mask means gen[t] never attends keys in the recent
+    # band (t-h, t-1], so the encoder stops keeping those positions informative and the target goes
+    # trivial. Instead, every gen_reveal_interval steps, each query position i independently samples
+    # k ~ Uniform{0, ..., h-1} and uses effective horizon h-k — revealing a contiguous prefix of the
+    # recent band from oldest toward most recent, matching how the clean stream looks at a smaller
+    # horizon. k=0 is the original tril(-h); k=h-1 opens up to tril(-1). On those steps the gen
+    # stream is computed twice: with the sampled mask for the JEPA loss, and with the deterministic
+    # tril(-h) for the gen_thread so no leaked context propagates to the next module. No-op on
+    # module 0 (h=1, empty band) and at inference (eval always uses the deterministic tril(-h)).
+    # Set gen_reveal_interval to 0 to disable the reveal entirely.
+    gen_reveal_interval: int = 5
     module_warmup_steps: int = 50_000  # global steps before module i+1 starts training
     # Top-down prediction feed: once module i+1 has trained this many local steps, its detached
     # prediction is fed into module i's predictor extra slot (before that, a learned null is used).

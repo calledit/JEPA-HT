@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.utils.data import DataLoader
 
 # Efficient/flash SDPA kernels are left ENABLED. (Previously globally disabled, which forced the slow
 # math kernel for every masked attention — the dominant cost for this tiny model.) The only path that
@@ -87,6 +88,23 @@ def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: flo
     pred_res   = pred   - pred.mean(dim=sample_dims, keepdim=True)
     target_res = target - target.mean(dim=sample_dims, keepdim=True)
     return loss + scale * F.mse_loss(pred_res, target_res.detach())
+
+
+def _vicreg_var(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
+    """VICReg variance term: hinge pushing per-dim std above gamma, averaged over dims."""
+    z = z.reshape(-1, z.shape[-1])
+    std = (z.var(dim=0) + 1e-4).sqrt()
+    return F.relu(gamma - std).mean()
+
+
+def _vicreg_cov(z: torch.Tensor) -> torch.Tensor:
+    """VICReg covariance term: penalise off-diagonal entries of the feature covariance matrix."""
+    z = z.reshape(-1, z.shape[-1])
+    N, D = z.shape
+    z = z - z.mean(dim=0)
+    cov = (z.T @ z) / (N - 1)
+    off_diag = cov.masked_fill(torch.eye(D, dtype=torch.bool, device=z.device), 0.0)
+    return off_diag.pow(2).sum() / D
 
 
 # ── Per-module state ────────────────────────────────────────────────────────
@@ -314,6 +332,10 @@ def module_forward(
         prev_gen = _shift_time(prev_gen, gap)
 
     # ── Forward pass ────────────────────────────────────────────────────────
+    use_stochastic_reveal = (
+        cfg.gen_reveal_interval > 0
+        and step % cfg.gen_reveal_interval == 0
+    )
     with autocast():
         gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread = ms.generator.forward_cross_layerwise(
             x,
@@ -323,6 +345,7 @@ def module_forward(
             x_corr=prev["x_corr"],
             corrupt_fn=corrupt_fn,
             thread_genfree=thread_genfree,
+            use_stochastic_reveal=use_stochastic_reveal,
         )
         target_latents = clean_latents
 
@@ -556,6 +579,10 @@ def module_predict_gen(
 
             manifold_stablization = (disc_corrupt - disc_target).mean()
             layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
+            if cfg.vicreg_var_weight > 0.0:
+                layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(target_latents[l + 1], cfg.vicreg_gamma)
+            if cfg.vicreg_cov_weight > 0.0:
+                layer_loss = layer_loss + cfg.vicreg_cov_weight * _vicreg_cov(target_latents[l + 1])
             layer_losses.append(layer_loss)
             attract_losses.append(attract.detach())
             toward_zero_losses.append(attract)
@@ -805,13 +832,17 @@ def train():
 
     train_dataset, val_data, _ = build_dataset(cfg, skip_docs)
     val_data      = val_data.to(device)
-    _dataset_iter = iter(train_dataset)
+    _dataloader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        num_workers=2,
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
+    _dataset_iter = iter(_dataloader)
 
     def next_batch():
-        seqs = []
-        while len(seqs) < cfg.batch_size:
-            seqs.append(next(_dataset_iter))
-        return torch.stack(seqs)
+        return next(_dataset_iter)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 

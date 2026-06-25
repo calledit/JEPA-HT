@@ -14,13 +14,23 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
+    def _causal_mask(self, T: int, offset: int, device) -> torch.Tensor:
+        cache = getattr(self, '_mask_cache', None)
+        if cache is None:
+            self._mask_cache: dict = {}
+            cache = self._mask_cache
+        key = (T, offset)
+        if key not in cache:
+            cache[key] = torch.ones(T, T, dtype=torch.bool, device=device).tril(-offset)
+        return cache[key]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
+        mask = self._causal_mask(T, 1, x.device)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -35,10 +45,10 @@ class CausalSelfAttention(nn.Module):
         Own state is preserved via the residual connection in TransformerBlock.
         """
         B, T, C = x.shape
-        q, _, _ = self.qkv(x).split(C, dim=-1)
+        q = F.linear(x, self.qkv.weight[:C])  # Q-only; K/V come from context
         k, v = self.get_kv(context)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
+        mask = self._causal_mask(T, causal_offset, x.device)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
@@ -53,10 +63,11 @@ class CausalSelfAttention(nn.Module):
         attn_mask: optional precomputed boolean mask (True = attend) that overrides causal_offset —
         used for the stochastic horizon mask (the deterministic tril is built here when it's None)."""
         B, T, C = x.shape
-        q, _, _ = self.qkv(x).split(C, dim=-1)
+        # K and V come precomputed — only compute Q to save 2/3 of the QKV GEMM
+        q = F.linear(x, self.qkv.weight[:C])
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         if attn_mask is None:
-            attn_mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-causal_offset)
+            attn_mask = self._causal_mask(T, causal_offset, x.device)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
@@ -71,7 +82,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril(-1)
+        mask = self._causal_mask(T, 1, x.device)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y), k, v
@@ -275,20 +286,35 @@ class Generator(nn.Module):
         return hiddens
 
     def _build_stochastic_gen_mask(self, B: int, T: int, device) -> torch.Tensor:
-        """Per-sample stochastic horizon mask for the gen stream, shape [B, 1, T, T] (True = attend).
+        """Per-query stochastic horizon mask for the gen stream, shape [B, 1, T, T] (True = attend).
 
-        Distance d = i - j between query i and key j. Far context (d >= horizon) is always visible;
-        recent-band keys (1 <= d < horizon) are each revealed independently with prob gen_reveal_prob;
-        keys at j >= i (d <= 0) are never visible, so the target position i is never leaked. With
-        horizon == 1 the recent band is empty and this reduces to a plain tril(-1)."""
+        For each query position i, sample k ~ Uniform{0, ..., h-1} independently. The effective
+        horizon becomes h-k, revealing a contiguous prefix of the recent band from oldest toward
+        most recent — exactly what the clean stream looks like at a smaller horizon. k=0 gives the
+        original tril(-h); k=h-1 would give tril(-1), identical to the clean stream, making the
+        JEPA target trivial. To prevent that, when k==h-1 one random key in the revealed recent
+        band is punched back out, ensuring the gen always differs from the clean by at least one
+        position. j >= i is never visible regardless of k."""
         h = self.horizon
-        i = torch.arange(T, device=device).view(T, 1)
-        j = torch.arange(T, device=device).view(1, T)
-        d = i - j
-        far    = d >= h                                   # [T, T] always-visible far context
-        recent = (d >= 1) & (d < h)                       # [T, T] maskable recent band
-        reveal = (torch.rand(B, T, T, device=device) < self.cfg.gen_reveal_prob) & recent.unsqueeze(0)
-        return (far.unsqueeze(0) | reveal).unsqueeze(1)   # [B, 1, T, T]
+        i_idx = torch.arange(T, device=device).view(T, 1)
+        j_idx = torch.arange(T, device=device).view(1, T)
+        d = i_idx - j_idx                                          # [T, T]
+        k = torch.randint(0, h, (B, T), device=device)             # [B, T] per (batch, query)
+        eff_h = (h - k).unsqueeze(-1)                              # [B, T, 1]
+        mask = (d.unsqueeze(0) >= eff_h) & (d.unsqueeze(0) >= 1)  # [B, T, T]
+        if h > 1:
+            # Punch one random key out of the revealed recent band for fully-open queries.
+            # If the random distance would go past the start of the sequence, clamp to j=0
+            # (the oldest possible key) rather than skipping — so the punch always lands.
+            full_reveal = (k == h - 1)                                              # [B, T]
+            rand_d      = torch.randint(1, h, (B, T), device=device)                # [B, T]
+            i_range     = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+            punch_j     = (i_range - rand_d).clamp(min=0)                           # [B, T]
+            punch       = torch.zeros(B, T, T, dtype=torch.bool, device=device)
+            punch.scatter_(2, punch_j.unsqueeze(2), True)
+            punch      &= full_reveal.unsqueeze(2)
+            mask       &= ~punch
+        return mask.unsqueeze(1)                                    # [B, 1, T, T]
 
     def forward_cross_layerwise(self, x: torch.Tensor,
                                 prev_latent_clean: torch.Tensor = None,
@@ -297,7 +323,8 @@ class Generator(nn.Module):
                                 x_corr: torch.Tensor = None,
                                 clean_token_leak: bool = True,
                                 corrupt_fn=None,
-                                thread_genfree: bool = False):
+                                thread_genfree: bool = False,
+                                use_stochastic_reveal: bool = False):
         """Training-only forward with three parallel streams: clean, generative (null-init), corrupt.
         For module 0 all prev_latents are None. For module 1+ each stream receives the corresponding
         output from the frozen previous module so the corruption/generation is consistent up the chain.
@@ -306,10 +333,12 @@ class Generator(nn.Module):
         corrupt_fn: optional callable(clean_latents, gen_hiddens) -> x_corr tensor [B, T].
                     Called after clean/gen streams are computed but before the corrupt stream runs.
                     Allows the decoder to train on fresh latents and supply hard-negative tokens.
-        thread_genfree: if True, return the last block's gen output as gen_thread — the latent threaded
-                    up to the next module's gen stream. We reuse the in-graph (with-leak) gen output
-                    rather than recomputing a leak-free copy (train.py detaches it). None when not
-                    requested.
+        thread_genfree: if True, return a gen_thread for the next module. When use_stochastic_reveal
+                    is also True, gen_thread is recomputed from the last block with the deterministic
+                    tril(-h) mask (no reveal) so it never carries stochastic-reveal context forward.
+        use_stochastic_reveal: if True (and training, horizon > 1), apply the per-key stochastic
+                    horizon reveal for the gen stream used in the JEPA loss. The gen_thread (when
+                    requested) is always computed with the deterministic mask regardless.
         Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread).
         """
         B, T = x.shape
@@ -343,7 +372,7 @@ class Generator(nn.Module):
         # So every recent relative position is exercised on most steps, partially, keeping the encoder
         # honest while the expectation still hides the recent window (preserving the abstraction). At
         # inference (eval) we fall back to the deterministic tril(-h) — the module's characteristic mask.
-        use_stochastic = self.training and self.horizon > 1
+        use_stochastic = use_stochastic_reveal and self.training and self.horizon > 1
         gen_mask = self._build_stochastic_gen_mask(B, T, x.device) if use_stochastic else None
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
@@ -366,11 +395,32 @@ class Generator(nn.Module):
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
         # ── Gen output threaded up to the next module ─────────────────────────
-        # Reuse the (with-leak) last-block gen output rather than recomputing a leak-free copy: the
-        # n_clean_tokens leak touches only a couple positions, so the train/inference mismatch is
-        # negligible, and this saves an extra last-block forward for every non-top module. train.py
-        # detaches it before threading.
-        gen_thread = gen_hiddens[-1] if thread_genfree else None
+        # When the stochastic reveal was used for the loss pass, the gen_hiddens carry context from
+        # recent-band positions the deterministic tril(-h) would have hidden. Threading that signal
+        # forward would give the next module a richer prev_latent_gen during training than it ever
+        # gets at inference. Instead we re-run only the last block with the deterministic mask
+        # (causal_offset=horizon, attn_mask=None). Blocks start from null_embs independently, so
+        # only the last block needs re-running; the shared clean cross-KVs are reused as-is.
+        # No n_clean_tokens injection for the thread — keeps it purely horizon-limited.
+        if thread_genfree:
+            if use_stochastic:
+                last_i     = len(self.blocks) - 1
+                last_block = self.blocks[last_i]
+                if self.layer_idx == 0:
+                    h_thr = (self.null_embs[last_i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+                else:
+                    null_char = self.null_embs[last_i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
+                    h_thr = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
+                kv0, kv1, kv2 = cross_kvs[last_i]
+                h_thr = h_thr + last_block.input_mlp(h_thr)
+                h_thr = last_block.layer1.forward_cross_kv(h_thr, *kv0, causal_offset=self.horizon)
+                h_thr = last_block.layer2.forward_cross_kv(h_thr, *kv1, causal_offset=self.horizon)
+                h_thr = last_block.layer3.forward_cross_kv(h_thr, *kv2, causal_offset=self.horizon)
+                gen_thread = h_thr[:, :, :last_block.d_out] + last_block.output_mlp(h_thr)
+            else:
+                gen_thread = gen_hiddens[-1]
+        else:
+            gen_thread = None
 
         # ── Corrupt stream ────────────────────────────────────────────────────
         K = self.cfg.corrupt_samples

@@ -173,8 +173,9 @@ def jepa_generate(modules, predictors, decoder, active, feed_active, cfg,
                   prompt_ids, max_new_tokens, temperature, top_k, device, debug=False):
     tokens = list(prompt_ids)
 
+    n_pad = cfg.prediction_horizons[active[-1]]
     for step_i in range(max_new_tokens):
-        ctx = tokens[-(cfg.context_length - 1):]
+        ctx = tokens[-(cfg.context_length - n_pad):]
         logits = _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg, ctx, device)
 
         if temperature != 1.0:
