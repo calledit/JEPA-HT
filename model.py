@@ -69,18 +69,6 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y), k, v
 
-    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
-        """Single-token forward attending to cached past K, V."""
-        B, T_new, C = x.shape
-        q, k_new, v_new = self.qkv(x).split(C, dim=-1)
-        q     = q.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        k_new = k_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        v_new = v_new.view(B, T_new, self.n_heads, self.head_dim).transpose(1, 2)
-        k = torch.cat([past_k, k_new], dim=2)
-        v = torch.cat([past_v, v_new], dim=2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(B, T_new, C)
-        return self.out_proj(y), k, v
 
 
 class FeedForward(nn.Module):
@@ -119,12 +107,6 @@ class TransformerBlock(nn.Module):
 
     def forward_kv(self, x: torch.Tensor):
         attn_out, k, v = self.attn.forward_kv(self.norm1(x))
-        x = x + attn_out
-        x = x + self.ff(self.norm2(x))
-        return x, k, v
-
-    def forward_with_cache(self, x: torch.Tensor, past_k: torch.Tensor, past_v: torch.Tensor):
-        attn_out, k, v = self.attn.forward_with_cache(self.norm1(x), past_k, past_v)
         x = x + attn_out
         x = x + self.ff(self.norm2(x))
         return x, k, v
