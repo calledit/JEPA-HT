@@ -48,22 +48,42 @@ def load_log(path):
     block = [c for c in header if (m := mod_re.match(c)) and m.group(1) == "0"]
     nf, nt, nb = len(front), len(tail), len(block)
 
+    # n_modules from the header, not inferred from row width — block size may have grown
+    n_modules = len({mod_re.match(c).group(1) for c in header if mod_re.match(c)})
+
+    # Widest row tells us the largest per-module block size in the file
     max_fields = max((len(r) for r in data), default=len(header))
-    n_modules  = max(1, (max_fields - nf - nt) // nb)
-    mid_total  = n_modules * nb
+    mid_max = max_fields - nf - nt
+    actual_nb = nb
+    if n_modules > 0 and mid_max % n_modules == 0:
+        actual_nb = max(nb, mid_max // n_modules)
 
     columns = list(front)
     for m in range(n_modules):
-        columns += [mod_re.sub(f"m{m}_", c) for c in block]
+        cols = [mod_re.sub(f"m{m}_", c) for c in block]
+        cols += [f"m{m}_extra_{k}" for k in range(actual_nb - nb)]
+        columns += cols
     columns += tail
 
     aligned = []
     for r in data:
         f_vals = r[:nf]
         t_vals = r[len(r) - nt:] if nt else []
-        mid    = r[nf:len(r) - nt] if nt else r[nf:]
-        mid   += [""] * (mid_total - len(mid))        # pad missing later modules
-        aligned.append(f_vals + mid[:mid_total] + t_vals)
+        mid    = list(r[nf:len(r) - nt] if nt else r[nf:])
+
+        # Detect this row's per-module block size; fall back to nb for short/partial rows
+        mid_len = len(mid)
+        row_nb = nb
+        if n_modules > 0 and mid_len % n_modules == 0:
+            row_nb = mid_len // n_modules
+
+        new_mid = []
+        for m in range(n_modules):
+            m_block = mid[m * row_nb : (m + 1) * row_nb]
+            m_block += [""] * (actual_nb - len(m_block))  # pad short rows
+            new_mid += m_block
+
+        aligned.append(f_vals + new_mid + t_vals)
 
     return pd.DataFrame(aligned, columns=columns)
 
@@ -217,14 +237,10 @@ def main():
 
     # Row 2: decoder + val + latent diagnostics
     ax = axes[2, 0]
-    if decoder_a_cols:
-        for i, (ca, cb) in enumerate(zip(decoder_a_cols, decoder_b_cols)):
-            plot_line(ax, df["step"], df[ca], f"l{i} gen",   layer_colors[i], args.smooth, "-")
-            plot_line(ax, df["step"], df[cb], f"l{i} clean", layer_colors[i], args.smooth, "--")
-    else:
-        for i, col in enumerate(decoder_layer_cols):
-            plot_line(ax, df["step"], df[col], f"l{i}", layer_colors[i], args.smooth)
-    ax.set_title("Per-layer decoder loss")
+    decoder_c_cols = layer_filter([c for c in df.columns if c.startswith("decoder_loss_c_")], args.layer)
+    for i, col in enumerate(decoder_c_cols):
+        plot_line(ax, df["step"], df[col], f"l{i} rec", layer_colors[i], args.smooth)
+    ax.set_title("Per-layer decoder loss (rec)")
     ax.set_ylabel("loss")
     ax.legend()
     ax.grid(True, alpha=0.3)

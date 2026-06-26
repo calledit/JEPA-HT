@@ -254,38 +254,24 @@ class Generator(nn.Module):
             mask       &= ~punch
         return mask.unsqueeze(1)                                    # [B, 1, T, T]
 
-    def forward_cross_layerwise(self, x: torch.Tensor,
-                                prev_latent_clean: torch.Tensor = None,
-                                prev_latent_gen: torch.Tensor = None,
-                                prev_latent_corrupt: torch.Tensor = None,
-                                x_corr: torch.Tensor = None,
-                                clean_token_leak: bool = True,
-                                corrupt_fn=None,
-                                thread_genfree: bool = False,
-                                use_stochastic_reveal: bool = False):
-        """Training-only forward with three parallel streams: clean, generative (null-init), corrupt.
-        For module 0 all prev_latents are None. For module 1+ each stream receives the corresponding
-        output from the frozen previous module so the corruption/generation is consistent up the chain.
-        x_corr: if provided, reuse this corrupted character sequence (keeps corruption consistent
-                across all modules); otherwise a fresh one is sampled and returned.
-        corrupt_fn: optional callable(clean_latents, gen_hiddens) -> x_corr tensor [B, T].
-                    Called after clean/gen streams are computed but before the corrupt stream runs.
-                    Allows the decoder to train on fresh latents and supply hard-negative tokens.
-        thread_genfree: if True, return a gen_thread for the next module. When use_stochastic_reveal
-                    is also True, gen_thread is recomputed from the last block with the deterministic
-                    tril(-h) mask (no reveal) so it never carries stochastic-reveal context forward.
-        use_stochastic_reveal: if True (and training, horizon > 1), apply the per-key stochastic
-                    horizon reveal for the gen stream used in the JEPA loss. The gen_thread (when
-                    requested) is always computed with the deterministic mask regardless.
-        Returns (gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread).
-        """
+    def forward_clean_gen(self, x: torch.Tensor,
+                          prev_latent_clean: torch.Tensor = None,
+                          prev_latent_gen: torch.Tensor = None,
+                          *,
+                          clean_token_leak: bool = True,
+                          thread_genfree: bool = False,
+                          use_stochastic_reveal: bool = False):
+        """Phase A1: run the clean and generative streams only (no corrupt).
+        Returns (gen_hiddens, clean_latents, cross_kvs, gen_thread).
+        cross_kvs is NOT detached — the corrupt stream backward must reach the encoder
+        through these K/Vs for the manifold stabilisation term to work."""
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
 
         # ── Clean stream ──────────────────────────────────────────────────────
         h_clean = self._build_input(x, prev_latent_clean)
         pre_block_states = []
-        cross_kvs = []   # precomputed (k, v) per block per layer, reused by gen + corrupt
+        cross_kvs = []
         clean_latents = [h_clean]
         for block in self.blocks:
             pre_block_states.append(h_clean)
@@ -299,17 +285,6 @@ class Generator(nn.Module):
             h_clean = h_out.detach()
 
         # ── Generative (null) stream ──────────────────────────────────────────
-        # Horizon mask with a STOCHASTIC reveal (training only). The deterministic mask is tril(-h):
-        # gen[t] attends clean context <= t-h. But a fixed tril(-h) means a query at t NEVER attends
-        # keys in the recent band (t-h, t-1], so the shared encoder never learns to keep those
-        # positions informative (it can drop the masked-window content and make the target trivial).
-        # Instead of the old all-or-nothing per-step reveal, we reveal each recent-band key
-        # INDEPENDENTLY with probability cfg.gen_reveal_prob, fresh per step and per sample:
-        #   far context (d = t-j >= h): always visible        recent band (1 <= d < h): visible w.p. r
-        #   j >= t: never visible (the target position t is never leaked)
-        # So every recent relative position is exercised on most steps, partially, keeping the encoder
-        # honest while the expectation still hides the recent window (preserving the abstraction). At
-        # inference (eval) we fall back to the deterministic tril(-h) — the module's characteristic mask.
         use_stochastic = use_stochastic_reveal and self.training and self.horizon > 1
         gen_mask = self._build_stochastic_gen_mask(B, T, x.device) if use_stochastic else None
         gen_hiddens = []
@@ -317,7 +292,6 @@ class Generator(nn.Module):
             if self.layer_idx == 0:
                 h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
             else:
-                # null_embs[i] is char_emb_dim for module 1+; _build_input adds pos and prev_latent_gen.
                 null_char = self.null_embs[i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
                 h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
             if clean_token_leak and self.cfg.n_clean_tokens > 0:
@@ -326,20 +300,12 @@ class Generator(nn.Module):
                 h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             kv0, kv1, kv2 = cross_kvs[i]
             h = h + block.input_mlp(h)
-            # When gen_mask is None (module 0 or eval) the tril(-horizon) is built inside from causal_offset.
             h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon, attn_mask=gen_mask)
             h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=self.horizon, attn_mask=gen_mask)
             h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon, attn_mask=gen_mask)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
-        # ── Gen output threaded up to the next module ─────────────────────────
-        # When the stochastic reveal was used for the loss pass, the gen_hiddens carry context from
-        # recent-band positions the deterministic tril(-h) would have hidden. Threading that signal
-        # forward would give the next module a richer prev_latent_gen during training than it ever
-        # gets at inference. Instead we re-run only the last block with the deterministic mask
-        # (causal_offset=horizon, attn_mask=None). Blocks start from null_embs independently, so
-        # only the last block needs re-running; the shared clean cross-KVs are reused as-is.
-        # No n_clean_tokens injection for the thread — keeps it purely horizon-limited.
+        # ── Gen thread (deterministic mask, for threading to next module) ─────
         if thread_genfree:
             if use_stochastic:
                 last_i     = len(self.blocks) - 1
@@ -360,29 +326,17 @@ class Generator(nn.Module):
         else:
             gen_thread = None
 
-        # ── Corrupt stream ────────────────────────────────────────────────────
+        return gen_hiddens, clean_latents, cross_kvs, gen_thread
+
+    def forward_corrupt(self, x_corr: torch.Tensor,
+                        prev_latent_corrupt: torch.Tensor = None,
+                        cross_kvs: list = None) -> list:
+        """Phase A2: run the corrupt stream using pre-computed clean K/Vs.
+        x_corr: [B*K, T]. prev_latent_corrupt: None (module 0) or [B*K, T, D] (module 1+).
+        cross_kvs: from forward_clean_gen — kept in-graph so manifold stab grad reaches encoder.
+        Returns corrupt_latents list of length n_layers+1."""
         K = self.cfg.corrupt_samples
-        x_corr_was_none = x_corr is None
-        if x_corr is None:
-            if corrupt_fn is not None:
-                x_corr = corrupt_fn(clean_latents, gen_hiddens)  # [B*K, T]
-            else:
-                xc_list = []
-                for _ in range(K):
-                    xc = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
-                    xc = xc + (xc >= x).long()
-                    xc_list.append(xc)
-                x_corr = torch.cat(xc_list, dim=0)  # [B*K, T]
-        elif corrupt_fn is not None:
-            # x_corr was provided by the prev module; still run the decoder forward for its
-            # training side-effect but keep the consistent x_corr from upstream
-            corrupt_fn(clean_latents, gen_hiddens)
-        prev_c = prev_latent_corrupt if prev_latent_corrupt is not None else prev_latent_clean
-        if prev_c is not None and x_corr_was_none:
-            # prev_c is [B, T, D]; x_corr was freshly expanded to [B*K, T] so repeat to match
-            prev_c = prev_c.repeat(K, 1, 1)  # [B*K, T, D]
-        # if x_corr was passed in, it's already [B*K, T] and prev_c is already [B*K, T, D]
-        hc = self._build_input(x_corr, prev_c)
+        hc = self._build_input(x_corr, prev_latent_corrupt)
         corrupt_latents = [hc]
         for i, block in enumerate(self.blocks):
             (k0, v0), (k1, v1), (k2, v2) = cross_kvs[i]
@@ -396,7 +350,45 @@ class Generator(nn.Module):
             hc_out = hc[:, :, :block.d_out] + block.output_mlp(hc)
             corrupt_latents.append(hc_out)
             hc = hc_out.detach()
+        return corrupt_latents
 
+    def forward_cross_layerwise(self, x: torch.Tensor,
+                                prev_latent_clean: torch.Tensor = None,
+                                prev_latent_gen: torch.Tensor = None,
+                                prev_latent_corrupt: torch.Tensor = None,
+                                x_corr: torch.Tensor = None,
+                                clean_token_leak: bool = True,
+                                corrupt_fn=None,
+                                thread_genfree: bool = False,
+                                use_stochastic_reveal: bool = False):
+        """Backward-compatible wrapper: forward_clean_gen then x_corr sampling then forward_corrupt.
+        New training code calls forward_clean_gen + forward_corrupt directly."""
+        gen_hiddens, clean_latents, cross_kvs, gen_thread = self.forward_clean_gen(
+            x, prev_latent_clean, prev_latent_gen,
+            clean_token_leak=clean_token_leak,
+            thread_genfree=thread_genfree,
+            use_stochastic_reveal=use_stochastic_reveal,
+        )
+        K = self.cfg.corrupt_samples
+        if x_corr is None:
+            if corrupt_fn is not None:
+                x_corr = corrupt_fn(clean_latents, gen_hiddens)
+            else:
+                xc_list = []
+                for _ in range(K):
+                    xc = torch.randint(0, self.cfg.vocab_size - 1, x.shape, device=x.device)
+                    xc = xc + (xc >= x).long()
+                    xc_list.append(xc)
+                x_corr = torch.cat(xc_list, dim=0)
+        elif corrupt_fn is not None:
+            corrupt_fn(clean_latents, gen_hiddens)
+        if prev_latent_corrupt is not None:
+            prev_c = prev_latent_corrupt
+        elif prev_latent_clean is not None:
+            prev_c = prev_latent_clean.repeat(K, 1, 1)
+        else:
+            prev_c = None
+        corrupt_latents = self.forward_corrupt(x_corr, prev_c, cross_kvs)
         return gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread
 
     @torch.no_grad()

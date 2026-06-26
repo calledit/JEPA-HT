@@ -6,6 +6,11 @@ import re
 import time
 from collections import deque
 
+import torch._dynamo
+import torch._functorch.config
+torch._dynamo.config.recompile_limit = 64
+torch._functorch.config.donated_buffer = False
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -112,6 +117,8 @@ class ModuleState:
         self.generator          = Generator(cfg, layer_idx=module_idx).to(device)
         self.layerwise_predictor = LayerwisePredictor(cfg).to(device)
         self.manifold_est       = ManifoldEstimator(cfg).to(device)
+        self.generator.forward_clean_gen = torch.compile(self.generator.forward_clean_gen)
+        self.generator.forward_corrupt   = torch.compile(self.generator.forward_corrupt)
         # Only module 0 owns a decoder. It produces the hard-negative corrupt tokens for the
         # whole hierarchy (they propagate up the chain) and acts as module 0's reconstruction probe.
         if module_idx == 0:
@@ -249,198 +256,28 @@ class ModuleState:
 
 # ── Per-module training step ────────────────────────────────────────────────
 
-def module_forward(
-    ms: ModuleState,
-    x: torch.Tensor,
-    prev: dict,
-    step: int,
-    cfg: Config,
-    device: torch.device,
-    decoder_ms: "ModuleState",
-    thread_genfree: bool,
-) -> dict:
-    """Phase A: run a module's three-stream forward (with grad) and its discriminator step.
-
-    `prev` holds the detached {clean, gen, corrupt, x_corr} outputs threaded up from the module
-    below (all None for module 0). `thread_genfree` requests the leak-free gen output needed to
-    thread up to the next module. The generator forward graph is left intact (the discriminator
-    trains on detached latents) so the predictor/generator backward can run later in Phase B.
-
-    decoder_ms is the module that owns the (single) decoder — always module 0; only module 0 samples
-    its own hard negatives, later modules reuse the upstream x_corr.
-    """
-    autocast   = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-    module_idx = ms.module_idx
-    # use local step so each module's LR schedule starts from 0
-    local_step = max(0, step - module_idx * cfg.module_warmup_steps)
-
-    def decoder_sample_fn(clean_latents, gen_hiddens):
-        logits = decoder_ms.layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach().float())
-        logits.scatter_(-1, x.unsqueeze(-1), float('-inf'))
-        probs   = torch.softmax(logits, dim=-1)
-        B, T    = x.shape
-        samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
-        return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
-
-    lr = get_lr(local_step, cfg) * ms.adaptive_lr_scale
-    for pg in ms.gen_opt.param_groups:
-        pg["lr"] = lr
-    for pg in ms.manifold_opt.param_groups:
-        pg["lr"] = cfg.manifold_est_lr * ms.adaptive_lr_scale
-    for pg in ms.layerwise_pred_opt.param_groups:
-        pg["lr"] = cfg.predictor_lr
-
-    corrupt_fn = decoder_sample_fn if module_idx == 0 else None
-
-    # Bottom-up input shift: module i+1's gen stream looks `gap` positions further back than module i,
-    # so its prev_latent_gen must come from `gap` positions earlier (out[:, gap:] = gen_i[:, :-gap]).
-    # This keeps module i+1 genuinely h_{i+1}-ahead (otherwise gen_i[p] would leak context up to p-1)
-    # and makes the top-down look-ahead computable at inference. Clean/corrupt prev stay position-aligned
-    # — they build the full-context target/negative manifold, only the prediction stream looks back.
-    prev_gen = prev["gen"]
-    if module_idx > 0 and prev_gen is not None:
-        gap = cfg.prediction_horizons[module_idx] - cfg.prediction_horizons[module_idx - 1]
-        prev_gen = _shift_time(prev_gen, gap)
-
-    # ── Forward pass ────────────────────────────────────────────────────────
-    use_stochastic_reveal = (
-        cfg.gen_reveal_interval > 0
-        and step % cfg.gen_reveal_interval == 0
-    )
-    with autocast():
-        gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread = ms.generator.forward_cross_layerwise(
-            x,
-            prev_latent_clean=prev["clean"],
-            prev_latent_gen=prev_gen,
-            prev_latent_corrupt=prev["corrupt"],
-            x_corr=prev["x_corr"],
-            corrupt_fn=corrupt_fn,
-            thread_genfree=thread_genfree,
-            use_stochastic_reveal=use_stochastic_reveal,
-        )
-        target_latents = clean_latents
-
-    # ── Discriminator step ───────────────────────────────────────────────────
-    with autocast():
-        disc_layer_losses = []
-        disc_margin_sum   = 0.0
-        for l in range(cfg.n_layers):
-            pos_scores = ms.manifold_est(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
-            neg_scores = ms.manifold_est(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
-            layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
-            disc_margin_sum += (pos_scores.mean() - neg_scores.mean()).item()
-            layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
-            layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
-            disc_layer_losses.append(layer_disc)
-        disc_base   = sum(disc_layer_losses) / cfg.n_layers
-        disc_margin = disc_margin_sum / cfg.n_layers
-
-        r1_penalty  = disc_base.new_zeros(1).squeeze()
-        r1_computed = cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0
-        if r1_computed:
-            for l in range(cfg.n_layers):
-                real_in    = target_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
-                real_score = ms.manifold_est(real_in, apply_dropout=False)
-                grad       = torch.autograd.grad(outputs=real_score.sum(), inputs=real_in, create_graph=True)[0]
-                r1_penalty = r1_penalty + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
-        disc_total = disc_base + r1_penalty * cfg.r1_weight
-
-    ms.manifold_opt.zero_grad()
-    disc_total.backward()
-    torch.nn.utils.clip_grad_norm_(ms.manifold_est.parameters(), cfg.grad_clip)
-    ms.manifold_opt.step()
-
-    return {
-        "module_idx":      module_idx,
-        "local_step":      local_step,
-        "lr":              lr,
-        "gen_hiddens":     gen_hiddens,
-        "clean_latents":   clean_latents,
-        "corrupt_latents": corrupt_latents,
-        "target_latents":  target_latents,
-        "x_corr":          x_corr,
-        "gen_thread":      gen_thread,
-        "prev_clean":      prev["clean"],
-        "disc_base":       disc_base,
-        "disc_margin":     disc_margin,
-        "r1_penalty":      r1_penalty,
-        "r1_computed":     r1_computed,
-    }
-
-
 def module_predict_gen(
     ms: ModuleState,
     x: torch.Tensor,
     ctx: dict,
-    extra_preds: list,
+    preds: list,
     step: int,
     cfg: Config,
     device: torch.device,
-    decoder_ms: "ModuleState",
-    retain_graph_for_feed: bool = False,
+    retain_graph: bool = False,
+    dec_logits: list = None,
 ) -> dict:
-    """Phase B: compute the predictor output (conditioned on the next module's detached prediction
-    via the predictor's extra slot), train the decoder (module 0), and run the generator+predictor
-    backward. `extra_preds` is the per-layer detached prediction from the module above, or None
-    (→ the predictor's learned null embedding). The generator and predictor optimizer steps are NOT
-    taken here — they are deferred to the end of Phase B so the cross-module term from the module below
-    can accumulate first. `retain_graph_for_feed` keeps this module's generator graph alive so a lower
-    module can backprop into it (needed only when cross_module_grad_include_generator is on).
-    Returns step metrics including this module's preds.
+    """Phase C: run the JEPA loss + decoder + backward for one module.
+    preds: pre-computed per-layer predictor outputs from Phase B (with grad).
+    Optimizer steps are deferred to the end of Phase C so cross-module gradients
+    from the module below can accumulate first.
     """
     autocast        = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     module_idx      = ms.module_idx
     local_step      = ctx["local_step"]
-    gen_hiddens     = ctx["gen_hiddens"]
     clean_latents   = ctx["clean_latents"]
     corrupt_latents = ctx["corrupt_latents"]
     target_latents  = ctx["target_latents"]
-    prev_clean      = ctx["prev_clean"]
-
-    with autocast():
-        preds = [
-            ms.layerwise_predictor.predictors[l](
-                gen_hiddens[l],
-                extra_preds[l] if extra_preds is not None else None,
-            )
-            for l in range(cfg.n_layers)
-        ]
-
-    # ── Decoder backward (module 0 only) ──────────────────────────────────────
-    # The decoder learns to decode the predictor output (preds) — the latent that is actually
-    # decoded at inference — rather than the raw context-generator output (gen_hiddens). The second
-    # term keeps it anchored on the true clean latents, which are also what decoder_sample_fn reads.
-    step_dec_losses = None
-    if module_idx == 0 and step % cfg.decoder_train_interval == 0:
-        targets = x.reshape(-1)
-        with autocast():
-            dec_losses = [
-                (
-                    F.cross_entropy(
-                        decoder_ms.layerwise_decoder(l, preds[l].detach()).reshape(-1, cfg.vocab_size),
-                        targets,
-                    ),
-                    F.cross_entropy(
-                        decoder_ms.layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size),
-                        targets,
-                    ),
-                )
-                for l in range(cfg.n_layers)
-            ]
-            dec_loss = sum((a + b) / 2 for a, b in dec_losses) / cfg.n_layers
-        ms.decoder_opt.zero_grad()
-        dec_loss.backward()
-        torch.nn.utils.clip_grad_norm_(ms.layerwise_decoder.parameters(), cfg.grad_clip)
-        ms.decoder_opt.step()
-        step_dec_losses = [(da.item(), db.item(), 0.0) for da, db in dec_losses]
-        for l, (da, db) in enumerate(dec_losses):
-            ms.decoder_layer_sums_a[l] += da.item()
-            ms.decoder_layer_sums_b[l] += db.item()
-        ms.decoder_sum   += dec_loss.item()
-        ms.decoder_count += 1
-        ms.decoder_hist.append((step, step_dec_losses[0][0]))
-        while ms.decoder_hist[0][0] < step - 50_000:
-            ms.decoder_hist.popleft()
 
     disc_margin = ctx["disc_margin"]
     disc_base   = ctx["disc_base"]
@@ -475,6 +312,9 @@ def module_predict_gen(
                 attract = gra(attract, pred_v, cfg.gra_scale)
 
             manifold_stablization = (disc_corrupt - disc_target).mean()
+
+            #Raise to the poer of to so weeker loss effect things less
+            manifold_stablization = manifold_stablization * max(0, float(disc_margin))
             layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
             if cfg.vicreg_var_weight > 0.0:
                 layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(target_latents[l + 1], cfg.vicreg_gamma)
@@ -491,11 +331,10 @@ def module_predict_gen(
         # (at gen_recon_weight scale) into the generator + predictor AND into the decoder — i.e. the
         # readout co-adapts with the representation every step, on top of the detached probe that runs
         # every decoder_train_interval steps.
-        if module_idx == 0 and cfg.gen_recon_weight > 0.0:
-            dec = decoder_ms.layerwise_decoder
+        if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
             recon_terms = [
                 F.cross_entropy(
-                    dec(l, preds[l][:, lo:hi]).reshape(-1, cfg.vocab_size),
+                    dec_logits[l][:, lo:hi].reshape(-1, cfg.vocab_size),
                     x[:, lo:hi].reshape(-1),
                 )
                 for l in range(cfg.n_layers)
@@ -506,16 +345,16 @@ def module_predict_gen(
     for param in ms.manifold_est.parameters():
         param.requires_grad_(False)
     # NB: neither gen_opt nor layerwise_pred_opt is zeroed or stepped here. Generator and predictor
-    # grads accumulate across the Phase B reversed pass — this module's own loss plus the cross-module
-    # term from the module below (which trains this predictor's weights, and its generator's too when
-    # cross_module_grad_include_generator is on). Both opts are zeroed once at the start of Phase B and
-    # clipped+stepped once at the end (see train loop). retain_graph_for_feed keeps this generator graph
-    # alive so the module below can backprop into it.
+    # grads accumulate across the Phase C reversed pass — this module's own loss plus the cross-module
+    # term from the module below (which trains this predictor's weights and its generator's too). Both
+    # opts are zeroed once at the start of Phase B and
+    # clipped+stepped once at the end (see train loop). retain_graph keeps the Phase B pred graph alive
+    # so the module below can backprop into it.
     # Isolate the recon term's gradient on the decoder (the every-13-steps probe has already stepped
     # and left stale grads on these params) so decoder_opt applies only the small attached update.
     if recon_ce is not None:
         ms.decoder_opt.zero_grad()
-    jepa_loss.backward(retain_graph=retain_graph_for_feed)
+    jepa_loss.backward(retain_graph=retain_graph)
     if recon_ce is not None:
         torch.nn.utils.clip_grad_norm_(ms.layerwise_decoder.parameters(), cfg.grad_clip)
         ms.decoder_opt.step()
@@ -550,9 +389,8 @@ def module_predict_gen(
     ms.latent_mean_sum += step_latent_mean
     ms.loss_count      += 1
 
-    ms.last_preds       = preds
-    ms.last_gen_hiddens = gen_hiddens
-    ms.last_x           = x
+    ms.last_preds = preds
+    ms.last_x     = x
     ms.last_clean       = latent  # top clean latent [B, T, D], for the participation-ratio diagnostic
 
     return {
@@ -564,31 +402,149 @@ def module_predict_gen(
         "r1_penalty":      r1_penalty,
         "step_latent_std": step_latent_std,
         "step_latent_mean": step_latent_mean,
-        "lr":              ctx["lr"],
-        "step_dec_losses": step_dec_losses,
-        "r1_computed":     r1_computed,
+        "lr":          ctx["lr"],
+        "r1_computed": r1_computed,
         "target_latents":  target_latents,
         "preds":           preds,
     }
 
 
-def build_feed_copy(ms, gen_hiddens, extra_used, cfg, device, include_generator):
-    """Re-run a module's predictor to produce the prediction handed down to the module below.
 
-    The extra slot is always detached, so the gradient stops at this module — one hop, never the module
-    above it. gen_hiddens is detached only when include_generator is False: then the downstream loss
-    reaches this predictor's weights alone. When include_generator is True, gen_hiddens stays in-graph,
-    so the downstream loss also flows through this module's context generator (back to its detached
-    Phase A inputs, never further down). The predictor forward is cheap; the generator graph it rides
-    on (when included) must have been kept alive via retain_graph in this module's backward."""
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        return [
-            ms.layerwise_predictor.predictors[l](
-                gen_hiddens[l] if include_generator else gen_hiddens[l].detach(),
-                extra_used[l].detach() if extra_used is not None else None,
-            )
-            for l in range(cfg.n_layers)
-        ]
+# ── Phase A1: clean + gen forward ───────────────────────────────────────────
+
+def module_forward_clean_gen(
+    ms: ModuleState,
+    x: torch.Tensor,
+    prev: dict,
+    step: int,
+    cfg: Config,
+    device: torch.device,
+    thread_genfree: bool,
+) -> dict:
+    """Phase A1: run a module's clean and gen streams. No corrupt, no discriminator.
+    prev has keys 'clean' and 'gen' (both None for module 0).
+    Returns gen_hiddens, clean_latents, cross_kvs, gen_thread (cross_kvs not detached)."""
+    autocast   = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    module_idx = ms.module_idx
+    local_step = max(0, step - module_idx * cfg.module_warmup_steps)
+
+    lr = get_lr(local_step, cfg) * ms.adaptive_lr_scale
+    for pg in ms.gen_opt.param_groups:
+        pg["lr"] = lr
+    for pg in ms.manifold_opt.param_groups:
+        pg["lr"] = cfg.manifold_est_lr * ms.adaptive_lr_scale
+    for pg in ms.layerwise_pred_opt.param_groups:
+        pg["lr"] = cfg.predictor_lr
+
+    prev_gen = prev["gen"]
+    if module_idx > 0 and prev_gen is not None:
+        gap = cfg.prediction_horizons[module_idx] - cfg.prediction_horizons[module_idx - 1]
+        prev_gen = _shift_time(prev_gen, gap)
+
+    use_stochastic_reveal = (
+        cfg.gen_reveal_interval > 0
+        and step % cfg.gen_reveal_interval == 0
+    )
+
+    with autocast():
+        gen_hiddens, clean_latents, cross_kvs, gen_thread = ms.generator.forward_clean_gen(
+            x,
+            prev_latent_clean=prev["clean"],
+            prev_latent_gen=prev_gen,
+            thread_genfree=thread_genfree,
+            use_stochastic_reveal=use_stochastic_reveal,
+        )
+
+    return {
+        "module_idx":     module_idx,
+        "local_step":     local_step,
+        "lr":             lr,
+        "gen_hiddens":    gen_hiddens,
+        "clean_latents":  clean_latents,
+        "target_latents": clean_latents,
+        "cross_kvs":      cross_kvs,
+        "gen_thread":     gen_thread,
+        "prev_clean":     prev["clean"],
+    }
+
+
+def module_forward_corrupt(
+    ms: ModuleState,
+    x_corr: torch.Tensor,
+    prev_corrupt: torch.Tensor,
+    cross_kvs: list,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    """Phase A2: run the corrupt stream for one module using pre-computed clean K/Vs.
+    x_corr: [B*K, T]. prev_corrupt: None (module 0) or [B*K, T, D] (module 1+)."""
+    autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    with autocast():
+        corrupt_latents = ms.generator.forward_corrupt(x_corr, prev_corrupt, cross_kvs)
+    return {"corrupt_latents": corrupt_latents}
+
+
+def module_discriminator_step(
+    ms: ModuleState,
+    clean_latents: list,
+    corrupt_latents: list,
+    step: int,
+    cfg: Config,
+    device: torch.device,
+) -> dict:
+    """Discriminator (ManifoldEstimator) training step on detached clean vs corrupt latents."""
+    autocast = lambda: torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    with autocast():
+        disc_layer_losses = []
+        disc_margin_sum   = 0.0
+        for l in range(cfg.n_layers):
+            pos_scores = ms.manifold_est(clean_latents[l + 1].detach().reshape(-1, cfg.d_model))
+            neg_scores = ms.manifold_est(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
+            layer_disc = (F.relu(1 - pos_scores).mean() + F.relu(1 + neg_scores).mean()) / 2
+            disc_margin_sum += (pos_scores.mean() - neg_scores.mean()).item()
+            layer_disc = gra(layer_disc, pos_scores, cfg.gra_scale)
+            layer_disc = gra(layer_disc, neg_scores, cfg.gra_scale)
+            disc_layer_losses.append(layer_disc)
+        disc_base   = sum(disc_layer_losses) / cfg.n_layers
+        disc_margin = disc_margin_sum / cfg.n_layers
+
+        r1_penalty  = disc_base.new_zeros(1).squeeze()
+        r1_computed = cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0
+        if r1_computed:
+            for l in range(cfg.n_layers):
+                real_in    = clean_latents[l + 1].detach().reshape(-1, cfg.d_model).requires_grad_(True)
+                real_score = ms.manifold_est(real_in, apply_dropout=False)
+                grad       = torch.autograd.grad(outputs=real_score.sum(), inputs=real_in, create_graph=True)[0]
+                r1_penalty = r1_penalty + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
+        disc_total = disc_base + r1_penalty * cfg.r1_weight
+
+    ms.manifold_opt.zero_grad()
+    disc_total.backward()
+    torch.nn.utils.clip_grad_norm_(ms.manifold_est.parameters(), cfg.grad_clip)
+    ms.manifold_opt.step()
+
+    return {
+        "disc_base":    disc_base,
+        "disc_margin":  disc_margin,
+        "r1_penalty":   r1_penalty,
+        "r1_computed":  r1_computed,
+    }
+
+
+def _sample_corrupt_tokens(
+    logits: torch.Tensor,
+    x: torch.Tensor,
+    cfg: Config,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample hard-negative corrupt tokens from pre-computed decoder logits (detached).
+    logits: [B, T, vocab_size]. Returns x_corr [B*K, T] where no position matches x."""
+    logits = logits.float()
+    logits.scatter_(-1, x.unsqueeze(-1), float('-inf'))
+    probs   = torch.softmax(logits, dim=-1)
+    B, T    = x.shape
+    samples = torch.multinomial(probs.reshape(-1, cfg.vocab_size), num_samples=cfg.corrupt_samples, replacement=True)
+    return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
 
 
 # ── Log headers ─────────────────────────────────────────────────────────────
@@ -641,6 +597,30 @@ def _cols_per_module_log(n_layers: int) -> int:
 def _cols_per_module_steps(n_layers: int) -> int:
     # 3*n_l + 9 + 2*n_l = 5*n_l + 9
     return 5 * n_layers + 9
+
+
+# ── Phase B: compiled predictor chain ───────────────────────────────────────
+
+def _phase_b_forward(active, gen_hiddens_by_module, predictors_by_module,
+                     feeds, gaps, cross_module_pred_grad, w, n_layers):
+    """Top-down predictor pass for all active modules as one compiled graph."""
+    preds = {}
+    for i in reversed(active):
+        if feeds[i]:
+            gap = gaps[i]
+            prev = preds[i + 1]
+            if cross_module_pred_grad:
+                extra = [_shift_time(fp.detach() + w * (fp - fp.detach()), -gap) for fp in prev]
+            else:
+                extra = [_shift_time(fp.detach(), -gap) for fp in prev]
+        else:
+            extra = None
+        gh = gen_hiddens_by_module[i]
+        preds[i] = [
+            predictors_by_module[i][l](gh[l], extra[l] if extra is not None else None)
+            for l in range(n_layers)
+        ]
+    return preds
 
 
 # ── Main training loop ───────────────────────────────────────────────────────
@@ -738,77 +718,108 @@ def train():
 
         active = [i for i in range(cfg.n_modules) if step >= i * cfg.module_warmup_steps]
 
-        # ── Phase A: bottom-up forward + discriminator; thread detached outputs up ──
-        ctxs = {}
-        prev = {"clean": None, "gen": None, "corrupt": None, "x_corr": None}
+        # ── Phase A1: clean + gen streams, bottom-up ─────────────────────────
+        ctxs     = {}
+        prev_cg  = {"clean": None, "gen": None}
         for pos_i, i in enumerate(active):
-            is_top = pos_i == len(active) - 1
-            ctxs[i] = module_forward(
-                module_states[i], x, prev, step, cfg, device,
-                decoder_ms=module_states[0], thread_genfree=not is_top,
+            is_top  = pos_i == len(active) - 1
+            ctxs[i] = module_forward_clean_gen(
+                module_states[i], x, prev_cg, step, cfg, device,
+                thread_genfree=not is_top,
             )
             if not is_top:
                 c = ctxs[i]
-                prev = {
-                    "clean":   c["clean_latents"][-1].detach().float(),
-                    "gen":     c["gen_thread"].detach().float(),
-                    "corrupt": c["corrupt_latents"][-1].detach().float(),
-                    "x_corr":  c["x_corr"],
+                prev_cg = {
+                    "clean": c["clean_latents"][-1].detach().float(),
+                    "gen":   c["gen_thread"].detach().float(),
                 }
 
-        # ── Phase B: top-down predictor + generator step; feed each module's pred down ──
-        # Module i's predictor is conditioned on module i+1's prediction once i+1 has trained past
-        # cross_module_feed_start_step local steps (else its learned null is used). When
-        # cross_module_pred_grad is on, that fed-down prediction also carries gradient (scaled by
-        # cross_module_pred_grad_weight): module i's loss trains module i+1's PREDICTOR weights — one
-        # hop, never i+1's generator (gen_hiddens detached) nor i+2 (extra detached). Predictor steps
-        # are therefore deferred: grads accumulate across this reversed pass (each module's own loss +
-        # the cross term from the module below) and every predictor is clipped+stepped once at the end.
+        # ── Phase B: top-down predictor pass (with grad) ─────────────────────
         for i in active:
             module_states[i].gen_opt.zero_grad()
             module_states[i].layerwise_pred_opt.zero_grad()
-        incl_gen = cfg.cross_module_pred_grad and cfg.cross_module_grad_include_generator
-        detached_preds = {}
-        feed_preds     = {}
-        for i in reversed(active):
-            nxt  = i + 1
-            feed = (
+        # Pre-compute Python-level feed flags so `step` stays outside the compiled graph.
+        _feeds = {
+            i: (
                 cfg.cross_module_pred_feed
-                and nxt in ctxs
-                and (step - nxt * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
+                and (i + 1) in ctxs
+                and (step - (i + 1) * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
-            # Top-down look-ahead: module i reads module nxt's prediction `gap` positions ahead
-            # (extra_i[t] = pred_nxt[t + gap]); the last `gap` positions get no extra and are masked.
-            gap = cfg.prediction_horizons[nxt] - cfg.prediction_horizons[i] if feed else 0
-            if feed and cfg.cross_module_pred_grad:
-                # Same value as the detached feed, but gradient w.r.t. module nxt scaled by w.
-                w     = cfg.cross_module_pred_grad_weight
-                extra = [_shift_time(fp.detach() + w * (fp - fp.detach()), -gap) for fp in feed_preds[nxt]]
-            elif feed:
-                extra = [_shift_time(p, -gap) for p in detached_preds[nxt]]
-            else:
-                extra = None
-            # Whether the module below (i-1) will consume a gradient feed from this module this step:
-            # it exists and its feed gate (keyed on this module's local step) is open. Only then do we
-            # build the feed-copy / retain this generator graph for that backward.
+            for i in active
+        }
+        _gaps = {
+            i: cfg.prediction_horizons[i + 1] - cfg.prediction_horizons[i]
+            for i in active if i + 1 < cfg.n_modules
+        }
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            preds_by_module = _phase_b_forward(
+                tuple(active),
+                {i: ctxs[i]["gen_hiddens"] for i in active},
+                {i: module_states[i].layerwise_predictor.predictors for i in active},
+                _feeds,
+                _gaps,
+                cfg.cross_module_pred_grad,
+                cfg.cross_module_pred_grad_weight,
+                cfg.n_layers,
+            )
+
+        # Save gen_hiddens for the diagnostic decoder-accuracy comparison.
+        for i in active:
+            module_states[i].last_gen_hiddens = ctxs[i]["gen_hiddens"]
+
+        # ── Decoder logits: run once attached; reuse for sampling and reconstruction ──
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            dec_logits = [
+                module_states[0].layerwise_decoder(l, preds_by_module[0][l])
+                for l in range(cfg.n_layers)
+            ]
+
+        # ── Sample corrupt tokens from the decoder applied to module 0's pred ──
+        x_corr = _sample_corrupt_tokens(dec_logits[cfg.n_layers - 1].detach(), x, cfg, device)
+
+        # ── Phase A2: corrupt stream, bottom-up ──────────────────────────────
+        corrupt_ctxs = {}
+        prev_corrupt = None   # [B*K, T, D] or None
+        for i in active:
+            corrupt_ctxs[i] = module_forward_corrupt(
+                module_states[i], x_corr, prev_corrupt, ctxs[i]["cross_kvs"], cfg, device
+            )
+            prev_corrupt = corrupt_ctxs[i]["corrupt_latents"][-1].detach().float()
+
+        # ── Discriminator step (all active modules) ───────────────────────────
+        disc_results = {}
+        for i in active:
+            disc_results[i] = module_discriminator_step(
+                module_states[i],
+                ctxs[i]["clean_latents"],
+                corrupt_ctxs[i]["corrupt_latents"],
+                step, cfg, device,
+            )
+
+        # ── Phase C: generator losses + backward (preds from Phase B) ────────
+        # Phase B already ran all predictors with grad; preds_by_module[i] is
+        # connected to gen_hiddens[i] and to preds_by_module[i+1] (via the
+        # extra slot). Cross-module gradient flows naturally through this graph:
+        # module i-1's loss → preds_by_module[i-1] → preds_by_module[i] →
+        # predictor_i + gen_i. retain_graph is needed while a lower module
+        # still needs to backprop through this module's preds.
+        for i in reversed(active):
+            full_ctx = {
+                **ctxs[i],
+                "corrupt_latents": corrupt_ctxs[i]["corrupt_latents"],
+                **disc_results[i],
+            }
             below_feeds = (
                 cfg.cross_module_pred_feed
                 and i != active[0]
                 and (step - i * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
             last_results[i] = module_predict_gen(
-                module_states[i], x, ctxs[i], extra, step, cfg, device,
-                decoder_ms=module_states[0],
-                retain_graph_for_feed=(incl_gen and below_feeds),
+                module_states[i], x, full_ctx, preds_by_module[i], step, cfg, device,
+                retain_graph=below_feeds,
+                dec_logits=dec_logits if i == 0 else None,
             )
-            detached_preds[i] = [p.detach() for p in last_results[i]["preds"]]
-            if cfg.cross_module_pred_grad and below_feeds:
-                feed_preds[i] = build_feed_copy(
-                    module_states[i], ctxs[i]["gen_hiddens"], extra, cfg, device,
-                    include_generator=incl_gen,
-                )
-        # All cross-module contributions are in; clip + step every generator and predictor once
-        # (clipped jointly per module, matching the original combined-norm clip).
+        # All cross-module contributions in; clip + step every generator and predictor once.
         for i in active:
             ms = module_states[i]
             torch.nn.utils.clip_grad_norm_(
@@ -828,7 +839,6 @@ def train():
             if r is None:
                 row += [""] * n_empty_steps
                 continue
-            sdl = r["step_dec_losses"]
             row += [f"{ll.item():.6f}"  for ll in r["layer_losses"]]
             row += [f"{a.item():.6f}"   for a  in r["attract_losses"]]
             row += [f"{rp.item():.6f}"  for rp in r["repel_losses"]]
@@ -840,9 +850,8 @@ def train():
                 f"{r['step_latent_mean']:.6f}",
                 f"{r['lr']:.6e}",
             ]
-            _dummy = [(0, 0, 0)] * cfg.n_layers
-            row += [f"{da:.6f}" if sdl else "" for da, _, __ in (sdl or _dummy)]
-            row += [f"{db:.6f}" if sdl else "" for _, db, __ in (sdl or _dummy)]
+            row += [""] * cfg.n_layers  # decoder_a (probe removed)
+            row += [""] * cfg.n_layers  # decoder_b (probe removed)
         steps_log_writer.writerow(row)
 
         # ── eval log ─────────────────────────────────────────────────────────
@@ -878,8 +887,7 @@ def train():
                 rec_c     = max(ms.recon_count, 1)
                 avg_dec_c = [ms.decoder_layer_sums_c[l] / rec_c for l in range(nl)]
                 avg_dec   = ms.decoder_sum    / dc
-                avg_dec_a_mean = sum(avg_dec_a)    / nl
-                avg_dec_c_mean = sum(avg_dec_c)    / nl
+                avg_dec_c_mean = sum(avg_dec_c) / nl
                 avg_std   = ms.latent_std_sum  / lc
                 avg_mean  = ms.latent_mean_sum / lc
                 avg_r1    = ms.r1_sum  / rc
@@ -946,7 +954,7 @@ def train():
                     f"l{l} p={pred_char_acc[l]:.1f}%"
                     for l in range(nl)
                 )
-                dec_str = f"dec {avg_dec_a_mean:.4f} rec {avg_dec_c_mean:.4f} | " if ms.layerwise_decoder is not None else ""
+                dec_str = f"rec {avg_dec_c_mean:.4f} | " if ms.layerwise_decoder is not None else ""
                 print(
                     f"  [m{i}] step {step:7d} | {layer_str} | "
                     f"margin {avg_mfld:.4f}(σ={mfld_std:.4f}) r1={avg_r1:.4f} | "

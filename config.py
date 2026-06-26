@@ -110,11 +110,6 @@ class Config:
     cross_module_pred_grad_weight: float = 0.15
     # Let that cross-module gradient reach module i+1's CONTEXT GENERATOR as well as its predictor, so
     # the higher module also shapes its representation to be useful downstream. Still one hop only —
-    # the generator's own inputs are the detached up-threaded latents (Phase A), so it never reaches
-    # module i. Off → the feed-copy detaches gen_hiddens and only the predictor is coupled. This is a
-    # larger relaxation of the per-module isolation: a lower objective now nudges the higher manifold,
-    # bounded by cross_module_pred_grad_weight and dominated by the higher module's own local loss.
-    cross_module_grad_include_generator: bool = True
 
     # Eval / checkpointing
     eval_interval: int = 500
