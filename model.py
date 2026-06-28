@@ -287,17 +287,26 @@ class Generator(nn.Module):
         # ── Generative (null) stream ──────────────────────────────────────────
         use_stochastic = use_stochastic_reveal and self.training and self.horizon > 1
         gen_mask = self._build_stochastic_gen_mask(B, T, x.device) if use_stochastic else None
+
+        # Random Bernoulli null mask for module 0: each (batch, position) is independently
+        # visible (real token embedding) with probability 1-null_mask_prob, null otherwise.
+        # Generated once so the same mask applies across all blocks.
+        if self.layer_idx == 0:
+            visible_mask = torch.rand(B, T, device=x.device) >= self.cfg.null_mask_prob  # [B, T]
+        else:
+            visible_mask = None
+
         gen_hiddens = []
         for i, block in enumerate(self.blocks):
             if self.layer_idx == 0:
-                h = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1).clone()
+                null_base = (self.null_embs[i] + self.pos_emb(pos)).unsqueeze(0).expand(B, T, -1)
+                if visible_mask.any():
+                    h = torch.where(visible_mask.unsqueeze(-1), pre_block_states[i], null_base)
+                else:
+                    h = null_base.clone()
             else:
                 null_char = self.null_embs[i].unsqueeze(0).unsqueeze(0).expand(B, T, -1)
                 h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
-            if clean_token_leak and self.cfg.n_clean_tokens > 0:
-                idxs = torch.rand(B, T, device=x.device).argsort(dim=1)[:, :self.cfg.n_clean_tokens]
-                idx_exp = idxs.unsqueeze(-1).expand(-1, -1, h.size(-1))
-                h.scatter_(1, idx_exp, pre_block_states[i].gather(1, idx_exp))
             kv0, kv1, kv2 = cross_kvs[i]
             h = h + block.input_mlp(h)
             h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon, attn_mask=gen_mask)
@@ -305,9 +314,9 @@ class Generator(nn.Module):
             h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon, attn_mask=gen_mask)
             gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
 
-        # ── Gen thread (deterministic mask, for threading to next module) ─────
+        # ── Gen thread (all-null, deterministic, for threading to next module) ─
         if thread_genfree:
-            if use_stochastic:
+            if use_stochastic or (self.layer_idx == 0 and visible_mask is not None):
                 last_i     = len(self.blocks) - 1
                 last_block = self.blocks[last_i]
                 if self.layer_idx == 0:
@@ -326,7 +335,7 @@ class Generator(nn.Module):
         else:
             gen_thread = None
 
-        return gen_hiddens, clean_latents, cross_kvs, gen_thread
+        return gen_hiddens, clean_latents, cross_kvs, gen_thread, visible_mask
 
     def forward_corrupt(self, x_corr: torch.Tensor,
                         prev_latent_corrupt: torch.Tensor = None,
@@ -363,7 +372,7 @@ class Generator(nn.Module):
                                 use_stochastic_reveal: bool = False):
         """Backward-compatible wrapper: forward_clean_gen then x_corr sampling then forward_corrupt.
         New training code calls forward_clean_gen + forward_corrupt directly."""
-        gen_hiddens, clean_latents, cross_kvs, gen_thread = self.forward_clean_gen(
+        gen_hiddens, clean_latents, cross_kvs, gen_thread, _visible_mask = self.forward_clean_gen(
             x, prev_latent_clean, prev_latent_gen,
             clean_token_leak=clean_token_leak,
             thread_genfree=thread_genfree,
@@ -425,14 +434,21 @@ class Predictor(nn.Module):
             nn.Linear(h, cfg.d_model, bias=False),
         )
         self.null_emb = nn.Parameter(torch.empty(cfg.d_model))
+        # Target-position embedding: tells the predictor which latent position it should output.
+        # Added to the gen-hidden before the MLP so the same weights can predict any position.
+        self.pos_emb = nn.Embedding(cfg.context_length, cfg.d_model)
         self.apply(self._init_weights)
         nn.init.normal_(self.null_emb, std=0.5)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor, extra: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, extra: torch.Tensor = None,
+                target_pos: torch.Tensor = None) -> torch.Tensor:
+        if target_pos is not None:
+            x = x + self.pos_emb(target_pos)
         if extra is None:
             extra = self.null_emb.expand(*x.shape[:-1], -1)
         return self.net(torch.cat([x, extra], dim=-1))

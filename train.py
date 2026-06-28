@@ -172,6 +172,10 @@ class ModuleState:
         self.attract_layer_sums     = [0.0] * n
         self.toward_zero_layer_sums = [0.0] * n
         self.repel_layer_sums       = [0.0] * n
+        self.attract_null_layer_sums    = [0.0] * n
+        self.attract_visible_layer_sums = [0.0] * n
+        self.past_layer_sums            = [0.0] * n
+        self.future_layer_sums          = [0.0] * n
         self.jepa_sum = self.manifold_sum = self.clean_corrupt_sum = 0.0
         self.latent_std_sum = self.latent_mean_sum = self.r1_sum = 0.0
         self.r1_count = self.clean_corrupt_count = 0
@@ -220,7 +224,7 @@ class ModuleState:
             sub_models.append(("input_latent_decoder", self.input_latent_decoder, "input_latent_dec_opt"))
         for key, model, opt_key in sub_models:
             try:
-                model.load_state_dict(d[key])
+                model.load_state_dict(d[key], strict=False)
             except (RuntimeError, KeyError) as e:
                 print(f"  Warning: module {self.module_idx} {key} not loaded ({e}) — fresh init")
                 skip_opts.add(opt_key)
@@ -309,57 +313,140 @@ def module_predict_gen(
     recon_terms    = None
     input_dec_loss = None
     with autocast():
-        layer_losses       = []
-        attract_losses     = []
-        toward_zero_losses = []
-        repel_losses       = []
+        layer_losses            = []
+        attract_losses          = []
+        attract_null_losses     = []
+        attract_visible_losses  = []
+        past_losses             = []
+        future_losses           = []
+        toward_zero_losses      = []
+        repel_losses            = []
         B, T = x.shape
         # Valid prediction window for this module: [lo, hi) = [h_i, T - g_i). Front cut = empty attention
         # context (gen sees <= t - h_i); tail cut = no top-down extra (extra_i[t] = pred_{i+1}[t + g_i]).
         h_i    = cfg.prediction_horizons[module_idx]
         g_i    = (cfg.prediction_horizons[module_idx + 1] - h_i) if module_idx < cfg.n_modules - 1 else 0
         lo, hi = h_i, T - g_i
+
+        gen_hiddens  = ctx["gen_hiddens"]   # list of [B, T, d_model] per block
+        visible_mask = ctx.get("visible_mask")  # [B, T] bool or None (module 0 only)
+
+        # ── Sample random past/future target positions once (shared across layers) ─
+        # For each query t in [lo, hi), pick one random target:
+        #   past:   j ~ Uniform[lo, t-1]   (skip t=lo, no valid past)
+        #   future: j ~ Uniform[t+1, hi-1] (skip t=hi-1, no valid future)
+        W      = hi - lo
+        t_idx  = torch.arange(lo, hi, device=x.device)   # [W]
+
+        past_range = t_idx - lo                           # [W], 0 at t=lo
+        has_past   = past_range > 0
+        j_past     = torch.zeros(W, dtype=torch.long, device=x.device)
+        if has_past.any():
+            j_past[has_past] = lo + (
+                torch.rand(int(has_past.sum()), device=x.device) * past_range[has_past].float()
+            ).long()
+
+        future_range = (hi - 1) - t_idx                  # [W], 0 at t=hi-1
+        has_future   = future_range > 0
+        j_future     = torch.zeros(W, dtype=torch.long, device=x.device)
+        if has_future.any():
+            j_future[has_future] = t_idx[has_future] + 1 + (
+                torch.rand(int(has_future.sum()), device=x.device) * future_range[has_future].float()
+            ).long()
+
+        if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
+            recon_terms = []
+
         for l in range(cfg.n_layers):
             disc_target  = ms.manifold_est(target_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(B, T)
             K            = cfg.corrupt_samples
             disc_corrupt = ms.manifold_est(corrupt_latents[l + 1].reshape(-1, cfg.d_model), apply_dropout=False).reshape(K, B, T).mean(0)
 
-            # Restrict the prediction loss to the valid window; the gen stream has no meaningful
-            # prediction before `lo` (empty context) or at/after `hi` (no top-down extra).
+            # ── Current prediction (Phase B) — split by visible/null mask ────────
             pred_v = preds[l][:, lo:hi]
             targ_v = target_latents[l + 1].detach()[:, lo:hi]
-            attract = F.mse_loss(pred_v, targ_v)
+            if visible_mask is not None:
+                vm       = visible_mask[:, lo:hi]           # [B, W]
+                vm_flat  = vm.reshape(-1)                   # [B*W]
+                pf       = pred_v.reshape(-1, cfg.d_model)
+                tf       = targ_v.reshape(-1, cfg.d_model)
+                attract_null    = F.mse_loss(pf[~vm_flat], tf[~vm_flat]) if (~vm_flat).any() else pred_v.new_zeros(())
+                attract_visible = F.mse_loss(pf[ vm_flat], tf[ vm_flat]) if   vm_flat.any()  else pred_v.new_zeros(())
+                attract = (attract_null + attract_visible) / 2
+            else:
+                attract         = F.mse_loss(pred_v, targ_v)
+                attract_null    = pred_v.new_zeros(())
+                attract_visible = pred_v.new_zeros(())
+
             if cfg.gradient_residual_amplification and local_step < 30_000:
                 attract = gra(attract, pred_v, cfg.gra_scale)
 
-            manifold_stablization = (disc_corrupt - disc_target).mean()
+            # ── Past + Future: single predictor call, split after ────────────────
+            n_past   = int(has_past.sum())
+            n_future = int(has_future.sum())
+            if n_past > 0 or n_future > 0:
+                gh_w   = gen_hiddens[l][:, lo:hi]
+                parts_gh   = ([gh_w[:, has_past]]   if n_past   > 0 else []) + \
+                             ([gh_w[:, has_future]] if n_future > 0 else [])
+                parts_tpos = ([j_past[has_past]]    if n_past   > 0 else []) + \
+                             ([j_future[has_future]] if n_future > 0 else [])
+                all_pred = ms.layerwise_predictor.predictors[l](
+                    torch.cat(parts_gh, dim=1),
+                    target_pos=torch.cat(parts_tpos),
+                )
+                pred_past_l   = all_pred[:, :n_past]          if n_past   > 0 else None
+                pred_future_l = all_pred[:, n_past:]           if n_future > 0 else None
 
-            #Raise to the poer of to so weeker loss effect things less
-            manifold_stablization = manifold_stablization * max(0, float(disc_margin))
+                targ_past_l   = target_latents[l + 1].detach()[:, j_past[has_past]]   if n_past   > 0 else None
+                targ_future_l = target_latents[l + 1].detach()[:, j_future[has_future]] if n_future > 0 else None
+
+                past_loss   = F.mse_loss(pred_past_l,   targ_past_l)   if n_past   > 0 else pred_v.new_zeros(())
+                future_loss = F.mse_loss(pred_future_l, targ_future_l) if n_future > 0 else pred_v.new_zeros(())
+            else:
+                pred_past_l = pred_future_l = None
+                past_loss = future_loss = pred_v.new_zeros(())
+
+            # ── Reconstruction: first 64 chars only ───────────────────────────────
+            if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
+                terms = []
+                recon_hi = min(hi, 64)
+                if lo < recon_hi:
+                    logits_w = dec_logits[l][:, lo:recon_hi].reshape(-1, cfg.vocab_size)
+                    target_w = x[:, lo:recon_hi].reshape(-1)
+                    terms.append(F.cross_entropy(logits_w, target_w))
+                if n_past > 0:
+                    past_pos = j_past[has_past]
+                    early    = past_pos < 64
+                    if early.any():
+                        past_logits = ms.layerwise_decoder(l, pred_past_l[:, early])
+                        past_tgt    = x[:, past_pos[early]]
+                        terms.append(F.cross_entropy(past_logits.reshape(-1, cfg.vocab_size), past_tgt.reshape(-1)))
+                if terms:
+                    recon_terms.append(sum(terms) / len(terms))
+
+            manifold_stablization = (disc_corrupt - disc_target).mean()
+            manifold_stablization = manifold_stablization # * min(max(0, float(disc_margin)) * 3.0, 1.0)
+            manifold_stablization = 0
             layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
+            if cfg.jepa_past_weight > 0.0:
+                layer_loss = layer_loss + cfg.jepa_past_weight * past_loss
+            if cfg.jepa_future_weight > 0.0:
+                layer_loss = layer_loss + cfg.jepa_future_weight * future_loss
             if cfg.vicreg_var_weight > 0.0:
                 layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(target_latents[l + 1], cfg.vicreg_gamma)
             if cfg.vicreg_cov_weight > 0.0:
                 layer_loss = layer_loss + cfg.vicreg_cov_weight * _vicreg_cov(target_latents[l + 1])
             layer_losses.append(layer_loss)
             attract_losses.append(attract.detach())
+            attract_null_losses.append(attract_null.detach())
+            attract_visible_losses.append(attract_visible.detach())
+            past_losses.append(past_loss.detach())
+            future_losses.append(future_loss.detach())
             toward_zero_losses.append(attract)
-            repel_losses.append(manifold_stablization.detach())
+            repel_losses.append(manifold_stablization)
         jepa_loss = sum(layer_losses) / cfg.n_layers
 
-        # Small next-char grounding (module 0 only). preds[t] is the context-only prediction stream
-        # and never saw token t, so decoding it to x[t] is a next-char prediction. The gradient flows
-        # (at gen_recon_weight scale) into the generator + predictor AND into the decoder — i.e. the
-        # readout co-adapts with the representation every step, on top of the detached probe that runs
-        # every decoder_train_interval steps.
         if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
-            recon_terms = [
-                F.cross_entropy(
-                    dec_logits[l][:, lo:hi].reshape(-1, cfg.vocab_size),
-                    x[:, lo:hi].reshape(-1),
-                )
-                for l in range(cfg.n_layers)
-            ]
             recon_ce  = sum(recon_terms) / cfg.n_layers
             jepa_loss = jepa_loss + recon_ce * cfg.gen_recon_weight
 
@@ -413,11 +500,15 @@ def module_predict_gen(
     for l, ll in enumerate(layer_losses):
         ms.jepa_layer_sums[l] += ll.item()
     for l in range(cfg.n_layers):
-        ms.attract_layer_sums[l]     += attract_losses[l].item()
-        ms.toward_zero_layer_sums[l] += toward_zero_losses[l].item()
-        ms.repel_layer_sums[l]       += repel_losses[l].item()
+        ms.attract_layer_sums[l]         += attract_losses[l].item()
+        ms.attract_null_layer_sums[l]    += attract_null_losses[l].item()
+        ms.attract_visible_layer_sums[l] += attract_visible_losses[l].item()
+        ms.past_layer_sums[l]            += past_losses[l].item()
+        ms.future_layer_sums[l]          += future_losses[l].item()
+        ms.toward_zero_layer_sums[l]     += toward_zero_losses[l].item()
+        ms.repel_layer_sums[l]           += repel_losses[l]
         ms.attract_window[l].append(attract_losses[l].item())
-        ms.repel_window[l].append(repel_losses[l].item())
+        ms.repel_window[l].append(repel_losses[l])
     ms.jepa_sum      += jepa_loss.item()
     ms.manifold_sum        += disc_margin
     ms.manifold_window.append(disc_margin)
@@ -438,14 +529,18 @@ def module_predict_gen(
     ms.last_clean       = latent  # top clean latent [B, T, D], for the participation-ratio diagnostic
 
     return {
-        "layer_losses":    layer_losses,
-        "attract_losses":  attract_losses,
-        "repel_losses":    repel_losses,
-        "jepa_loss":       jepa_loss,
-        "disc_base":       disc_base,
-        "r1_penalty":      r1_penalty,
-        "step_latent_std": step_latent_std,
-        "step_latent_mean": step_latent_mean,
+        "layer_losses":           layer_losses,
+        "attract_losses":         attract_losses,
+        "attract_null_losses":    attract_null_losses,
+        "attract_visible_losses": attract_visible_losses,
+        "past_losses":            past_losses,
+        "future_losses":          future_losses,
+        "repel_losses":           repel_losses,
+        "jepa_loss":              jepa_loss,
+        "disc_base":              disc_base,
+        "r1_penalty":             r1_penalty,
+        "step_latent_std":        step_latent_std,
+        "step_latent_mean":       step_latent_mean,
         "lr":          ctx["lr"],
         "r1_computed": r1_computed,
         "target_latents":  target_latents,
@@ -491,7 +586,7 @@ def module_forward_clean_gen(
     )
 
     with autocast():
-        gen_hiddens, clean_latents, cross_kvs, gen_thread = ms.generator.forward_clean_gen(
+        gen_hiddens, clean_latents, cross_kvs, gen_thread, visible_mask = ms.generator.forward_clean_gen(
             x,
             prev_latent_clean=prev["clean"],
             prev_latent_gen=prev_gen,
@@ -509,6 +604,7 @@ def module_forward_clean_gen(
         "cross_kvs":      cross_kvs,
         "gen_thread":     gen_thread,
         "prev_clean":     prev["clean"],
+        "visible_mask":   visible_mask,
     }
 
 
@@ -600,6 +696,10 @@ def _build_log_header(cfg: Config) -> list[str]:
         p = f"m{i}_"
         cols += [f"{p}jepa_loss_{l}"         for l in _ll]
         cols += [f"{p}attract_{l}"            for l in _ll]
+        cols += [f"{p}attract_null_{l}"       for l in _ll]
+        cols += [f"{p}attract_visible_{l}"    for l in _ll]
+        cols += [f"{p}jepa_past_{l}"          for l in _ll]
+        cols += [f"{p}jepa_future_{l}"        for l in _ll]
         cols += [f"{p}toward_zero_{l}"        for l in _ll]
         cols += [f"{p}repel_{l}"              for l in _ll]
         cols += [f"{p}jepa_loss_avg", f"{p}manifold_margin", f"{p}clean_corrupt_loss"]
@@ -634,8 +734,8 @@ def _build_steps_header(cfg: Config) -> list[str]:
 
 # ── Column counts (for padding inactive modules with empty strings) ──────────
 def _cols_per_module_log(n_layers: int) -> int:
-    # 4*n_l + 3 + 3*n_l + 5 + 2*n_l + 6 + 2*n_l = 11*n_l + 14
-    return 11 * n_layers + 14
+    # 8*n_l + 3 + 3*n_l + 5 + 2*n_l + 2 + 2*n_l = 15*n_l + 10
+    return 15 * n_layers + 10
 
 
 def _cols_per_module_steps(n_layers: int) -> int:
@@ -660,8 +760,10 @@ def _phase_b_forward(active, gen_hiddens_by_module, predictors_by_module,
         else:
             extra = None
         gh = gen_hiddens_by_module[i]
+        T = gh[0].shape[1]
+        target_pos = torch.arange(T, device=gh[0].device)
         preds[i] = [
-            predictors_by_module[i][l](gh[l], extra[l] if extra is not None else None)
+            predictors_by_module[i][l](gh[l], extra[l] if extra is not None else None, target_pos=target_pos)
             for l in range(n_layers)
         ]
     return preds
@@ -886,7 +988,7 @@ def train():
                 continue
             row += [f"{ll.item():.6f}"  for ll in r["layer_losses"]]
             row += [f"{a.item():.6f}"   for a  in r["attract_losses"]]
-            row += [f"{rp.item():.6f}"  for rp in r["repel_losses"]]
+            row += [f"{rp:.6f}"  for rp in r["repel_losses"]]
             row += [
                 f"{r['jepa_loss'].item():.6f}",
                 f"{r['disc_base'].item():.6f}",
@@ -920,8 +1022,12 @@ def train():
                 rc = max(ms.r1_count, 1)
                 nl = cfg.n_layers
 
-                avg_layer = [ms.jepa_layer_sums[l]        / lc for l in range(nl)]
-                avg_attr  = [ms.attract_layer_sums[l]     / lc for l in range(nl)]
+                avg_layer        = [ms.jepa_layer_sums[l]            / lc for l in range(nl)]
+                avg_attr         = [ms.attract_layer_sums[l]         / lc for l in range(nl)]
+                avg_attr_null    = [ms.attract_null_layer_sums[l]    / lc for l in range(nl)]
+                avg_attr_visible = [ms.attract_visible_layer_sums[l] / lc for l in range(nl)]
+                avg_past         = [ms.past_layer_sums[l]            / lc for l in range(nl)]
+                avg_future       = [ms.future_layer_sums[l]          / lc for l in range(nl)]
                 avg_tz    = [ms.toward_zero_layer_sums[l] / lc for l in range(nl)]
                 avg_repel = [ms.repel_layer_sums[l]       / lc for l in range(nl)]
                 avg_jepa  = ms.jepa_sum     / lc
@@ -956,7 +1062,7 @@ def train():
                 part_ratio = 0.0
                 if ms.last_clean is not None:
                     with torch.no_grad():
-                        v = ms.last_clean.float().reshape(-1, ms.last_clean.shape[-1]).var(dim=0)
+                        v = ms.last_clean[:, :15, :].float().reshape(-1, ms.last_clean.shape[-1]).var(dim=0)
                         part_ratio = float(v.sum() ** 2 / (v.pow(2).sum() + 1e-12))
 
                 # char accuracy from last training batch (only modules that own a decoder)
@@ -975,10 +1081,14 @@ def train():
                             pred_char_acc[_l] = (ms.layerwise_decoder(_l, sp).argmax(-1) == tgt_chars).float().mean().item() * 100
                             gen_char_acc[_l]  = (ms.layerwise_decoder(_l, sg).argmax(-1) == tgt_chars).float().mean().item() * 100
 
-                eval_row += [f"{avg_layer[l]:.6f}" for l in range(nl)]
-                eval_row += [f"{avg_attr[l]:.6e}"  for l in range(nl)]
-                eval_row += [f"{avg_tz[l]:.6e}"    for l in range(nl)]
-                eval_row += [f"{avg_repel[l]:.6f}" for l in range(nl)]
+                eval_row += [f"{avg_layer[l]:.6f}"        for l in range(nl)]
+                eval_row += [f"{avg_attr[l]:.6e}"         for l in range(nl)]
+                eval_row += [f"{avg_attr_null[l]:.6e}"    for l in range(nl)]
+                eval_row += [f"{avg_attr_visible[l]:.6e}" for l in range(nl)]
+                eval_row += [f"{avg_past[l]:.6e}"         for l in range(nl)]
+                eval_row += [f"{avg_future[l]:.6e}"       for l in range(nl)]
+                eval_row += [f"{avg_tz[l]:.6e}"           for l in range(nl)]
+                eval_row += [f"{avg_repel[l]:.6f}"        for l in range(nl)]
                 eval_row += [f"{avg_jepa:.6f}", f"{avg_mfld:.6f}", f"{avg_cc:.6f}"]
                 eval_row += [
                     val for l in range(nl)
@@ -992,7 +1102,9 @@ def train():
                 eval_row += [f"{gen_char_acc[l]:.2f}"  for l in range(nl)]
 
                 layer_str = " | ".join(
-                    f"l{l} {avg_layer[l]:.4f}(at={avg_attr[l]:.4f} rp={avg_repel[l]:.4f})"
+                    f"l{l} {avg_layer[l]:.4f}(at={avg_attr[l]:.4f} null={avg_attr_null[l]:.4f} "
+                    f"vis={avg_attr_visible[l]:.4f} past={avg_past[l]:.4f} fut={avg_future[l]:.4f} "
+                    f"rp={avg_repel[l]:.4f})"
                     for l in range(nl)
                 )
                 acc_str = " ".join(

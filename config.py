@@ -15,7 +15,17 @@ class Config:
     predictor_dim: int = 192     # hidden width of per-layer predictor MLP (~80k params with 4 layers)
 
 
-    # Number of positions per sample (per block) replaced with real embeddings instead of null. Makes sure that reconstruction loss pusehes the net to use the incomming data if it is avalible
+    # Fraction of gen-stream token slots that are null (masked) — applied as an independent Bernoulli
+    # mask per (batch, position) before the gen-stream block loop, so the same positions are
+    # null/visible in every block. 1.0 = always null (original behaviour); 0.0 = always visible
+    # (degenerate — makes every current-token prediction trivial).
+    null_mask_prob: float = 0.85
+
+    # Weights for past/future auxiliary prediction losses. 0.0 = track only (no gradient effect).
+    jepa_past_weight:   float = 0.15
+    jepa_future_weight: float = 1.0
+
+    # Kept for reference / old checkpoints; no longer used (replaced by null_mask_prob).
     n_clean_tokens: int = 2
 
     # How often to train the layerwise decoder probes
@@ -43,9 +53,9 @@ class Config:
     # low-dimensional subspace. Covariance term penalises off-diagonal elements of the feature
     # covariance matrix, decorrelating dimensions. Both are applied to target_latents (un-detached)
     # so the gradient flows directly into the encoder. 0.0 = off.
-    vicreg_var_weight: float = 0.000001
-    vicreg_cov_weight: float = 0.000001 / 25
-    vicreg_gamma: float = 1.0      # variance hinge threshold (std must exceed this)
+    vicreg_var_weight: float = 0.03
+    vicreg_cov_weight: float = 0.01 / 10
+    vicreg_gamma: float = 3.0      # variance hinge threshold (std must exceed this)
 
     # JEPA triplet loss
     manifold_stablization_weight: float = 0.1
@@ -90,7 +100,7 @@ class Config:
     # n_modules. The gap g_i = h_{i+1} - h_i sets the bottom-up gen-feed shift and the top-down extra
     # look-ahead shift between modules i and i+1.
     #prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
-    prediction_horizons: tuple = (1)
+    prediction_horizons: tuple = (1,)
     # Stochastic horizon reveal. A fixed tril(-h) mask means gen[t] never attends keys in the recent
     # band (t-h, t-1], so the encoder stops keeping those positions informative and the target goes
     # trivial. Instead, every gen_reveal_interval steps, each query position i independently samples

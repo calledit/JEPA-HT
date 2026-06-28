@@ -34,7 +34,7 @@ def load_checkpoint(path, device):
         modules[idx] = gen
 
         pred = LayerwisePredictor(cfg).to(device)
-        pred.load_state_dict(md["layerwise_predictor"])
+        pred.load_state_dict(md["layerwise_predictor"], strict=False)
         pred.eval()
         predictors[idx] = pred
 
@@ -135,6 +135,8 @@ def _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg,
     P = len(ctx)                       # next-token position
     n_pad = horizons[active[-1]]       # placeholders for the top-down look-ahead chain
     x = torch.tensor([list(ctx) + [0] * n_pad], dtype=torch.long, device=device)
+    T = x.shape[1]
+    target_pos = torch.arange(T, device=device)
 
     # Bottom-up: clean + generative streams, threading detached latents up the hierarchy.
     gens = {}
@@ -160,6 +162,7 @@ def _predict_next_logits(modules, predictors, decoder, active, feed_active, cfg,
             predictors[i].predictors[l](
                 gens[i][l],
                 extra_list[l] if extra_list is not None else None,
+                target_pos=target_pos,
             )
             for l in range(n_layers)
         ]
