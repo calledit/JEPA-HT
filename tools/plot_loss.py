@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--log",    default=default_log())
     parser.add_argument("--smooth", type=int, default=20)
     parser.add_argument("--start",  type=int, default=0)
+    parser.add_argument("--end",    type=int, default=None)
     parser.add_argument("--layer",  type=int, default=None)
     parser.add_argument("--module", type=int, default=0, help="Which module to plot (default 0)")
     args = parser.parse_args()
@@ -132,6 +133,8 @@ def main():
     df = df.sort_values("step").reset_index(drop=True)
     if args.start > 0:
         df = df[df["step"] >= args.start].reset_index(drop=True)
+    if args.end is not None:
+        df = df[df["step"] <= args.end].reset_index(drop=True)
 
     # strip the m{module}_ prefix so the rest of the plotting code is unchanged
     prefix = f"m{args.module}_"
@@ -370,7 +373,7 @@ def main():
     for i, col in enumerate(repel_cols):
         plot_crossing(ax, col, f"repel {i}", layer_colors[i], "--")
     ax.axhline(0, color="gray", linewidth=0.6, linestyle=":")
-    ax.set_ylim(args.start, df["step"].max())
+    ax.set_ylim(args.start, args.end if args.end is not None else df["step"].max())
     ax.set_title("Predicted 0.5-crossing step (rolling fit)")
     ax.set_ylabel("crossing step")
     ax.legend()

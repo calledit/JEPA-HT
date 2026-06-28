@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder
+from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder, InputLatentDecoder
 from data import build_dataset
 
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
@@ -130,6 +130,17 @@ class ModuleState:
             self.layerwise_decoder = None
             self.decoder_opt = None
 
+        # Modules 1+ get a cross-level decoder: decodes predictor output back to the previous
+        # module's clean latent, creating gradient pressure toward retaining lower-level detail.
+        if module_idx > 0 and cfg.enable_upper_level_reconstruction:
+            self.input_latent_decoder = InputLatentDecoder(cfg).to(device)
+            self.input_latent_dec_opt = torch.optim.AdamW(
+                self.input_latent_decoder.parameters(), lr=cfg.decoder_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+            )
+        else:
+            self.input_latent_decoder = None
+            self.input_latent_dec_opt = None
+
         self.gen_opt = torch.optim.AdamW(
             self.generator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
         )
@@ -191,6 +202,9 @@ class ModuleState:
         if self.layerwise_decoder is not None:
             d["layerwise_decoder"] = self.layerwise_decoder.state_dict()
             d["decoder_opt"]       = self.decoder_opt.state_dict()
+        if self.input_latent_decoder is not None:
+            d["input_latent_decoder"]  = self.input_latent_decoder.state_dict()
+            d["input_latent_dec_opt"]  = self.input_latent_dec_opt.state_dict()
         return d
 
     def load_state_dict(self, d: dict):
@@ -202,6 +216,8 @@ class ModuleState:
         ]
         if self.layerwise_decoder is not None:
             sub_models.append(("layerwise_decoder", self.layerwise_decoder, "decoder_opt"))
+        if self.input_latent_decoder is not None:
+            sub_models.append(("input_latent_decoder", self.input_latent_decoder, "input_latent_dec_opt"))
         for key, model, opt_key in sub_models:
             try:
                 model.load_state_dict(d[key])
@@ -215,6 +231,8 @@ class ModuleState:
         ]
         if self.decoder_opt is not None:
             opt_specs.append((self.decoder_opt, "decoder_opt"))
+        if self.input_latent_dec_opt is not None:
+            opt_specs.append((self.input_latent_dec_opt, "input_latent_dec_opt"))
         for opt, key in opt_specs:
             if key in skip_opts or key not in d:
                 continue
@@ -252,6 +270,8 @@ class ModuleState:
         self.manifold_est.train()
         if self.layerwise_decoder is not None:
             self.layerwise_decoder.train()
+        if self.input_latent_decoder is not None:
+            self.input_latent_decoder.train()
 
 
 # ── Per-module training step ────────────────────────────────────────────────
@@ -285,8 +305,9 @@ def module_predict_gen(
     r1_computed = ctx["r1_computed"]
 
     # ── Generator + predictor step ───────────────────────────────────────────
-    recon_ce    = None
-    recon_terms = None
+    recon_ce       = None
+    recon_terms    = None
+    input_dec_loss = None
     with autocast():
         layer_losses       = []
         attract_losses     = []
@@ -342,6 +363,20 @@ def module_predict_gen(
             recon_ce  = sum(recon_terms) / cfg.n_layers
             jepa_loss = jepa_loss + recon_ce * cfg.gen_recon_weight
 
+        prev_clean = ctx.get("prev_clean")
+        if (module_idx > 0 and cfg.input_latent_dec_weight > 0.0
+                and ms.input_latent_decoder is not None
+                and prev_clean is not None):
+            input_dec_terms = [
+                F.mse_loss(
+                    ms.input_latent_decoder(l, preds[l][:, lo:hi]),
+                    prev_clean[:, lo:hi].detach(),
+                )
+                for l in range(cfg.n_layers)
+            ]
+            input_dec_loss = sum(input_dec_terms) / cfg.n_layers
+            jepa_loss      = jepa_loss + input_dec_loss * cfg.input_latent_dec_weight
+
     for param in ms.manifold_est.parameters():
         param.requires_grad_(False)
     # NB: neither gen_opt nor layerwise_pred_opt is zeroed or stepped here. Generator and predictor
@@ -354,15 +389,24 @@ def module_predict_gen(
     # and left stale grads on these params) so decoder_opt applies only the small attached update.
     if recon_ce is not None:
         ms.decoder_opt.zero_grad()
+    if input_dec_loss is not None:
+        ms.input_latent_dec_opt.zero_grad()
     jepa_loss.backward(retain_graph=retain_graph)
     if recon_ce is not None:
         torch.nn.utils.clip_grad_norm_(ms.layerwise_decoder.parameters(), cfg.grad_clip)
         ms.decoder_opt.step()
+    if input_dec_loss is not None:
+        torch.nn.utils.clip_grad_norm_(ms.input_latent_decoder.parameters(), cfg.grad_clip)
+        ms.input_latent_dec_opt.step()
     for param in ms.manifold_est.parameters():
         param.requires_grad_(True)
     if recon_ce is not None:
         for l, rt in enumerate(recon_terms):
             ms.decoder_layer_sums_c[l] += rt.item()
+        ms.recon_count += 1
+    if input_dec_loss is not None:
+        for l, t in enumerate(input_dec_terms):
+            ms.decoder_layer_sums_c[l] += t.item()
         ms.recon_count += 1
 
     # ── Update accumulators ──────────────────────────────────────────────────
@@ -634,12 +678,13 @@ def train():
     module_states = [ModuleState(i, cfg, device) for i in range(cfg.n_modules)]
     for ms in module_states:
         ms.set_train()
-        dec_str = f"{ms.layerwise_decoder.num_params():,}" if ms.layerwise_decoder is not None else "—"
+        dec_str  = f"{ms.layerwise_decoder.num_params():,}"    if ms.layerwise_decoder     is not None else "—"
+        idec_str = f"{ms.input_latent_decoder.num_params():,}" if ms.input_latent_decoder  is not None else "—"
         print(
             f"  Module {ms.module_idx}: gen={ms.generator.num_params():,}  "
             f"pred={ms.layerwise_predictor.num_params():,}  "
             f"disc={ms.manifold_est.num_params():,}  "
-            f"dec={dec_str}"
+            f"dec={dec_str}  idec={idec_str}"
         )
 
     step      = 0
@@ -954,7 +999,7 @@ def train():
                     f"l{l} p={pred_char_acc[l]:.1f}%"
                     for l in range(nl)
                 )
-                dec_str = f"rec {avg_dec_c_mean:.4f} | " if ms.layerwise_decoder is not None else ""
+                dec_str = f"rec {avg_dec_c_mean:.4f} | " if ms.recon_count > 0 else ""
                 print(
                     f"  [m{i}] step {step:7d} | {layer_str} | "
                     f"margin {avg_mfld:.4f}(σ={mfld_std:.4f}) r1={avg_r1:.4f} | "

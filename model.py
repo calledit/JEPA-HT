@@ -523,3 +523,34 @@ class LayerwiseDecoder(nn.Module):
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+class InputLatentDecoder(nn.Module):
+    """One 4-layer MLP decoder per block: decodes the predictor output back to the previous
+    module's clean latent. Used for modules 1+ to add cross-level reconstruction pressure —
+    the predictor must produce outputs that are decodable to the clean input it never directly saw
+    (the gen stream only sees the horizon-masked gen thread, not the clean latent from below)."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        D, H = cfg.d_model, 165  # H=165 → ~73k params per n_layers, matching LayerwiseDecoder
+        self.decoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(D, H, bias=False), nn.GELU(),
+                nn.Linear(H, H, bias=False), nn.GELU(),
+                nn.Linear(H, H, bias=False), nn.GELU(),
+                nn.Linear(H, D, bias=False),
+            )
+            for _ in range(cfg.n_layers)
+        ])
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def forward(self, l: int, h: torch.Tensor) -> torch.Tensor:
+        return self.decoders[l](h)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())

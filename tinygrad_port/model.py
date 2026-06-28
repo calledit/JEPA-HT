@@ -256,6 +256,101 @@ class Generator:
             mask = mask & (~punch)
         return mask.reshape(B, 1, T, T)
 
+    def forward_clean_gen(self, x: Tensor,
+                          prev_latent_clean: Tensor = None,
+                          prev_latent_gen: Tensor = None,
+                          *,
+                          clean_token_leak: bool = True,
+                          thread_genfree: bool = False,
+                          use_stochastic_reveal: bool = False):
+        """Phase A1: run the clean and generative streams only (no corrupt).
+        Returns (gen_hiddens, clean_latents, cross_kvs, gen_thread)."""
+        B, T = x.shape
+        pos = Tensor.arange(T)
+
+        # ── Clean stream ──────────────────────────────────────────────────────
+        h_clean = self._build_input(x, prev_latent_clean)
+        pre_block_states = []
+        cross_kvs = []
+        clean_latents = [h_clean]
+        for block in self.blocks:
+            pre_block_states.append(h_clean)
+            h_clean = h_clean + block.input_mlp(h_clean)
+            h_clean, k0, v0 = block.layer1.forward_kv(h_clean)
+            h_clean, k1, v1 = block.layer2.forward_kv(h_clean)
+            h_clean, k2, v2 = block.layer3.forward_kv(h_clean)
+            cross_kvs.append(((k0, v0), (k1, v1), (k2, v2)))
+            h_out = h_clean[:, :, :block.d_out] + block.output_mlp(h_clean)
+            clean_latents.append(h_out)
+            h_clean = h_out.detach()
+
+        # ── Generative (null) stream ──────────────────────────────────────────
+        use_stochastic = use_stochastic_reveal and self.training and self.horizon > 1
+        gen_mask = self._build_stochastic_gen_mask(B, T) if use_stochastic else None
+        gen_hiddens = []
+        for i, block in enumerate(self.blocks):
+            if self.layer_idx == 0:
+                h = (self.null_embs[i] + self.pos_emb(pos)).reshape(1, T, -1).expand(B, T, -1).contiguous()
+            else:
+                null_char = self.null_embs[i].reshape(1, 1, -1).expand(B, T, -1)
+                h = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
+            if clean_token_leak and self.cfg.n_clean_tokens > 0:
+                idxs = Tensor.rand(B, T).argsort(dim=1)[:, :self.cfg.n_clean_tokens]
+                idx_exp = idxs.reshape(B, self.cfg.n_clean_tokens, 1).expand(B, self.cfg.n_clean_tokens, h.shape[-1])
+                src = pre_block_states[i].gather(1, idx_exp)
+                h = h.scatter(1, idx_exp, src)
+            kv0, kv1, kv2 = cross_kvs[i]
+            h = h + block.input_mlp(h)
+            h = block.layer1.forward_cross_kv(h, *kv0, causal_offset=self.horizon, attn_mask=gen_mask)
+            h = block.layer2.forward_cross_kv(h, *kv1, causal_offset=self.horizon, attn_mask=gen_mask)
+            h = block.layer3.forward_cross_kv(h, *kv2, causal_offset=self.horizon, attn_mask=gen_mask)
+            gen_hiddens.append(h[:, :, :block.d_out] + block.output_mlp(h))
+
+        # ── Gen thread (deterministic mask, for threading to next module) ─────
+        if thread_genfree:
+            if use_stochastic:
+                last_i     = len(self.blocks) - 1
+                last_block = self.blocks[last_i]
+                if self.layer_idx == 0:
+                    h_thr = (self.null_embs[last_i] + self.pos_emb(pos)).reshape(1, T, -1).expand(B, T, -1).contiguous()
+                else:
+                    null_char = self.null_embs[last_i].reshape(1, 1, -1).expand(B, T, -1)
+                    h_thr = self._build_input(x, prev_latent_gen, char_emb_in=null_char)
+                kv0, kv1, kv2 = cross_kvs[last_i]
+                h_thr = h_thr + last_block.input_mlp(h_thr)
+                h_thr = last_block.layer1.forward_cross_kv(h_thr, *kv0, causal_offset=self.horizon)
+                h_thr = last_block.layer2.forward_cross_kv(h_thr, *kv1, causal_offset=self.horizon)
+                h_thr = last_block.layer3.forward_cross_kv(h_thr, *kv2, causal_offset=self.horizon)
+                gen_thread = h_thr[:, :, :last_block.d_out] + last_block.output_mlp(h_thr)
+            else:
+                gen_thread = gen_hiddens[-1]
+        else:
+            gen_thread = None
+
+        return gen_hiddens, clean_latents, cross_kvs, gen_thread
+
+    def forward_corrupt(self, x_corr: Tensor,
+                        prev_latent_corrupt: Tensor = None,
+                        cross_kvs: list = None) -> list:
+        """Phase A2: run the corrupt stream using pre-computed clean K/Vs.
+        x_corr: [B*K, T]. prev_latent_corrupt: None (module 0) or [B*K, T, D] (module 1+)."""
+        K = self.cfg.corrupt_samples
+        hc = self._build_input(x_corr, prev_latent_corrupt)
+        corrupt_latents = [hc]
+        for i, block in enumerate(self.blocks):
+            (k0, v0), (k1, v1), (k2, v2) = cross_kvs[i]
+            k0, v0 = k0.repeat(K, 1, 1, 1), v0.repeat(K, 1, 1, 1)
+            k1, v1 = k1.repeat(K, 1, 1, 1), v1.repeat(K, 1, 1, 1)
+            k2, v2 = k2.repeat(K, 1, 1, 1), v2.repeat(K, 1, 1, 1)
+            hc = hc + block.input_mlp(hc)
+            hc = block.layer1.forward_cross_kv(hc, k0, v0)
+            hc = block.layer2.forward_cross_kv(hc, k1, v1)
+            hc = block.layer3.forward_cross_kv(hc, k2, v2)
+            hc_out = hc[:, :, :block.d_out] + block.output_mlp(hc)
+            corrupt_latents.append(hc_out)
+            hc = hc_out.detach()
+        return corrupt_latents
+
     def forward_cross_layerwise(self, x: Tensor,
                                 prev_latent_clean: Tensor = None,
                                 prev_latent_gen: Tensor = None,

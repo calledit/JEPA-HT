@@ -31,6 +31,12 @@ class Config:
     # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
     # 0.0 = disabled.
     gen_recon_weight: float = 0.15 #CHANGE 2919000 Again 3521000
+    # Cross-level reconstruction: decode each module's predictor output back to the previous
+    # module's clean latent. Only applies to modules 1+. The predictor only sees the gen thread
+    # (horizon-masked), so decoding back to the clean latent is non-trivial and creates gradient
+    # pressure toward retaining lower-level detail. 0.0 = disabled.
+    enable_upper_level_reconstruction: bool = False
+    input_latent_dec_weight: float = 0.15
 
     # Weak VICReg on the clean latents. Variance term pushes per-dim std above vicreg_gamma
     # (hinge: max(0, gamma - std_d), averaged over dims) so the encoder can't collapse to a
@@ -74,7 +80,7 @@ class Config:
     grad_clip: float = 1.0
 
     # Multi-module training
-    n_modules: int = 8
+    n_modules: int = 1
     # Per-module prediction horizon: module i predicts its own latent at the SAME position by masking
     # the gen-stream cross-attention to clean context <= t - h_i (the clean/target stream is unchanged,
     # so target = clean[t]). The horizon lives in the mask, NOT the target offset — so the target is a
@@ -83,7 +89,8 @@ class Config:
     # 0 must stay at 1 (h_0 = 1, a byte-level next-char predictor grounded by the decoder). len must ==
     # n_modules. The gap g_i = h_{i+1} - h_i sets the bottom-up gen-feed shift and the top-down extra
     # look-ahead shift between modules i and i+1.
-    prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
+    #prediction_horizons: tuple = (1, 2, 4, 8, 16, 32, 64, 128)
+    prediction_horizons: tuple = (1)
     # Stochastic horizon reveal. A fixed tril(-h) mask means gen[t] never attends keys in the recent
     # band (t-h, t-1], so the encoder stops keeping those positions informative and the target goes
     # trivial. Instead, every gen_reveal_interval steps, each query position i independently samples

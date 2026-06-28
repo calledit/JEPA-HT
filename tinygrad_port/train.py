@@ -5,7 +5,7 @@ Key differences from train.py:
   - R1 penalty uses Tensor.gradient() — tinygrad's equivalent of torch.autograd.grad
   - Discriminator GRA computed analytically (hinge-loss gradient)
   - JEPA GRA uses tinygrad_port.train_utils.gra (MSE gradient, needs explicit target arg)
-  - _clip_grad_norm_lazy in train.py (lazy, JIT-compatible; replaces train_utils version)
+  - _clip_grad_norm_lazy (lazy, JIT-compatible; replaces train_utils version)
   - opt.lr = value instead of param_groups loop
   - Checkpoints saved as numpy arrays; loads both PyTorch and tinygrad formats
   - DataLoader kept as PyTorch; batches converted to tinygrad Tensor via numpy
@@ -51,6 +51,34 @@ def find_latest_checkpoint(checkpoint_dir: str):
 
 def _state_dict_to_numpy(tg_model) -> dict:
     return {k: v.numpy() for k, v in nn.state.get_state_dict(tg_model).items()}
+
+
+def _opt_state_to_numpy(opt) -> dict:
+    return {
+        "m":    [t.numpy() for t in opt.m],
+        "v":    [t.numpy() for t in opt.v],
+        "b1_t": opt.b1_t.numpy(),
+        "b2_t": opt.b2_t.numpy(),
+    }
+
+
+def _load_opt_state(opt, sd: dict):
+    if not sd:
+        return
+    try:
+        for i, arr in enumerate(sd.get("m", [])):
+            if i < len(opt.m) and arr.shape == opt.m[i].shape:
+                opt.m[i].assign(Tensor(arr.astype(np.float32)))
+        for i, arr in enumerate(sd.get("v", [])):
+            if i < len(opt.v) and arr.shape == opt.v[i].shape:
+                opt.v[i].assign(Tensor(arr.astype(np.float32)))
+        if "b1_t" in sd:
+            opt.b1_t.assign(Tensor(sd["b1_t"].astype(np.float32)))
+        if "b2_t" in sd:
+            opt.b2_t.assign(Tensor(sd["b2_t"].astype(np.float32)))
+        Tensor.realize(opt.b1_t, opt.b2_t, *opt.m, *opt.v)
+    except Exception as e:
+        print(f"  Warning: optimizer state load failed ({e}) — fresh moments")
 
 
 def _load_model_state(tg_model, sd: dict):
@@ -107,11 +135,15 @@ def _gra_disc_neg(loss: Tensor, neg_scores: Tensor, scale: float) -> Tensor:
     return loss + scale * (g_c.detach() * neg_scores).sum()
 
 
-def _clip_grad_norm_lazy(params: list, max_norm: float) -> None:
-    """Clip gradient norm without GPU syncs — fully lazy, JIT-compatible.
+def _fill_missing_grads(opt) -> None:
+    """Zero-fill gradients for parameters that didn't receive one this backward pass."""
+    for p in opt.params:
+        if p.grad is None:
+            p.grad = Tensor.zeros_like(p)
 
-    Replaces train_utils.clip_grad_norm which calls .numpy() per grad tensor.
-    """
+
+def _clip_grad_norm_lazy(params: list, max_norm: float) -> None:
+    """Clip gradient norm without GPU syncs — fully lazy, JIT-compatible."""
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return
@@ -123,13 +155,7 @@ def _clip_grad_norm_lazy(params: list, max_norm: float) -> None:
 
 
 def _make_disc_jit(manifold_est, manifold_opt, n_layers: int, gra_scale: float, grad_clip: float):
-    """Return a TinyJit-compiled disc forward+backward+step for one module.
-
-    Packs disc_base + per-layer margins into one realized tensor; the caller
-    reads them in a single .numpy() call (no Python control flow inside JIT).
-    Only used when R1 is not being computed (R1 needs a separate non-JIT path
-    because it creates new leaf tensors via .numpy() inside the loop).
-    """
+    """Return a TinyJit-compiled disc forward+backward+step for one module."""
     @TinyJit
     def _disc_step(target_stack: Tensor, corrupt_stack: Tensor) -> Tensor:
         disc_losses, margins = [], []
@@ -146,7 +172,6 @@ def _make_disc_jit(manifold_est, manifold_opt, n_layers: int, gra_scale: float, 
         disc_base.backward()
         _clip_grad_norm_lazy(manifold_est.parameters(), grad_clip)
         manifold_opt.step()
-        # [0] = disc_base, [1:] = per-layer margins
         return disc_base.detach().reshape(1).cat(
             *[m.reshape(1) for m in margins], dim=0
         ).realize()
@@ -186,7 +211,6 @@ class ModuleState:
             lr=cfg.manifold_est_lr, weight_decay=cfg.weight_decay, b1=0.9, b2=0.95,
         )
 
-        # JIT-compiled fast path for disc step (no R1); keyed by n_layers/gra_scale/grad_clip
         self._disc_jit = _make_disc_jit(
             self.manifold_est, self.manifold_opt,
             cfg.n_layers, cfg.gra_scale, cfg.grad_clip,
@@ -197,8 +221,6 @@ class ModuleState:
         self.manifold_window = deque(maxlen=1000)
         self.adaptive_lr_scale           = 1.0
         self.plateau_last_decrease_step  = 0
-        self.decoder_hist                = deque()
-
         self.last_preds       = None
         self.last_gen_hiddens = None
         self.last_x           = None
@@ -215,11 +237,7 @@ class ModuleState:
         self.jepa_sum = self.manifold_sum = self.clean_corrupt_sum = 0.0
         self.latent_std_sum = self.latent_mean_sum = self.r1_sum = 0.0
         self.r1_count = self.clean_corrupt_count = 0
-        self.decoder_layer_sums_a = [0.0] * n
-        self.decoder_layer_sums_b = [0.0] * n
         self.decoder_layer_sums_c = [0.0] * n
-        self.decoder_sum   = 0.0
-        self.decoder_count = 0
         self.recon_count   = 0
         self.loss_count    = 0
 
@@ -229,15 +247,18 @@ class ModuleState:
             "generator":                  _state_dict_to_numpy(self.generator),
             "layerwise_predictor":        _state_dict_to_numpy(self.layerwise_predictor),
             "manifold_est":               _state_dict_to_numpy(self.manifold_est),
+            "gen_opt":                    _opt_state_to_numpy(self.gen_opt),
+            "layerwise_pred_opt":         _opt_state_to_numpy(self.layerwise_pred_opt),
+            "manifold_opt":               _opt_state_to_numpy(self.manifold_opt),
             "attract_window":             [list(w) for w in self.attract_window],
             "repel_window":               [list(w) for w in self.repel_window],
             "manifold_window":            list(self.manifold_window),
             "adaptive_lr_scale":          self.adaptive_lr_scale,
             "plateau_last_decrease_step": self.plateau_last_decrease_step,
-            "decoder_hist":               list(self.decoder_hist),
         }
         if self.layerwise_decoder is not None:
             d["layerwise_decoder"] = _state_dict_to_numpy(self.layerwise_decoder)
+            d["decoder_opt"]       = _opt_state_to_numpy(self.decoder_opt)
         return d
 
     def load_state_dict(self, d: dict):
@@ -256,6 +277,11 @@ class ModuleState:
                 _load_model_state(self.layerwise_decoder, d["layerwise_decoder"])
             except Exception as e:
                 print(f"  Warning: module {self.module_idx} layerwise_decoder not loaded ({e}) — fresh init")
+        _load_opt_state(self.gen_opt,            d.get("gen_opt", {}))
+        _load_opt_state(self.layerwise_pred_opt, d.get("layerwise_pred_opt", {}))
+        _load_opt_state(self.manifold_opt,       d.get("manifold_opt", {}))
+        if self.decoder_opt is not None:
+            _load_opt_state(self.decoder_opt, d.get("decoder_opt", {}))
         for l, v in enumerate(d.get("attract_window", [])):
             self.attract_window[l] = deque(v, maxlen=1000)
         for l, v in enumerate(d.get("repel_window", [])):
@@ -264,54 +290,32 @@ class ModuleState:
             self.manifold_window = deque(d["manifold_window"], maxlen=1000)
         self.adaptive_lr_scale          = d.get("adaptive_lr_scale", 1.0)
         self.plateau_last_decrease_step = d.get("plateau_last_decrease_step", 0)
-        self.decoder_hist.extend(d.get("decoder_hist", []))
 
     def set_train(self):
         self.generator.train()
         self.manifold_est.train()
-        # LayerwisePredictor and LayerwiseDecoder have no training-sensitive ops
 
 
-# ── Per-module training step ────────────────────────────────────────────────
+# ── Phase A1: clean + gen forward ───────────────────────────────────────────
 
-def module_forward(
+def module_forward_clean_gen(
     ms: ModuleState,
     x: Tensor,
     prev: dict,
     step: int,
     cfg: Config,
-    decoder_ms: "ModuleState",
     thread_genfree: bool,
 ) -> dict:
-    """Phase A: three-stream forward + discriminator step.
-
-    Discriminator GRA uses analytical hinge-loss gradients.
-    R1 penalty uses Tensor.gradient() — tinygrad's equivalent of torch.autograd.grad.
-    """
+    """Phase A1: run a module's clean and gen streams. No corrupt, no discriminator.
+    prev has keys 'clean' and 'gen' (both None for module 0).
+    Returns gen_hiddens, clean_latents, cross_kvs, gen_thread (cross_kvs not detached)."""
     module_idx = ms.module_idx
     local_step = max(0, step - module_idx * cfg.module_warmup_steps)
-
-    def decoder_sample_fn(clean_latents, gen_hiddens):
-        logits = decoder_ms.layerwise_decoder(cfg.n_layers - 1, clean_latents[-1].detach())
-        B, T = x.shape
-        # Mask out the true token at each position: set logits[b,t,x[b,t]] = -inf
-        vocab_mask = (Tensor.arange(cfg.vocab_size).reshape(1, 1, -1) == x.reshape(B, T, 1))
-        logits = vocab_mask.where(
-            Tensor.full(logits.shape, float('-inf'), dtype=logits.dtype), logits,
-        )
-        probs   = logits.softmax(axis=-1)
-        samples = probs.reshape(-1, cfg.vocab_size).multinomial(cfg.corrupt_samples, replacement=True)
-        # samples: [B*T, corrupt_samples] → [B*corrupt_samples, T]
-        return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(
-            B * cfg.corrupt_samples, T
-        )
 
     lr = get_lr(local_step, cfg) * ms.adaptive_lr_scale
     ms.gen_opt.lr            = lr
     ms.manifold_opt.lr       = cfg.manifold_est_lr * ms.adaptive_lr_scale
     ms.layerwise_pred_opt.lr = cfg.predictor_lr
-
-    corrupt_fn = decoder_sample_fn if module_idx == 0 else None
 
     prev_gen = prev["gen"]
     if module_idx > 0 and prev_gen is not None:
@@ -323,55 +327,78 @@ def module_forward(
         and step % cfg.gen_reveal_interval == 0
     )
 
-    gen_hiddens, clean_latents, corrupt_latents, x_corr, gen_thread = (
-        ms.generator.forward_cross_layerwise(
-            x,
-            prev_latent_clean=prev["clean"],
-            prev_latent_gen=prev_gen,
-            prev_latent_corrupt=prev["corrupt"],
-            x_corr=prev["x_corr"],
-            corrupt_fn=corrupt_fn,
-            thread_genfree=thread_genfree,
-            use_stochastic_reveal=use_stochastic_reveal,
-        )
+    gen_hiddens, clean_latents, cross_kvs, gen_thread = ms.generator.forward_clean_gen(
+        x,
+        prev_latent_clean=prev["clean"],
+        prev_latent_gen=prev_gen,
+        thread_genfree=thread_genfree,
+        use_stochastic_reveal=use_stochastic_reveal,
     )
-    target_latents = clean_latents
 
-    # ── Discriminator step ────────────────────────────────────────────────────
-    n            = cfg.n_layers
-    r1_computed  = cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0
+    return {
+        "module_idx":     module_idx,
+        "local_step":     local_step,
+        "lr":             lr,
+        "gen_hiddens":    gen_hiddens,
+        "clean_latents":  clean_latents,
+        "target_latents": clean_latents,
+        "cross_kvs":      cross_kvs,
+        "gen_thread":     gen_thread,
+        "prev_clean":     prev["clean"],
+    }
+
+
+def module_forward_corrupt(
+    ms: ModuleState,
+    x_corr: Tensor,
+    prev_corrupt: Tensor,
+    cross_kvs: list,
+    cfg: Config,
+) -> dict:
+    """Phase A2: run the corrupt stream for one module using pre-computed clean K/Vs.
+    x_corr: [B*K, T]. prev_corrupt: None (module 0) or [B*K, T, D] (module 1+)."""
+    corrupt_latents = ms.generator.forward_corrupt(x_corr, prev_corrupt, cross_kvs)
+    return {"corrupt_latents": corrupt_latents}
+
+
+def module_discriminator_step(
+    ms: ModuleState,
+    clean_latents: list,
+    corrupt_latents: list,
+    step: int,
+    cfg: Config,
+) -> dict:
+    """Discriminator (ManifoldEstimator) training step on detached clean vs corrupt latents."""
+    n           = cfg.n_layers
+    r1_computed = cfg.r1_weight > 0.0 and step % cfg.r1_interval == 0
 
     if not r1_computed:
-        # JIT fast path: disc forward + backward + manifold_opt.step() in one cached
-        # kernel graph.  Single .numpy() call reads disc_base + per-layer margins.
         target_stack  = Tensor.stack(
-            [target_latents[l + 1].detach().reshape(-1, cfg.d_model)  for l in range(n)]
+            [clean_latents[l + 1].detach().reshape(-1, cfg.d_model)  for l in range(n)]
         ).realize()
         corrupt_stack = Tensor.stack(
             [corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model) for l in range(n)]
         ).realize()
         _disc_out    = ms._disc_jit(target_stack, corrupt_stack)
-        _disc_vals   = _disc_out.numpy()             # one GPU sync
+        _disc_vals   = _disc_out.numpy()
         disc_base_val = float(_disc_vals[0])
         disc_margin   = float(_disc_vals[1:].mean())
         r1_val        = 0.0
     else:
-        # R1 path (infrequent): requires fresh leaf tensors via .numpy() inside loop,
-        # so JIT cannot be used here.
         disc_layer_losses, disc_margin_tensors = [], []
         for l in range(n):
-            pos_scores = ms.manifold_est(target_latents[l + 1].detach().reshape(-1, cfg.d_model))
+            pos_scores = ms.manifold_est(clean_latents[l + 1].detach().reshape(-1, cfg.d_model))
             neg_scores = ms.manifold_est(corrupt_latents[l + 1].detach().reshape(-1, cfg.d_model))
             layer_disc = ((1 - pos_scores).relu().mean() + (1 + neg_scores).relu().mean()) / 2
             disc_margin_tensors.append(pos_scores.mean() - neg_scores.mean())
             layer_disc = _gra_disc_pos(layer_disc, pos_scores, cfg.gra_scale)
             layer_disc = _gra_disc_neg(layer_disc, neg_scores, cfg.gra_scale)
             disc_layer_losses.append(layer_disc)
-        disc_base  = sum(disc_layer_losses) / n
+        disc_base = sum(disc_layer_losses) / n
 
         r1_penalty = Tensor.zeros(1).squeeze()
         for l in range(n):
-            real_in    = target_latents[l + 1].detach().reshape(-1, cfg.d_model)
+            real_in    = clean_latents[l + 1].detach().reshape(-1, cfg.d_model)
             real_in.requires_grad = True
             real_score = ms.manifold_est(real_in, apply_dropout=False)
             grad       = real_score.sum().gradient(real_in)[0]
@@ -391,35 +418,46 @@ def module_forward(
         disc_margin   = float(_vals[2:].mean())
 
     return {
-        "module_idx":      module_idx,
-        "local_step":      local_step,
-        "lr":              lr,
-        "gen_hiddens":     gen_hiddens,
-        "clean_latents":   clean_latents,
-        "corrupt_latents": corrupt_latents,
-        "target_latents":  target_latents,
-        "x_corr":          x_corr,
-        "gen_thread":      gen_thread,
-        "prev_clean":      prev["clean"],
-        "disc_base":       disc_base_val,
-        "disc_margin":     disc_margin,
-        "r1_penalty":      r1_val,
-        "r1_computed":     r1_computed,
+        "disc_base":   disc_base_val,
+        "disc_margin": disc_margin,
+        "r1_penalty":  r1_val,
+        "r1_computed": r1_computed,
     }
 
 
-def module_predict_gen(
+def _sample_corrupt_tokens(
+    logits: Tensor,
+    x: Tensor,
+    cfg: Config,
+) -> Tensor:
+    """Sample hard-negative corrupt tokens from pre-computed decoder logits (detached).
+    logits: [B, T, vocab_size]. Returns x_corr [B*K, T] where no position matches x."""
+    B, T = x.shape
+    vocab_mask = (Tensor.arange(cfg.vocab_size).reshape(1, 1, -1) == x.reshape(B, T, 1))
+    logits = vocab_mask.where(
+        Tensor.full(logits.shape, float('-inf'), dtype=logits.dtype), logits,
+    )
+    probs   = logits.softmax(axis=-1)
+    samples = probs.reshape(-1, cfg.vocab_size).multinomial(cfg.corrupt_samples, replacement=True)
+    return samples.reshape(B, T, cfg.corrupt_samples).permute(2, 0, 1).reshape(B * cfg.corrupt_samples, T)
+
+
+# ── Per-module training step ────────────────────────────────────────────────
+
+def module_build_jepa_loss(
     ms: ModuleState,
     x: Tensor,
     ctx: dict,
-    extra_preds: list,
+    preds: list,
     step: int,
     cfg: Config,
     decoder_ms: "ModuleState",
+    dec_logits: list = None,
 ) -> dict:
-    """Phase B: predictor forward, optional decoder backward, JEPA + generator backward.
-
-    retain_graph is not needed in tinygrad (lazy eval recomputes graphs on demand).
+    """Phase C (part 1): build the JEPA loss tensor lazily — no backward yet.
+    Caller sums losses across modules and calls backward() once.
+    Decoder probe is intentionally NOT here; it runs in the main loop after the
+    combined backward so it can't realize shared lazy buffers prematurely.
     """
     module_idx      = ms.module_idx
     local_step      = ctx["local_step"]
@@ -428,64 +466,10 @@ def module_predict_gen(
     corrupt_latents = ctx["corrupt_latents"]
     target_latents  = ctx["target_latents"]
 
-    preds = [
-        ms.layerwise_predictor.predictors[l](
-            gen_hiddens[l],
-            extra_preds[l] if extra_preds is not None else None,
-        )
-        for l in range(cfg.n_layers)
-    ]
-
-    # ── Decoder backward (module 0 only) ──────────────────────────────────────
-    step_dec_losses = None
-    if module_idx == 0 and step % cfg.decoder_train_interval == 0:
-        targets = x.reshape(-1)
-        dec_losses = [
-            (
-                decoder_ms.layerwise_decoder(l, preds[l].detach()).reshape(-1, cfg.vocab_size)
-                    .sparse_categorical_crossentropy(targets),
-                decoder_ms.layerwise_decoder(l, clean_latents[l + 1].detach()).reshape(-1, cfg.vocab_size)
-                    .sparse_categorical_crossentropy(targets),
-            )
-            for l in range(cfg.n_layers)
-        ]
-        dec_loss = sum((a + b) / 2 for a, b in dec_losses) / cfg.n_layers
-        ms.decoder_opt.zero_grad()
-        dec_loss.backward()
-        _clip_grad_norm_lazy(ms.layerwise_decoder.parameters(), cfg.grad_clip)
-        ms.decoder_opt.step()
-        # Batch-read all decoder metrics in one GPU transfer
-        _dec_tensors = ([da.reshape(1) for da, _ in dec_losses]
-                        + [db.reshape(1) for _, db in dec_losses]
-                        + [dec_loss.detach().reshape(1)])
-        _dec_vals = _dec_tensors[0].cat(*_dec_tensors[1:], dim=0).numpy()
-        _n = cfg.n_layers
-        da_vals      = [float(v) for v in _dec_vals[:_n]]
-        db_vals      = [float(v) for v in _dec_vals[_n:2*_n]]
-        dec_loss_val = float(_dec_vals[-1])
-        step_dec_losses = [(da_vals[l], db_vals[l], 0.0) for l in range(_n)]
-        for l in range(_n):
-            ms.decoder_layer_sums_a[l] += da_vals[l]
-            ms.decoder_layer_sums_b[l] += db_vals[l]
-        ms.decoder_sum   += dec_loss_val
-        ms.decoder_count += 1
-        ms.decoder_hist.append((step, step_dec_losses[0][0]))
-        while ms.decoder_hist and ms.decoder_hist[0][0] < step - 50_000:
-            ms.decoder_hist.popleft()
-
-    disc_margin = ctx["disc_margin"]
-    disc_base   = ctx["disc_base"]
-    r1_penalty  = ctx["r1_penalty"]
-    r1_computed = ctx["r1_computed"]
-
-    # ── Generator + predictor step ────────────────────────────────────────────
-    recon_ce    = None
-    recon_terms = None
-
-    layer_losses       = []
-    attract_losses     = []
-    toward_zero_losses = []
-    repel_losses       = []
+    # ── Build JEPA loss (lazy — no backward, no realize) ─────────────────────
+    layer_losses   = []
+    attract_losses = []
+    repel_losses   = []
     B, T = x.shape
     h_i    = cfg.prediction_horizons[module_idx]
     g_i    = (cfg.prediction_horizons[module_idx + 1] - h_i) if module_idx < cfg.n_modules - 1 else 0
@@ -506,6 +490,7 @@ def module_predict_gen(
             attract = gra(attract, pred_v, targ_v, cfg.gra_scale)
 
         manifold_stablization = (disc_corrupt - disc_target).mean()
+        manifold_stablization = manifold_stablization * max(0, float(ctx["disc_margin"]))
         layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
         if cfg.vicreg_var_weight > 0.0:
             layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(
@@ -515,112 +500,49 @@ def module_predict_gen(
             layer_loss = layer_loss + cfg.vicreg_cov_weight * _vicreg_cov(target_latents[l + 1])
         layer_losses.append(layer_loss)
         attract_losses.append(attract.detach())
-        toward_zero_losses.append(attract)
         repel_losses.append(manifold_stablization.detach())
     jepa_loss = sum(layer_losses) / cfg.n_layers
 
-    if module_idx == 0 and cfg.gen_recon_weight > 0.0:
-        dec = decoder_ms.layerwise_decoder
+    recon_ce    = None
+    recon_terms = None
+    if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
         recon_terms = [
-            dec(l, preds[l][:, lo:hi]).reshape(-1, cfg.vocab_size)
+            dec_logits[l][:, lo:hi].reshape(-1, cfg.vocab_size)
                 .sparse_categorical_crossentropy(x[:, lo:hi].reshape(-1))
             for l in range(cfg.n_layers)
         ]
         recon_ce  = sum(recon_terms) / cfg.n_layers
         jepa_loss = jepa_loss + recon_ce * cfg.gen_recon_weight
 
-    for param in ms.manifold_est.parameters():
-        param.requires_grad = False
-    if recon_ce is not None:
-        ms.decoder_opt.zero_grad()
-    jepa_loss.backward()
-    if recon_ce is not None:
-        _clip_grad_norm_lazy(ms.layerwise_decoder.parameters(), cfg.grad_clip)
-        ms.decoder_opt.step()
-    for param in ms.manifold_est.parameters():
-        param.requires_grad = True
-
     latent = target_latents[-1].detach()
 
-    n = cfg.n_layers
-    _ll_t  = [ll.detach().reshape(1) for ll in layer_losses]
-    _al_t  = [al.reshape(1)          for al in attract_losses]
-    _rl_t  = [rl.reshape(1)          for rl in repel_losses]
-    _lat_h = latent.reshape(-1, latent.shape[-1])
-    _std_t = _lat_h.std(axis=0).mean().reshape(1)
-    _mn_t  = latent.mean().reshape(1)
-    _jl_t  = jepa_loss.detach().reshape(1)
-    Tensor.realize(*_ll_t, *_al_t, *_rl_t, _jl_t, _std_t, _mn_t)
-    layer_loss_vals   = [float(t.numpy()) for t in _ll_t]
-    attract_loss_vals = [float(t.numpy()) for t in _al_t]
-    repel_loss_vals   = [float(t.numpy()) for t in _rl_t]
-    jepa_val  = float(_jl_t.numpy())
-    std_val   = float(_std_t.numpy())
-    mean_val  = float(_mn_t.numpy())
-
-    if recon_ce is not None:
-        _recon_t = [t.detach().reshape(1) for t in recon_terms]
-        Tensor.realize(*_recon_t)
-        for l in range(n):
-            ms.decoder_layer_sums_c[l] += float(_recon_t[l].numpy())
-        ms.recon_count += 1
-
-    # ── Update accumulators (all Python, no GPU syncs) ─────────────────────────
-    for l in range(n):
-        ms.jepa_layer_sums[l]        += layer_loss_vals[l]
-        ms.attract_layer_sums[l]     += attract_loss_vals[l]
-        ms.toward_zero_layer_sums[l] += attract_loss_vals[l]  # same value as attract
-        ms.repel_layer_sums[l]       += repel_loss_vals[l]
-        ms.attract_window[l].append(attract_loss_vals[l])
-        ms.repel_window[l].append(repel_loss_vals[l])
-    ms.jepa_sum       += jepa_val
-    ms.manifold_sum   += disc_margin
-    ms.manifold_window.append(disc_margin)
-    ms.clean_corrupt_count += 1
-    if r1_computed:
-        ms.r1_sum   += ctx["r1_penalty"]
-        ms.r1_count += 1
-    step_latent_std  = std_val
-    step_latent_mean = mean_val
-    ms.latent_std_sum  += step_latent_std
-    ms.latent_mean_sum += step_latent_mean
-    ms.loss_count      += 1
-
-    ms.last_preds       = preds
-    ms.last_gen_hiddens = gen_hiddens
-    ms.last_x           = x
-    ms.last_clean       = latent
-
+    # Lazy metric tensors — realized in one batch by the caller after backward
     return {
-        "layer_losses":     layer_loss_vals,   # list[float]
-        "attract_losses":   attract_loss_vals, # list[float]
-        "repel_losses":     repel_loss_vals,   # list[float]
-        "jepa_loss":        jepa_val,          # float
-        "disc_base":        ctx["disc_base"],  # float (from module_forward batch read)
-        "r1_penalty":       ctx["r1_penalty"], # float
-        "step_latent_std":  step_latent_std,
-        "step_latent_mean": step_latent_mean,
-        "lr":               ctx["lr"],
-        "step_dec_losses":  step_dec_losses,
-        "r1_computed":      r1_computed,
-        "target_latents":   target_latents,
-        "preds":            preds,
+        "jepa_loss":      jepa_loss,
+        "recon_ce":       recon_ce,
+        "_recon_t":       [t.detach().reshape(1) for t in recon_terms] if recon_terms else [],
+        "preds":          preds,
+        "gen_hiddens":    gen_hiddens,
+        "target_latents": target_latents,
+        "latent":         latent,
+        # lazy metric tensors
+        "_ll_t":  [ll.detach().reshape(1) for ll in layer_losses],
+        "_al_t":  [al.reshape(1)          for al in attract_losses],
+        "_rl_t":  [rl.reshape(1)          for rl in repel_losses],
+        "_jl_t":  jepa_loss.detach().reshape(1),
+        "_std_t": latent.reshape(-1, latent.shape[-1]).std(axis=0).mean().reshape(1),
+        "_mn_t":  latent.mean().reshape(1),
+        # scalars already read (from disc step, no realize needed)
+        "disc_margin":     ctx["disc_margin"],
+        "disc_base":       ctx["disc_base"],
+        "r1_penalty":      ctx["r1_penalty"],
+        "r1_computed":     ctx["r1_computed"],
+        "local_step":      local_step,
+        "lr":              ctx["lr"],
     }
 
 
-def build_feed_copy(ms: ModuleState, gen_hiddens: list, extra_used: list,
-                    cfg: Config, include_generator: bool) -> list:
-    """Re-run predictor to produce the prediction handed down to the module below."""
-    return [
-        ms.layerwise_predictor.predictors[l](
-            gen_hiddens[l] if include_generator else gen_hiddens[l].detach(),
-            extra_used[l].detach() if extra_used is not None else None,
-        )
-        for l in range(cfg.n_layers)
-    ]
-
-
-# ── Log helpers (identical to train.py) ────────────────────────────────────
+# ── Log helpers ──────────────────────────────────────────────────────────────
 
 def _build_log_header(cfg: Config) -> list:
     _ll   = range(cfg.n_layers)
@@ -632,11 +554,9 @@ def _build_log_header(cfg: Config) -> list:
         cols += [f"{p}toward_zero_{l}" for l in _ll]
         cols += [f"{p}repel_{l}"      for l in _ll]
         cols += [f"{p}jepa_loss_avg", f"{p}manifold_margin", f"{p}clean_corrupt_loss"]
-        cols += [col for l in _ll for col in (
-            f"{p}decoder_loss_a_{l}", f"{p}decoder_loss_b_{l}", f"{p}decoder_loss_c_{l}"
-        )]
+        cols += [f"{p}decoder_loss_c_{l}" for l in _ll]
         cols += [
-            f"{p}decoder_loss_avg", f"{p}latent_std", f"{p}latent_mean",
+            f"{p}latent_std", f"{p}latent_mean",
             f"{p}participation_ratio", f"{p}lr",
         ]
         cols += [f"{p}attract_std_{l}"  for l in _ll]
@@ -652,9 +572,9 @@ def _build_steps_header(cfg: Config) -> list:
     cols = ["step"]
     for i in range(cfg.n_modules):
         p = f"m{i}_"
-        cols += [f"{p}jepa_{l}"    for l in range(cfg.n_layers)]
-        cols += [f"{p}attract_{l}" for l in range(cfg.n_layers)]
-        cols += [f"{p}repel_{l}"   for l in range(cfg.n_layers)]
+        cols += [f"{p}jepa_{l}"      for l in range(cfg.n_layers)]
+        cols += [f"{p}attract_{l}"   for l in range(cfg.n_layers)]
+        cols += [f"{p}repel_{l}"     for l in range(cfg.n_layers)]
         cols += [
             f"{p}jepa_total", f"{p}manifold", f"{p}r1",
             f"{p}latent_std", f"{p}latent_mean", f"{p}lr",
@@ -665,7 +585,7 @@ def _build_steps_header(cfg: Config) -> list:
 
 
 def _cols_per_module_log(n_layers: int) -> int:
-    return 11 * n_layers + 14
+    return 9 * n_layers + 13
 
 
 def _cols_per_module_steps(n_layers: int) -> int:
@@ -676,8 +596,9 @@ def _cols_per_module_steps(n_layers: int) -> int:
 
 def train():
     cfg = Config()
-    Tensor.training = True   # required for optimizer.step() in tinygrad
-    print(f"Device: tinygrad NV  |  Training {cfg.n_modules} modules")
+    cfg.checkpoint_dir = "checkpoints_tinygrad"
+    Tensor.training = True
+    print(f"Device: tinygrad  |  Training {cfg.n_modules} modules")
     print(f"Module warmup: {cfg.module_warmup_steps:,} steps")
 
     module_states = [ModuleState(i, cfg) for i in range(cfg.n_modules)]
@@ -717,7 +638,6 @@ def train():
         print("No checkpoint found — starting from scratch")
 
     train_dataset, val_data, _ = build_dataset(cfg, skip_docs)
-    # val_data is a PyTorch tensor; not used in the tinygrad training loop
     _dataloader   = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
@@ -767,33 +687,29 @@ def train():
 
         active = [i for i in range(cfg.n_modules) if step >= i * cfg.module_warmup_steps]
 
-        print("# ── Phase A: bottom-up forward + discriminator ────────────────────────")
-        # ── Phase A: bottom-up forward + discriminator ────────────────────────
-        ctxs = {}
-        prev = {"clean": None, "gen": None, "corrupt": None, "x_corr": None}
+        # ── Phase A1: clean + gen streams, bottom-up ─────────────────────────
+        ctxs    = {}
+        prev_cg = {"clean": None, "gen": None}
         for pos_i, i in enumerate(active):
-            is_top = pos_i == len(active) - 1
-            print("module: " + str(i))
-            ctxs[i] = module_forward(
-                module_states[i], x, prev, step, cfg,
-                decoder_ms=module_states[0], thread_genfree=not is_top,
+            is_top  = pos_i == len(active) - 1
+            ctxs[i] = module_forward_clean_gen(
+                module_states[i], x, prev_cg, step, cfg,
+                thread_genfree=not is_top,
             )
             if not is_top:
                 c = ctxs[i]
-                prev = {
-                    "clean":   c["clean_latents"][-1].detach(),
-                    "gen":     c["gen_thread"].detach(),
-                    "corrupt": c["corrupt_latents"][-1].detach(),
-                    "x_corr":  c["x_corr"],
+                prev_cg = {
+                    "clean": c["clean_latents"][-1].detach(),
+                    "gen":   c["gen_thread"].detach(),
                 }
 
-        # ── Phase B: top-down predictor + generator step ──────────────────────
+        # ── Phase B: top-down predictor pass (with grad) ─────────────────────
+        # Zero gen and predictor grads here so the accumulated cross-module
+        # gradient from Phase C is captured correctly.
         for i in active:
             module_states[i].gen_opt.zero_grad()
             module_states[i].layerwise_pred_opt.zero_grad()
-        incl_gen       = cfg.cross_module_pred_grad and cfg.cross_module_grad_include_generator
-        detached_preds = {}
-        feed_preds     = {}
+        preds_by_module = {}
         for i in reversed(active):
             nxt  = i + 1
             feed = (
@@ -801,42 +717,167 @@ def train():
                 and nxt in ctxs
                 and (step - nxt * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
             )
-            gap = cfg.prediction_horizons[nxt] - cfg.prediction_horizons[i] if feed else 0
-            if feed and cfg.cross_module_pred_grad:
-                w     = cfg.cross_module_pred_grad_weight
-                extra = [
-                    _shift_time(fp.detach() + w * (fp - fp.detach()), -gap)
-                    for fp in feed_preds[nxt]
-                ]
-            elif feed:
-                extra = [_shift_time(p, -gap) for p in detached_preds[nxt]]
+            if feed:
+                gap = cfg.prediction_horizons[nxt] - cfg.prediction_horizons[i]
+                if cfg.cross_module_pred_grad:
+                    w     = cfg.cross_module_pred_grad_weight
+                    extra = [_shift_time(fp.detach() + w * (fp - fp.detach()), -gap)
+                             for fp in preds_by_module[nxt]]
+                else:
+                    extra = [_shift_time(fp.detach(), -gap) for fp in preds_by_module[nxt]]
             else:
                 extra = None
-
-            below_feeds = (
-                cfg.cross_module_pred_feed
-                and i != active[0]
-                and (step - i * cfg.module_warmup_steps) >= cfg.cross_module_feed_start_step
-            )
-            last_results[i] = module_predict_gen(
-                module_states[i], x, ctxs[i], extra, step, cfg,
-                decoder_ms=module_states[0],
-            )
-            detached_preds[i] = [p.detach() for p in last_results[i]["preds"]]
-            if cfg.cross_module_pred_grad and below_feeds:
-                feed_preds[i] = build_feed_copy(
-                    module_states[i], ctxs[i]["gen_hiddens"], extra, cfg,
-                    include_generator=incl_gen,
+            ms_i = module_states[i]
+            preds_by_module[i] = [
+                ms_i.layerwise_predictor.predictors[l](
+                    ctxs[i]["gen_hiddens"][l],
+                    extra[l] if extra is not None else None,
                 )
+                for l in range(cfg.n_layers)
+            ]
 
+        # Save gen_hiddens for diagnostic decoder-accuracy comparison
+        for i in active:
+            module_states[i].last_gen_hiddens = ctxs[i]["gen_hiddens"]
+
+        # ── Decoder logits: run once attached; reuse for sampling and recon ───
+        dec_logits = [
+            module_states[0].layerwise_decoder(l, preds_by_module[0][l])
+            for l in range(cfg.n_layers)
+        ]
+
+        # ── Sample corrupt tokens from decoder applied to module 0's pred ─────
+        x_corr = _sample_corrupt_tokens(dec_logits[cfg.n_layers - 1].detach(), x, cfg)
+
+        # ── Phase A2: corrupt stream, bottom-up ──────────────────────────────
+        corrupt_ctxs = {}
+        prev_corrupt = None
+        for i in active:
+            corrupt_ctxs[i] = module_forward_corrupt(
+                module_states[i], x_corr, prev_corrupt, ctxs[i]["cross_kvs"], cfg
+            )
+            prev_corrupt = corrupt_ctxs[i]["corrupt_latents"][-1].detach()
+
+        # ── Discriminator step (all active modules) ───────────────────────────
+        disc_results = {}
+        for i in active:
+            disc_results[i] = module_discriminator_step(
+                module_states[i],
+                ctxs[i]["clean_latents"],
+                corrupt_ctxs[i]["corrupt_latents"],
+                step, cfg,
+            )
+
+        # ── Phase C (part 1): build all JEPA losses lazily ───────────────────
+        # Decoder probe runs here per-module (its own backward, separate graph).
+        # The JEPA loss tensors themselves are NOT yet realized or backpropped.
+        jepa_builds = {}
+        for i in reversed(active):
+            full_ctx = {
+                **ctxs[i],
+                "corrupt_latents": corrupt_ctxs[i]["corrupt_latents"],
+                **disc_results[i],
+            }
+            jepa_builds[i] = module_build_jepa_loss(
+                module_states[i], x, full_ctx, preds_by_module[i], step, cfg,
+                decoder_ms=module_states[0],
+                dec_logits=dec_logits if i == 0 else None,
+            )
+
+        # ── Phase C (part 2): single combined backward ────────────────────────
+        # Summing all modules' losses and calling backward() once lets tinygrad
+        # trace the entire graph (A1 + B + A2 + C across all modules) in a single
+        # pass — no repeated retracing of the cross-module pred graph.
+        for i in active:
+            for param in module_states[i].manifold_est.parameters():
+                param.requires_grad = False
+        has_recon = 0 in jepa_builds and jepa_builds[0]["recon_ce"] is not None
+        if has_recon:
+            module_states[0].decoder_opt.zero_grad()
+        combined_loss = sum(jepa_builds[i]["jepa_loss"] for i in active)
+        combined_loss.backward()
+        if has_recon:
+            _clip_grad_norm_lazy(module_states[0].layerwise_decoder.parameters(), cfg.grad_clip)
+            module_states[0].decoder_opt.step()
+        for i in active:
+            for param in module_states[i].manifold_est.parameters():
+                param.requires_grad = True
+
+        # Clip + step every generator and predictor once.
         for i in active:
             ms = module_states[i]
             _clip_grad_norm_lazy(
                 list(ms.generator.parameters()) + list(ms.layerwise_predictor.parameters()),
                 cfg.grad_clip,
             )
+            _fill_missing_grads(ms.gen_opt)
+            _fill_missing_grads(ms.layerwise_pred_opt)
             ms.gen_opt.step()
             ms.layerwise_pred_opt.step()
+
+        # ── Phase C (part 3): realize all metric tensors in one batch ─────────
+        all_metric_t = []
+        for i in active:
+            b = jepa_builds[i]
+            all_metric_t.extend(b["_ll_t"] + b["_al_t"] + b["_rl_t"] + b["_recon_t"])
+            all_metric_t.extend([b["_jl_t"], b["_std_t"], b["_mn_t"]])
+        Tensor.realize(*all_metric_t)
+
+        # ── Update accumulators and build last_results ────────────────────────
+        for i in active:
+            b  = jepa_builds[i]
+            ms = module_states[i]
+            n  = cfg.n_layers
+
+            layer_loss_vals   = [t.numpy().item() for t in b["_ll_t"]]
+            attract_loss_vals = [t.numpy().item() for t in b["_al_t"]]
+            repel_loss_vals   = [t.numpy().item() for t in b["_rl_t"]]
+            jepa_val  = b["_jl_t"].numpy().item()
+            std_val   = b["_std_t"].numpy().item()
+            mean_val  = b["_mn_t"].numpy().item()
+
+            if b["_recon_t"]:
+                for l in range(n):
+                    ms.decoder_layer_sums_c[l] += b["_recon_t"][l].numpy().item()
+                ms.recon_count += 1
+
+            for l in range(n):
+                ms.jepa_layer_sums[l]        += layer_loss_vals[l]
+                ms.attract_layer_sums[l]     += attract_loss_vals[l]
+                ms.toward_zero_layer_sums[l] += attract_loss_vals[l]
+                ms.repel_layer_sums[l]       += repel_loss_vals[l]
+                ms.attract_window[l].append(attract_loss_vals[l])
+                ms.repel_window[l].append(repel_loss_vals[l])
+            ms.jepa_sum       += jepa_val
+            ms.manifold_sum   += b["disc_margin"]
+            ms.manifold_window.append(b["disc_margin"])
+            ms.clean_corrupt_count += 1
+            if b["r1_computed"]:
+                ms.r1_sum   += b["r1_penalty"]
+                ms.r1_count += 1
+            ms.latent_std_sum  += std_val
+            ms.latent_mean_sum += mean_val
+            ms.loss_count      += 1
+
+            ms.last_preds       = b["preds"]
+            ms.last_gen_hiddens = b["gen_hiddens"]
+            ms.last_x           = x
+            ms.last_clean       = b["latent"]
+
+            last_results[i] = {
+                "layer_losses":     layer_loss_vals,
+                "attract_losses":   attract_loss_vals,
+                "repel_losses":     repel_loss_vals,
+                "jepa_loss":        jepa_val,
+                "disc_base":        b["disc_base"],
+                "r1_penalty":       b["r1_penalty"],
+                "step_latent_std":  std_val,
+                "step_latent_mean": mean_val,
+                "lr":               b["lr"],
+                "r1_computed":      b["r1_computed"],
+                "target_latents":   b["target_latents"],
+                "preds":            b["preds"],
+            }
 
         step             += 1
         tokens_since_log += batch.shape[0] * cfg.context_length
@@ -849,7 +890,6 @@ def train():
             if r is None:
                 row += [""] * n_empty_steps
                 continue
-            sdl  = r["step_dec_losses"]
             row += [f"{ll:.6f}" for ll in r["layer_losses"]]
             row += [f"{a:.6f}"  for a  in r["attract_losses"]]
             row += [f"{rp:.6f}" for rp in r["repel_losses"]]
@@ -861,9 +901,8 @@ def train():
                 f"{r['step_latent_mean']:.6f}",
                 f"{r['lr']:.6e}",
             ]
-            _dummy = [(0, 0, 0)] * cfg.n_layers
-            row += [f"{da:.6f}" if sdl else "" for da, _, __ in (sdl or _dummy)]
-            row += [f"{db:.6f}" if sdl else "" for _, db, __ in (sdl or _dummy)]
+            row += [""] * cfg.n_layers  # decoder_a (probe removed)
+            row += [""] * cfg.n_layers  # decoder_b (probe removed)
         steps_log_writer.writerow(row)
 
         # ── eval log ──────────────────────────────────────────────────────────
@@ -883,7 +922,6 @@ def train():
                     continue
 
                 lc = ms.loss_count
-                dc = max(ms.decoder_count, 1)
                 rc = max(ms.r1_count, 1)
                 nl = cfg.n_layers
 
@@ -894,12 +932,8 @@ def train():
                 avg_jepa  = ms.jepa_sum     / lc
                 avg_mfld  = ms.manifold_sum / lc
                 avg_cc    = ms.clean_corrupt_sum / max(ms.clean_corrupt_count, 1)
-                avg_dec_a = [ms.decoder_layer_sums_a[l] / dc for l in range(nl)]
-                avg_dec_b = [ms.decoder_layer_sums_b[l] / dc for l in range(nl)]
                 rec_c     = max(ms.recon_count, 1)
                 avg_dec_c = [ms.decoder_layer_sums_c[l] / rec_c for l in range(nl)]
-                avg_dec   = ms.decoder_sum    / dc
-                avg_dec_a_mean = sum(avg_dec_a) / nl
                 avg_dec_c_mean = sum(avg_dec_c) / nl
                 avg_std   = ms.latent_std_sum  / lc
                 avg_mean  = ms.latent_mean_sum / lc
@@ -954,14 +988,9 @@ def train():
                 eval_row += [f"{avg_tz[l]:.6e}"    for l in range(nl)]
                 eval_row += [f"{avg_repel[l]:.6f}" for l in range(nl)]
                 eval_row += [f"{avg_jepa:.6f}", f"{avg_mfld:.6f}", f"{avg_cc:.6f}"]
+                eval_row += [f"{avg_dec_c[l]:.6f}" for l in range(nl)]
                 eval_row += [
-                    val for l in range(nl)
-                    for val in (
-                        f"{avg_dec_a[l]:.6f}", f"{avg_dec_b[l]:.6f}", f"{avg_dec_c[l]:.6f}"
-                    )
-                ]
-                eval_row += [
-                    f"{avg_dec:.6f}", f"{avg_std:.6f}", f"{avg_mean:.6f}",
+                    f"{avg_std:.6f}", f"{avg_mean:.6f}",
                     f"{part_ratio:.2f}", f"{lr_val:.6e}",
                 ]
                 eval_row += [f"{attr_std[l]:.6f}"  for l in range(nl)]
@@ -976,7 +1005,7 @@ def train():
                 )
                 acc_str = " ".join(f"l{l} p={pred_char_acc[l]:.1f}%" for l in range(nl))
                 dec_str = (
-                    f"dec {avg_dec_a_mean:.4f} rec {avg_dec_c_mean:.4f} | "
+                    f"rec {avg_dec_c_mean:.4f} | "
                     if ms.layerwise_decoder is not None else ""
                 )
                 print(
