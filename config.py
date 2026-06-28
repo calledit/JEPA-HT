@@ -41,6 +41,10 @@ class Config:
     # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
     # 0.0 = disabled.
     gen_recon_weight: float = 0.15 #CHANGE 2919000 Again 3521000
+    # Reconstruction directly on clean latents (un-detached) → trains the generator to produce
+    # character-predictive representations. Eliminates the attract/reconstruction gradient conflict
+    # by decoupling the generator's training signal from the predictor's output. 0.0 = disabled.
+    clean_recon_weight: float = 1.0
     # Cross-level reconstruction: decode each module's predictor output back to the previous
     # module's clean latent. Only applies to modules 1+. The predictor only sees the gen thread
     # (horizon-masked), so decoding back to the clean latent is non-trivial and creates gradient
@@ -53,8 +57,8 @@ class Config:
     # low-dimensional subspace. Covariance term penalises off-diagonal elements of the feature
     # covariance matrix, decorrelating dimensions. Both are applied to target_latents (un-detached)
     # so the gradient flows directly into the encoder. 0.0 = off.
-    vicreg_var_weight: float = 0.03
-    vicreg_cov_weight: float = 0.01 / 10
+    vicreg_var_weight: float = 0 #0.03
+    vicreg_cov_weight: float = 0 #0.01 / 10
     vicreg_gamma: float = 3.0      # variance hinge threshold (std must exceed this)
 
     # JEPA triplet loss
@@ -127,6 +131,21 @@ class Config:
     cross_module_pred_grad_weight: float = 0.15
     # Let that cross-module gradient reach module i+1's CONTEXT GENERATOR as well as its predictor, so
     # the higher module also shapes its representation to be useful downstream. Still one hop only —
+
+    # Latent Judge: GAN-discriminator-style MLP critic for collapse-resistant attract loss.
+    # After judge_warmup_steps the primary's MSE attract is replaced by MSE-in-judge-space
+    # (judge weights frozen during that pass). The judge is always trained with its own VICReg.
+    # Primary VICReg is removed after warmup — the judge's structure provides anti-collapse pressure.
+    judge_dim: int = 128
+    judge_lr: float = 3e-4
+    judge_warmup_steps: int = 825000
+    judge_corrupt_frac: float = 0.15   # fraction of dims zeroed when training the judge SEMS to correlate with the STD of the net work that is beeing trained...??? Good to know Probably cause it itroduces a certain randomnes. Randomness that esentailly is working like a sort of local field that pushes energy up.
+    # Not sure whata good stable value is... Mabye it is inherently unstable so we need a adaptive stablizer
+    judge_vicreg_var_weight: float = 0.03
+    judge_vicreg_cov_weight: float = 0.001
+    judge_vicreg_gamma: float = 1.0
+    judge_r1_weight: float = 0.10
+    judge_r1_interval: int = 1
 
     # Eval / checkpointing
     eval_interval: int = 500

@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
-from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder, InputLatentDecoder
+from model import Generator, LayerwisePredictor, ManifoldEstimator, LayerwiseDecoder, InputLatentDecoder, LatentJudge
 from data import build_dataset
 
 _CKPT_RE = re.compile(r"checkpoint_s(\d+)\.pt")
@@ -151,6 +151,11 @@ class ModuleState:
             self.manifold_est.parameters(), lr=cfg.manifold_est_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
         )
 
+        self.judge = LatentJudge(cfg).to(device)
+        self.judge_opt = torch.optim.AdamW(
+            self.judge.parameters(), lr=cfg.judge_lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        )
+
         self.attract_window  = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
         self.repel_window    = [deque(maxlen=1000) for _ in range(cfg.n_layers)]
         self.manifold_window = deque(maxlen=1000)
@@ -186,6 +191,11 @@ class ModuleState:
         self.decoder_count = 0
         self.recon_count   = 0
         self.loss_count    = 0
+        self.judge_loss_sum = 0.0
+        self.judge_std_sum  = 0.0
+        self.judge_cov_sum  = 0.0
+        self.judge_r1_sum   = 0.0
+        self.judge_r1_count = 0
 
     def state_dict(self) -> dict:
         d = {
@@ -209,6 +219,8 @@ class ModuleState:
         if self.input_latent_decoder is not None:
             d["input_latent_decoder"]  = self.input_latent_decoder.state_dict()
             d["input_latent_dec_opt"]  = self.input_latent_dec_opt.state_dict()
+        d["judge"]     = self.judge.state_dict()
+        d["judge_opt"] = self.judge_opt.state_dict()
         return d
 
     def load_state_dict(self, d: dict):
@@ -222,6 +234,7 @@ class ModuleState:
             sub_models.append(("layerwise_decoder", self.layerwise_decoder, "decoder_opt"))
         if self.input_latent_decoder is not None:
             sub_models.append(("input_latent_decoder", self.input_latent_decoder, "input_latent_dec_opt"))
+        sub_models.append(("judge", self.judge, "judge_opt"))
         for key, model, opt_key in sub_models:
             try:
                 model.load_state_dict(d[key], strict=False)
@@ -237,6 +250,7 @@ class ModuleState:
             opt_specs.append((self.decoder_opt, "decoder_opt"))
         if self.input_latent_dec_opt is not None:
             opt_specs.append((self.input_latent_dec_opt, "input_latent_dec_opt"))
+        opt_specs.append((self.judge_opt, "judge_opt"))
         for opt, key in opt_specs:
             if key in skip_opts or key not in d:
                 continue
@@ -276,6 +290,7 @@ class ModuleState:
             self.layerwise_decoder.train()
         if self.input_latent_decoder is not None:
             self.input_latent_decoder.train()
+        self.judge.train()
 
 
 # ── Per-module training step ────────────────────────────────────────────────
@@ -308,10 +323,52 @@ def module_predict_gen(
     r1_penalty  = ctx["r1_penalty"]
     r1_computed = ctx["r1_computed"]
 
+    # ── Judge training: own JEPA + VICReg, fully independent of primary loss ───
+    # Corrupts clean latents by zeroing random dimensions, then trains the judge to
+    # map corrupted and clean to nearby points in its own structured space (MSE term).
+    # VICReg on the clean side prevents the judge itself from collapsing.
+    ms.judge_opt.zero_grad()
+    judge_loss_total = x.new_zeros(())
+    judge_std_total  = 0.0
+    judge_cov_total  = 0.0
+    judge_r1_total   = x.new_zeros(())
+    judge_r1_computed = cfg.judge_r1_weight > 0.0 and local_step % cfg.judge_r1_interval == 0
+    for _l in range(cfg.n_layers):
+        clean_l   = target_latents[_l + 1].detach()
+        dim_mask  = (torch.rand(clean_l.shape, device=clean_l.device) > cfg.judge_corrupt_frac).to(clean_l.dtype)
+        corrupt_l = clean_l * dim_mask
+        z_clean   = ms.judge.encode(clean_l)
+        z_corrupt = ms.judge.encode(corrupt_l)
+        z_pred    = ms.judge.predict(z_corrupt)
+        j_var  = _vicreg_var(z_clean, cfg.judge_vicreg_gamma)
+        j_cov  = _vicreg_cov(z_clean)
+        judge_loss_total = judge_loss_total + (
+            F.mse_loss(z_pred, z_clean.detach())
+            + cfg.judge_vicreg_var_weight * j_var
+            + cfg.judge_vicreg_cov_weight * j_cov
+        )
+        if judge_r1_computed:
+            real_in  = clean_l.reshape(-1, cfg.d_model).requires_grad_(True)
+            real_out = ms.judge.predict(ms.judge.encode(real_in))
+            grad     = torch.autograd.grad(outputs=real_out.sum(), inputs=real_in, create_graph=True)[0]
+            judge_r1_total = judge_r1_total + grad.pow(2).sum(dim=-1).mean() / cfg.n_layers
+        with torch.no_grad():
+            judge_std_total += z_clean.reshape(-1, cfg.judge_dim).std(dim=0).mean().item()
+            judge_cov_total += j_cov.item()
+    judge_total = judge_loss_total / cfg.n_layers + judge_r1_total * cfg.judge_r1_weight
+    judge_total.backward()
+    torch.nn.utils.clip_grad_norm_(ms.judge.parameters(), cfg.grad_clip)
+    ms.judge_opt.step()
+    judge_loss_scalar = judge_loss_total.item() / cfg.n_layers
+    judge_std_scalar  = judge_std_total         / cfg.n_layers
+    judge_cov_scalar  = judge_cov_total         / cfg.n_layers
+    judge_r1_scalar   = judge_r1_total.item()
+
     # ── Generator + predictor step ───────────────────────────────────────────
     recon_ce       = None
     recon_terms    = None
     input_dec_loss = None
+    use_judge      = local_step >= cfg.judge_warmup_steps
     with autocast():
         layer_losses            = []
         attract_losses          = []
@@ -365,16 +422,25 @@ def module_predict_gen(
             # ── Current prediction (Phase B) — split by visible/null mask ────────
             pred_v = preds[l][:, lo:hi]
             targ_v = target_latents[l + 1].detach()[:, lo:hi]
+            if use_judge:
+                # Freeze judge weights: grad flows to pred_v but never updates the judge here.
+                for p in ms.judge.parameters(): p.requires_grad_(False)
+                with torch.no_grad():
+                    cmp_targ = ms.judge.encode(targ_v)
+                cmp_pred = ms.judge.predict(ms.judge.encode(pred_v))
+                for p in ms.judge.parameters(): p.requires_grad_(True)
+            else:
+                cmp_pred, cmp_targ = pred_v, targ_v
             if visible_mask is not None:
                 vm       = visible_mask[:, lo:hi]           # [B, W]
                 vm_flat  = vm.reshape(-1)                   # [B*W]
-                pf       = pred_v.reshape(-1, cfg.d_model)
-                tf       = targ_v.reshape(-1, cfg.d_model)
+                pf       = cmp_pred.reshape(-1, cmp_pred.shape[-1])
+                tf       = cmp_targ.reshape(-1, cmp_targ.shape[-1])
                 attract_null    = F.mse_loss(pf[~vm_flat], tf[~vm_flat]) if (~vm_flat).any() else pred_v.new_zeros(())
                 attract_visible = F.mse_loss(pf[ vm_flat], tf[ vm_flat]) if   vm_flat.any()  else pred_v.new_zeros(())
                 attract = (attract_null + attract_visible) / 2
             else:
-                attract         = F.mse_loss(pred_v, targ_v)
+                attract         = F.mse_loss(cmp_pred, cmp_targ)
                 attract_null    = pred_v.new_zeros(())
                 attract_visible = pred_v.new_zeros(())
 
@@ -406,14 +472,19 @@ def module_predict_gen(
                 pred_past_l = pred_future_l = None
                 past_loss = future_loss = pred_v.new_zeros(())
 
-            # ── Reconstruction: first 64 chars only ───────────────────────────────
+            # ── Reconstruction: predictor output + clean latent ───────────────────
             if module_idx == 0 and cfg.gen_recon_weight > 0.0 and dec_logits is not None:
                 terms = []
-                recon_hi = min(hi, 64)
+                recon_hi = min(hi, 256)
                 if lo < recon_hi:
                     logits_w = dec_logits[l][:, lo:recon_hi].reshape(-1, cfg.vocab_size)
                     target_w = x[:, lo:recon_hi].reshape(-1)
                     terms.append(F.cross_entropy(logits_w, target_w))
+                    # Direct clean-latent reconstruction: trains generator to produce
+                    # character-predictive representations independent of the predictor.
+                    if cfg.clean_recon_weight > 0.0:
+                        clean_logits_w = ms.layerwise_decoder(l, target_latents[l + 1][:, lo:recon_hi])
+                        terms.append(cfg.clean_recon_weight * F.cross_entropy(clean_logits_w.reshape(-1, cfg.vocab_size), target_w))
                 if n_past > 0:
                     past_pos = j_past[has_past]
                     early    = past_pos < 64
@@ -426,16 +497,18 @@ def module_predict_gen(
 
             manifold_stablization = (disc_corrupt - disc_target).mean()
             manifold_stablization = manifold_stablization # * min(max(0, float(disc_margin)) * 3.0, 1.0)
-            manifold_stablization = 0
-            layer_loss = attract + manifold_stablization * cfg.manifold_stablization_weight
+            #manifold_stablization = 0
+            layer_loss = attract + 0 * cfg.manifold_stablization_weight
             if cfg.jepa_past_weight > 0.0:
                 layer_loss = layer_loss + cfg.jepa_past_weight * past_loss
             if cfg.jepa_future_weight > 0.0:
                 layer_loss = layer_loss + cfg.jepa_future_weight * future_loss
-            if cfg.vicreg_var_weight > 0.0:
+            if cfg.vicreg_var_weight > 0.0 and not use_judge:
                 layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(target_latents[l + 1], cfg.vicreg_gamma)
-            if cfg.vicreg_cov_weight > 0.0:
+            if cfg.vicreg_cov_weight > 0.0 and not use_judge:
                 layer_loss = layer_loss + cfg.vicreg_cov_weight * _vicreg_cov(target_latents[l + 1])
+
+            manifold_stablization = float(manifold_stablization.detach()) # * min(max(0, float(disc_margin)) * 3.0, 1.0)
             layer_losses.append(layer_loss)
             attract_losses.append(attract.detach())
             attract_null_losses.append(attract_null.detach())
@@ -522,6 +595,12 @@ def module_predict_gen(
         step_latent_mean = latent.mean().item()
     ms.latent_std_sum  += step_latent_std
     ms.latent_mean_sum += step_latent_mean
+    ms.judge_loss_sum  += judge_loss_scalar
+    ms.judge_std_sum   += judge_std_scalar
+    ms.judge_cov_sum   += judge_cov_scalar
+    if judge_r1_computed:
+        ms.judge_r1_sum   += judge_r1_scalar
+        ms.judge_r1_count += 1
     ms.loss_count      += 1
 
     ms.last_preds = preds
@@ -545,6 +624,10 @@ def module_predict_gen(
         "r1_computed": r1_computed,
         "target_latents":  target_latents,
         "preds":           preds,
+        "judge_loss":      judge_loss_scalar,
+        "judge_std":       judge_std_scalar,
+        "judge_cov":       judge_cov_scalar,
+        "judge_r1":        judge_r1_scalar,
     }
 
 
@@ -1042,6 +1125,10 @@ def train():
                 avg_std   = ms.latent_std_sum  / lc
                 avg_mean  = ms.latent_mean_sum / lc
                 avg_r1    = ms.r1_sum  / rc
+                avg_judge_loss = ms.judge_loss_sum / lc
+                avg_judge_std  = ms.judge_std_sum  / lc
+                avg_judge_cov  = ms.judge_cov_sum  / lc
+                avg_judge_r1   = ms.judge_r1_sum / max(ms.judge_r1_count, 1)
                 lr_val    = r["lr"]
 
                 attr_std  = [
@@ -1116,7 +1203,9 @@ def train():
                     f"  [m{i}] step {step:7d} | {layer_str} | "
                     f"margin {avg_mfld:.4f}(σ={mfld_std:.4f}) r1={avg_r1:.4f} | "
                     f"{dec_str}{acc_str} | "
-                    f"std {avg_std:.4f} mean {avg_mean:.4f} pr {part_ratio:.1f}/{cfg.d_model} | lr {lr_val:.2e}"
+                    f"std {avg_std:.4f} mean {avg_mean:.4f} pr {part_ratio:.1f}/{cfg.d_model} | "
+                    f"judge loss={avg_judge_loss:.4f} std={avg_judge_std:.4f} cov={avg_judge_cov:.4f} r1={avg_judge_r1:.4f} | "
+                    f"lr {lr_val:.2e}"
                 )
                 ms._reset_accumulators()
 

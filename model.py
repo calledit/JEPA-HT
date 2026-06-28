@@ -541,6 +541,42 @@ class LayerwiseDecoder(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+class LatentJudge(nn.Module):
+    """Secondary JEPA critic: encoder + predictor MLP pair trained on primary latents.
+    Encoder maps clean/corrupt latents to judge space. Predictor maps a corrupted encoding
+    to the predicted clean encoding. Trained with MSE(predict(encode(corrupt)), encode(clean))
+    + VICReg on encode(clean). When providing the attract metric for the primary, both networks
+    are frozen so gradients flow only to the primary predictor (GAN-discriminator pattern)."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        D, H = cfg.d_model, cfg.judge_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(D, H, bias=False), nn.GELU(),
+            nn.Linear(H, H, bias=False), nn.GELU(),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(H, H, bias=False), nn.GELU(),
+            nn.Linear(H, H, bias=False),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def encode(self, h: torch.Tensor) -> torch.Tensor:
+        shape = h.shape
+        return self.encoder(h.reshape(-1, shape[-1])).reshape(*shape[:-1], -1)
+
+    def predict(self, z: torch.Tensor) -> torch.Tensor:
+        shape = z.shape
+        return self.predictor(z.reshape(-1, shape[-1])).reshape(*shape[:-1], -1)
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 class InputLatentDecoder(nn.Module):
     """One 4-layer MLP decoder per block: decodes the predictor output back to the previous
     module's clean latent. Used for modules 1+ to add cross-level reconstruction pressure —
