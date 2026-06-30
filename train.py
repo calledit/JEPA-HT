@@ -91,20 +91,25 @@ def nca(loss: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, scale: flo
 
 
 def _vicreg_var(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
-    """VICReg variance term: hinge pushing per-dim std above gamma, averaged over dims."""
-    z = z.reshape(-1, z.shape[-1])
-    std = (z.var(dim=0) + 1e-4).sqrt()
-    return F.relu(gamma - std).mean()
+    """VICReg variance term: quadratic hinge pushing per-dim std above gamma.
+    Variance is computed across the batch dimension only — each position is compared
+    to the same position in other samples, not to other positions in the same sequence."""
+    B = z.shape[0]
+    z = z.reshape(B, -1, z.shape[-1])          # [B, T, D]
+    std = (z.var(dim=0) + 1e-4).sqrt()         # [T, D] — across batch per position
+    return F.relu(gamma - std).pow(2).mean()
 
 
 def _vicreg_cov(z: torch.Tensor) -> torch.Tensor:
-    """VICReg covariance term: penalise off-diagonal entries of the feature covariance matrix."""
-    z = z.reshape(-1, z.shape[-1])
-    N, D = z.shape
-    z = z - z.mean(dim=0)
-    cov = (z.T @ z) / (N - 1)
-    off_diag = cov.masked_fill(torch.eye(D, dtype=torch.bool, device=z.device), 0.0)
-    return off_diag.pow(2).sum() / D
+    """VICReg covariance term: penalise off-diagonal entries of the feature covariance matrix.
+    Covariance is computed across the batch dimension only, per position."""
+    B = z.shape[0]
+    z = z.reshape(B, -1, z.shape[-1])          # [B, T, D]
+    z = z - z.mean(dim=0, keepdim=True)        # centre per position
+    D = z.shape[-1]
+    cov = torch.einsum('btd,bte->tde', z, z) / (B - 1)   # [T, D, D]
+    off_diag = cov.pow(2).sum(dim=(-2, -1)) - cov.diagonal(dim1=-2, dim2=-1).pow(2).sum(dim=-1)
+    return off_diag.mean() / D
 
 
 # ── Per-module state ────────────────────────────────────────────────────────
@@ -194,8 +199,8 @@ class ModuleState:
         self.judge_loss_sum = 0.0
         self.judge_std_sum  = 0.0
         self.judge_cov_sum  = 0.0
-        self.judge_r1_sum   = 0.0
-        self.judge_r1_count = 0
+        self.judge_r1_sum      = 0.0
+        self.judge_r1_count    = 0
 
     def state_dict(self) -> dict:
         d = {
@@ -331,7 +336,7 @@ def module_predict_gen(
     judge_loss_total = x.new_zeros(())
     judge_std_total  = 0.0
     judge_cov_total  = 0.0
-    judge_r1_total   = x.new_zeros(())
+    judge_r1_total    = x.new_zeros(())
     judge_r1_computed = cfg.judge_r1_weight > 0.0 and local_step % cfg.judge_r1_interval == 0
     for _l in range(cfg.n_layers):
         clean_l   = target_latents[_l + 1].detach()
@@ -355,14 +360,14 @@ def module_predict_gen(
         with torch.no_grad():
             judge_std_total += z_clean.reshape(-1, cfg.judge_dim).std(dim=0).mean().item()
             judge_cov_total += j_cov.item()
-    judge_total = judge_loss_total / cfg.n_layers + judge_r1_total * cfg.judge_r1_weight
+    judge_total = (judge_loss_total / cfg.n_layers + judge_r1_total * cfg.judge_r1_weight)
     judge_total.backward()
     torch.nn.utils.clip_grad_norm_(ms.judge.parameters(), cfg.grad_clip)
     ms.judge_opt.step()
     judge_loss_scalar = judge_loss_total.item() / cfg.n_layers
     judge_std_scalar  = judge_std_total         / cfg.n_layers
     judge_cov_scalar  = judge_cov_total         / cfg.n_layers
-    judge_r1_scalar   = judge_r1_total.item()
+    judge_r1_scalar      = judge_r1_total.item()
 
     # ── Generator + predictor step ───────────────────────────────────────────
     recon_ce       = None
@@ -375,6 +380,7 @@ def module_predict_gen(
         attract_null_losses     = []
         attract_visible_losses  = []
         past_losses             = []
+
         future_losses           = []
         toward_zero_losses      = []
         repel_losses            = []
@@ -403,7 +409,8 @@ def module_predict_gen(
                 torch.rand(int(has_past.sum()), device=x.device) * past_range[has_past].float()
             ).long()
 
-        future_range = (hi - 1) - t_idx                  # [W], 0 at t=hi-1
+        max_ahead    = max(1, int(0.1 * T))
+        future_range = ((hi - 1) - t_idx).clamp(max=max_ahead)  # never more than 10% of T ahead
         has_future   = future_range > 0
         j_future     = torch.zeros(W, dtype=torch.long, device=x.device)
         if has_future.any():
@@ -427,7 +434,7 @@ def module_predict_gen(
                 for p in ms.judge.parameters(): p.requires_grad_(False)
                 with torch.no_grad():
                     cmp_targ = ms.judge.encode(targ_v)
-                cmp_pred = ms.judge.predict(ms.judge.encode(pred_v))
+                cmp_pred = ms.judge.encode(pred_v)
                 for p in ms.judge.parameters(): p.requires_grad_(True)
             else:
                 cmp_pred, cmp_targ = pred_v, targ_v
@@ -466,6 +473,21 @@ def module_predict_gen(
                 targ_past_l   = target_latents[l + 1].detach()[:, j_past[has_past]]   if n_past   > 0 else None
                 targ_future_l = target_latents[l + 1].detach()[:, j_future[has_future]] if n_future > 0 else None
 
+                pred_past_l_for_recon = pred_past_l  # d_model space, for decoder below
+
+                if use_judge and n_past > 0:
+                    for p in ms.judge.parameters(): p.requires_grad_(False)
+                    with torch.no_grad():
+                        targ_past_l = ms.judge.encode(targ_past_l)
+                    pred_past_l = ms.judge.encode(pred_past_l)
+                    for p in ms.judge.parameters(): p.requires_grad_(True)
+                if use_judge and n_future > 0:
+                    for p in ms.judge.parameters(): p.requires_grad_(False)
+                    with torch.no_grad():
+                        targ_future_l = ms.judge.encode(targ_future_l)
+                    pred_future_l = ms.judge.encode(pred_future_l)
+                    for p in ms.judge.parameters(): p.requires_grad_(True)
+
                 past_loss   = F.mse_loss(pred_past_l,   targ_past_l)   if n_past   > 0 else pred_v.new_zeros(())
                 future_loss = F.mse_loss(pred_future_l, targ_future_l) if n_future > 0 else pred_v.new_zeros(())
             else:
@@ -480,16 +502,20 @@ def module_predict_gen(
                     logits_w = dec_logits[l][:, lo:recon_hi].reshape(-1, cfg.vocab_size)
                     target_w = x[:, lo:recon_hi].reshape(-1)
                     terms.append(F.cross_entropy(logits_w, target_w))
-                    # Direct clean-latent reconstruction: trains generator to produce
-                    # character-predictive representations independent of the predictor.
                     if cfg.clean_recon_weight > 0.0:
-                        clean_logits_w = ms.layerwise_decoder(l, target_latents[l + 1][:, lo:recon_hi])
+                        clean_in = target_latents[l + 1][:, lo:recon_hi]
+                        if step % (cfg.recon_detach_steps + cfg.recon_attach_steps) < cfg.recon_detach_steps:
+                            clean_in = clean_in.detach()
+                        clean_logits_w = ms.layerwise_decoder(l, clean_in)
                         terms.append(cfg.clean_recon_weight * F.cross_entropy(clean_logits_w.reshape(-1, cfg.vocab_size), target_w))
                 if n_past > 0:
                     past_pos = j_past[has_past]
-                    early    = past_pos < 64
+                    early    = past_pos < 256
                     if early.any():
-                        past_logits = ms.layerwise_decoder(l, pred_past_l[:, early])
+                        past_in = pred_past_l_for_recon[:, early]
+                        if step % (cfg.recon_detach_steps + cfg.recon_attach_steps) < cfg.recon_detach_steps:
+                            past_in = past_in.detach()
+                        past_logits = ms.layerwise_decoder(l, past_in)
                         past_tgt    = x[:, past_pos[early]]
                         terms.append(F.cross_entropy(past_logits.reshape(-1, cfg.vocab_size), past_tgt.reshape(-1)))
                 if terms:
@@ -507,6 +533,11 @@ def module_predict_gen(
                 layer_loss = layer_loss + cfg.vicreg_var_weight * _vicreg_var(target_latents[l + 1], cfg.vicreg_gamma)
             if cfg.vicreg_cov_weight > 0.0 and not use_judge:
                 layer_loss = layer_loss + cfg.vicreg_cov_weight * _vicreg_cov(target_latents[l + 1])
+            if use_judge and cfg.numeric_push_weight > 0.0:
+                diff = pred_v - targ_v.detach()
+                dist = diff.norm(dim=-1).mean()
+                raw_push = torch.exp(-dist / cfg.numeric_push_scale)
+                layer_loss = layer_loss + cfg.numeric_push_weight * raw_push
 
             manifold_stablization = float(manifold_stablization.detach()) # * min(max(0, float(disc_margin)) * 3.0, 1.0)
             layer_losses.append(layer_loss)
@@ -599,8 +630,8 @@ def module_predict_gen(
     ms.judge_std_sum   += judge_std_scalar
     ms.judge_cov_sum   += judge_cov_scalar
     if judge_r1_computed:
-        ms.judge_r1_sum   += judge_r1_scalar
-        ms.judge_r1_count += 1
+        ms.judge_r1_sum      += judge_r1_scalar
+        ms.judge_r1_count    += 1
     ms.loss_count      += 1
 
     ms.last_preds = preds
@@ -997,10 +1028,11 @@ def train():
         for i in active:
             module_states[i].last_gen_hiddens = ctxs[i]["gen_hiddens"]
 
-        # ── Decoder logits: run once attached; reuse for sampling and reconstruction ──
+        # ── Decoder logits: run once; reuse for sampling and reconstruction ──
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            _pred_in = [p.detach() if step % (cfg.recon_detach_steps + cfg.recon_attach_steps) < cfg.recon_detach_steps else p for p in preds_by_module[0]]
             dec_logits = [
-                module_states[0].layerwise_decoder(l, preds_by_module[0][l])
+                module_states[0].layerwise_decoder(l, _pred_in[l])
                 for l in range(cfg.n_layers)
             ]
 
@@ -1128,7 +1160,8 @@ def train():
                 avg_judge_loss = ms.judge_loss_sum / lc
                 avg_judge_std  = ms.judge_std_sum  / lc
                 avg_judge_cov  = ms.judge_cov_sum  / lc
-                avg_judge_r1   = ms.judge_r1_sum / max(ms.judge_r1_count, 1)
+                avg_judge_r1     = ms.judge_r1_sum    / max(ms.judge_r1_count, 1)
+
                 lr_val    = r["lr"]
 
                 attr_std  = [
@@ -1151,6 +1184,8 @@ def train():
                     with torch.no_grad():
                         v = ms.last_clean[:, :15, :].float().reshape(-1, ms.last_clean.shape[-1]).var(dim=0)
                         part_ratio = float(v.sum() ** 2 / (v.pow(2).sum() + 1e-12))
+
+
 
                 # char accuracy from last training batch (only modules that own a decoder)
                 pred_char_acc = [0.0] * nl

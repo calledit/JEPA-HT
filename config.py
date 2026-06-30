@@ -22,8 +22,8 @@ class Config:
     null_mask_prob: float = 0.85
 
     # Weights for past/future auxiliary prediction losses. 0.0 = track only (no gradient effect).
-    jepa_past_weight:   float = 0.15
-    jepa_future_weight: float = 1.0
+    jepa_past_weight:   float = 0.0
+    jepa_future_weight: float = 0.15
 
     # Kept for reference / old checkpoints; no longer used (replaced by null_mask_prob).
     n_clean_tokens: int = 2
@@ -40,11 +40,16 @@ class Config:
     # Keeps module 0 from compressing away character-predictive content when the JEPA / top-down brake
     # signal is weak. Keep this small; large values collapse the latent toward raw char identity.
     # 0.0 = disabled.
-    gen_recon_weight: float = 0.15 #CHANGE 2919000 Again 3521000
+    gen_recon_weight: float = 1.0 #CHANGE 2919000 Again 3521000
     # Reconstruction directly on clean latents (un-detached) → trains the generator to produce
     # character-predictive representations. Eliminates the attract/reconstruction gradient conflict
     # by decoupling the generator's training signal from the predictor's output. 0.0 = disabled.
-    clean_recon_weight: float = 1.0
+    clean_recon_weight: float = 0.0
+    # Cyclic recon-detach schedule: detach for recon_detach_steps, then attach for
+    # recon_attach_steps, repeating. Detached = decoder-only gradient; attached = gradient
+    # flows into generator/predictor.
+    recon_detach_steps: int = 5_000
+    recon_attach_steps: int = 10_000
     # Cross-level reconstruction: decode each module's predictor output back to the previous
     # module's clean latent. Only applies to modules 1+. The predictor only sees the gen thread
     # (horizon-masked), so decoding back to the clean latent is non-trivial and creates gradient
@@ -57,8 +62,8 @@ class Config:
     # low-dimensional subspace. Covariance term penalises off-diagonal elements of the feature
     # covariance matrix, decorrelating dimensions. Both are applied to target_latents (un-detached)
     # so the gradient flows directly into the encoder. 0.0 = off.
-    vicreg_var_weight: float = 0 #0.03
-    vicreg_cov_weight: float = 0 #0.01 / 10
+    vicreg_var_weight: float = 1.0
+    vicreg_cov_weight: float = 1.0
     vicreg_gamma: float = 3.0      # variance hinge threshold (std must exceed this)
 
     # JEPA triplet loss
@@ -138,14 +143,20 @@ class Config:
     # Primary VICReg is removed after warmup — the judge's structure provides anti-collapse pressure.
     judge_dim: int = 128
     judge_lr: float = 3e-4
-    judge_warmup_steps: int = 825000
-    judge_corrupt_frac: float = 0.15   # fraction of dims zeroed when training the judge SEMS to correlate with the STD of the net work that is beeing trained...??? Good to know Probably cause it itroduces a certain randomnes. Randomness that esentailly is working like a sort of local field that pushes energy up.
+    judge_warmup_steps: int = 2_000_000
+    judge_corrupt_frac: float = 0.1   # fraction of dims zeroed when training the judge SEMS to correlate with the STD of the net work that is beeing trained...??? Good to know Probably cause it itroduces a certain randomnes. Randomness that esentailly is working like a sort of local field that pushes energy up.
     # Not sure whata good stable value is... Mabye it is inherently unstable so we need a adaptive stablizer
-    judge_vicreg_var_weight: float = 0.03
-    judge_vicreg_cov_weight: float = 0.001
+    judge_vicreg_var_weight: float = 10.0
+    judge_vicreg_cov_weight: float = 10.0
     judge_vicreg_gamma: float = 1.0
     judge_r1_weight: float = 0.10
     judge_r1_interval: int = 1
+
+    # Push pred_v and targ_v apart in raw representation space using exp(-||d||/scale).
+    # Gradient direction is (pred-targ)/||pred-targ|| — unit vector, non-zero at coincidence —
+    # scaled by exp(-dist/scale) which decays as they separate. 0.0 = disabled.
+    numeric_push_weight: float = 0.0
+    numeric_push_scale:  float = 0.3   # typical L2 distance at which push halves (tune to rep scale)
 
     # Eval / checkpointing
     eval_interval: int = 500
