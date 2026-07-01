@@ -23,7 +23,7 @@ class Config:
 
     # Weights for past/future auxiliary prediction losses. 0.0 = track only (no gradient effect).
     jepa_past_weight:   float = 0.0
-    jepa_future_weight: float = 0.15
+    jepa_future_weight: float = 0.0
 
     # Kept for reference / old checkpoints; no longer used (replaced by null_mask_prob).
     n_clean_tokens: int = 2
@@ -48,8 +48,8 @@ class Config:
     # Cyclic recon-detach schedule: detach for recon_detach_steps, then attach for
     # recon_attach_steps, repeating. Detached = decoder-only gradient; attached = gradient
     # flows into generator/predictor.
-    recon_detach_steps: int = 5_000
-    recon_attach_steps: int = 10_000
+    recon_detach_steps: int = 10000
+    recon_attach_steps: int = 2
     # Cross-level reconstruction: decode each module's predictor output back to the previous
     # module's clean latent. Only applies to modules 1+. The predictor only sees the gen thread
     # (horizon-masked), so decoding back to the clean latent is non-trivial and creates gradient
@@ -143,7 +143,7 @@ class Config:
     # Primary VICReg is removed after warmup — the judge's structure provides anti-collapse pressure.
     judge_dim: int = 128
     judge_lr: float = 3e-4
-    judge_warmup_steps: int = 2_000_000
+    judge_warmup_steps: int = 1295000000000
     judge_corrupt_frac: float = 0.1   # fraction of dims zeroed when training the judge SEMS to correlate with the STD of the net work that is beeing trained...??? Good to know Probably cause it itroduces a certain randomnes. Randomness that esentailly is working like a sort of local field that pushes energy up.
     # Not sure whata good stable value is... Mabye it is inherently unstable so we need a adaptive stablizer
     judge_vicreg_var_weight: float = 10.0
