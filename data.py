@@ -5,6 +5,7 @@ from torch.utils.data import IterableDataset
 from config import Config
 
 _HF_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hf_cache")
+os.environ.setdefault("HF_HOME", _HF_CACHE_DIR)
 
 
 _FINEWEB_VAL_DOCS = 500
