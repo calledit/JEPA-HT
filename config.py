@@ -16,13 +16,14 @@ class Config:
     mask_prob: float = 0.35
 
     # VICReg anti-collapse on clean target latents (shared by both models)
-    vicreg_var_weight: float = 1.0
-    vicreg_cov_weight: float = 2.0
-    vicreg_gamma: float = 3.0
+    vicreg_var_weight: float = 1.0/32.0
+    vicreg_cov_weight: float = 30
+    vicreg_gamma: float = 6.0
 
     # Model 2: Spelling Effect Model
     action_emb_dim: int = 64   # embedding dim for the action (next character)
     sem_weight: float = 1.0    # weight of SEM loss relative to TextEncoder loss
+    sem_warmup_steps: int = 150_000  # steps before SEM gradients flow into TextEncoder
 
     # Model 3: Autoregressive Model
     ar_d_model: int = 196
@@ -36,8 +37,8 @@ class Config:
 
     # Training
     batch_size: int = 64
-    lr: float = 3e-4           # transformer bodies (TextEncoder, SEM)
-    predictor_lr: float = 6e-4  # predictor MLPs (TEPredictor, SEMPredictor)
+    lr: float = 1e-4           # transformer bodies (TextEncoder, SEM)
+    predictor_lr: float = 1e-4  # predictor MLPs (TEPredictor, SEMPredictor)
     lr_schedule: str = "cosine"
     lr_warmup_steps: int = 2_000
     lr_end_decay_step: int = 100_000

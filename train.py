@@ -71,6 +71,7 @@ def _vicreg_var(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
     return F.relu(gamma - std).pow(2).mean()
 
 
+
 def _vicreg_cov(z: torch.Tensor) -> torch.Tensor:
     """Covariance term: penalise off-diagonal entries of the feature covariance matrix."""
     B = z.shape[0]
@@ -91,6 +92,7 @@ def train_step(
     x: torch.Tensor,
     cfg: Config,
     device: torch.device,
+    step: int = 0,
 ) -> tuple[dict, torch.Tensor, torch.Tensor]:
     """One joint training step for TextEncoder + SpellingEffectModel.
 
@@ -114,13 +116,16 @@ def train_step(
         te_loss = te_jepa + cfg.vicreg_var_weight * te_vvar + cfg.vicreg_cov_weight * te_vcov
 
         # ── Spelling Effect Model ─────────────────────────────────────────────
-        sem_ctx  = sem(tgt)
-        sem_pred = sem_predictor(sem_ctx[:, :-1], x[:, 1:])  # [B, T-1, d_model]
-        sem_tgt  = sem_ctx[:, 1:].detach()
+        sem_input = tgt.detach() if step < cfg.sem_warmup_steps else tgt
+        sem_ctx   = sem(sem_input)
+        # VICReg always uses detached tgt so its gradients never reach TextEncoder
+        sem_ctx_reg = sem_ctx if step < cfg.sem_warmup_steps else sem(tgt.detach())
+        sem_pred  = sem_predictor(sem_ctx[:, :-1], x[:, 1:])  # [B, T-1, d_model]
+        sem_tgt   = sem_ctx[:, 1:].detach()
 
         sem_jepa = F.mse_loss(sem_pred, sem_tgt)
-        sem_vvar = _vicreg_var(sem_pred, cfg.vicreg_gamma)
-        sem_vcov = _vicreg_cov(sem_pred)
+        sem_vvar = _vicreg_var(sem_ctx_reg, cfg.vicreg_gamma)
+        sem_vcov = _vicreg_cov(sem_ctx_reg)
         sem_loss = sem_jepa + cfg.vicreg_var_weight * sem_vvar + cfg.vicreg_cov_weight * sem_vcov
 
         total_loss = te_loss + cfg.sem_weight * sem_loss
@@ -312,7 +317,7 @@ def train():
         ar_optimizer.param_groups[0]["lr"] = lr_ar
 
         result, te_tgt_det, sem_tgt_det = train_step(
-            text_encoder, te_predictor, sem, sem_predictor, optimizer, x, cfg, device
+            text_encoder, te_predictor, sem, sem_predictor, optimizer, x, cfg, device, step
         )
 
         if step % cfg.ar_train_interval == 0:
