@@ -20,6 +20,10 @@ class Config:
     vicreg_cov_weight: float = 30
     vicreg_gamma: float = 6.0
 
+    # R1 gradient penalty (smoothness regulariser, enables L4 to work)
+    r1_weight:    float = 0.15
+    r1_interval:  int   = 50
+
     # Model 2: Spelling Effect Model
     action_emb_dim: int = 64   # embedding dim for the action (next character)
     sem_weight: float = 1.0    # weight of SEM loss relative to TextEncoder loss
@@ -30,10 +34,12 @@ class Config:
     ar_n_layers: int = 3
     ar_ff_mult: int = 2
     ar_lr: float = 3e-4
-    ar_l1_weight: float = 1.0
-    ar_l2_weight: float = 1.0
-    ar_l3_weight: float = 1.0
-    ar_train_interval: int = 10
+    ar_l1_weight:   float = 1.0
+    ar_l2_weight:   float = 1.0
+    ar_l4_weight:          float = 1.0
+    ar_l4_layer_interval:  int   = 25   # steps between random SEM layer resamples for L4
+    ar_l3_weight:          float = 1.0
+    ar_train_interval:     int   = 10
 
     # Training
     batch_size: int = 64

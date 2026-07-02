@@ -11,6 +11,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
 
 
 def default_log():
@@ -33,6 +34,52 @@ def ema(values, window):
     return out
 
 
+def _power_law(x, a, b, c):
+    return a * np.power(x, -b) + c
+
+
+def fit_power_law_baseline(x, y, fit_end, window):
+    """Fit a power law to smoothed y up to fit_end.
+
+    Returns (xs, ys_smooth, y_baseline) all on the same x grid, or None on failure.
+    xs/ys_smooth are the smoothed actual data; y_baseline is the power law evaluated there.
+    """
+    y = np.array(y, dtype=float)
+    x = np.array(x, dtype=float)
+    mask = ~np.isnan(y)
+    x, y = x[mask], y[mask]
+    if len(y) < window:
+        return None
+
+    ys = smooth(y, window)
+    xs = x[window - 1:]
+
+    fit_mask = xs <= fit_end
+    if fit_mask.sum() < 10:
+        return None
+
+    xf, yf = xs[fit_mask], ys[fit_mask]
+    try:
+        p0 = (yf[0] - yf[-1], 0.3, yf[-1])
+        popt, _ = curve_fit(_power_law, xf, yf, p0=p0, maxfev=10_000,
+                            bounds=([0, 0, 0], [np.inf, 2, np.inf]))
+    except RuntimeError:
+        return None
+
+    return xs, ys, _power_law(xs, *popt)
+
+
+def plot_extrapolation(ax, x, y, fit_end, window, color="dimgray"):
+    """Plot a power-law baseline extrapolated beyond fit_end."""
+    result = fit_power_law_baseline(x, y, fit_end, window)
+    if result is None:
+        return
+    xs, _, y_baseline = result
+    ax.plot(xs, y_baseline, color=color, linewidth=1.6, linestyle="--",
+            label=f"power-law fit (≤{fit_end//1000}k steps)", zorder=5)
+    ax.axvline(fit_end, color=color, linewidth=0.8, linestyle=":", alpha=0.6)
+
+
 def plot_line(ax, x, y, label, color, window, linestyle="-"):
     y = np.array(y, dtype=float)
     mask = ~np.isnan(y)
@@ -49,10 +96,12 @@ def plot_line(ax, x, y, label, color, window, linestyle="-"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log",    default=default_log())
-    parser.add_argument("--smooth", type=int, default=20)
-    parser.add_argument("--start",  type=int, default=0)
-    parser.add_argument("--end",    type=int, default=None)
+    parser.add_argument("--log",     default=default_log())
+    parser.add_argument("--smooth",  type=int, default=20)
+    parser.add_argument("--start",   type=int, default=0)
+    parser.add_argument("--end",     type=int, default=None)
+    parser.add_argument("--fit_end", type=int, default=700_000,
+                        help="Fit power-law baseline to AR L1 up to this step")
     args = parser.parse_args()
 
     df = pd.read_csv(args.log)
@@ -110,9 +159,11 @@ def main():
     ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 2]
-    plot_line(ax, s, df["ar_l1"], "L1 xent", "crimson",   args.smooth)
-    plot_line(ax, s, df["ar_l2"], "L2 TE",   "salmon",    args.smooth, "--")
-    plot_line(ax, s, df["ar_l3"], "L3 SEM",  "lightcoral",args.smooth, ":")
+    plot_line(ax, s, df["ar_l1"],   "L1 xent",    "crimson",    args.smooth)
+    plot_line(ax, s, df["ar_l2"],   "L2 TE",      "salmon",     args.smooth, "--")
+    plot_line(ax, s, df["ar_l4"], "L4 SEM",   "darkorange", args.smooth, "--")
+    plot_line(ax, s, df["ar_l3"],   "L3 SEM",     "lightcoral", args.smooth, ":")
+    plot_extrapolation(ax, s, df["ar_l1"], args.fit_end, args.smooth)
     ax.set_title("AR loss breakdown")
     ax.set_ylabel("loss")
     ax.legend(); ax.grid(True, alpha=0.3)
@@ -147,7 +198,18 @@ def main():
     ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[2, 3]
-    ax.set_visible(False)
+    result = fit_power_law_baseline(s, df["ar_l1"], args.fit_end, args.smooth)
+    if result is not None:
+        xs, ys_smooth, y_baseline = result
+        diff = ys_smooth - y_baseline
+        ax.plot(xs, diff, color="crimson", linewidth=1.5, label="L1 − baseline")
+        ax.axhline(0, color="dimgray", linewidth=0.8, linestyle="--")
+        ax.axvline(args.fit_end, color="dimgray", linewidth=0.8, linestyle=":", alpha=0.6)
+        ax.fill_between(xs, diff, 0, where=(diff > 0), alpha=0.15, color="crimson")
+        ax.fill_between(xs, diff, 0, where=(diff < 0), alpha=0.15, color="steelblue")
+    ax.set_title("AR L1 − power-law baseline (saturation gap)")
+    ax.set_ylabel("loss gap")
+    ax.legend(); ax.grid(True, alpha=0.3)
 
     for ax in axes.flat:
         if ax.get_visible():

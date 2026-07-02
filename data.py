@@ -1,4 +1,7 @@
+import ctypes
 import os
+from multiprocessing import Value
+
 import torch
 from torch.utils.data import IterableDataset
 
@@ -36,7 +39,11 @@ class SequenceDataset(IterableDataset):
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
-        self.docs_consumed = skip_docs
+        self._docs_consumed = Value(ctypes.c_int64, skip_docs)
+
+    @property
+    def docs_consumed(self) -> int:
+        return self._docs_consumed.value
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -51,7 +58,8 @@ class SequenceDataset(IterableDataset):
             raw = self.tokenizer.encode(doc["text"])
             if not raw:
                 continue
-            self.docs_consumed += 1
+            with self._docs_consumed.get_lock():
+                self._docs_consumed.value += 1
             for start in range(0, len(raw), self.sequence_length):
                 chunk = raw[start : start + self.sequence_length]
                 if len(chunk) < self.sequence_length:

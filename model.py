@@ -183,15 +183,18 @@ class SpellingEffectModel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, text_enc: torch.Tensor) -> torch.Tensor:
-        """
-        text_enc: [B, T, d_model] — text encodings from TextEncoder
-        returns:  [B, T, d_model] — context latents (no action conditioning)
-        """
+    def forward(self, text_enc: torch.Tensor,
+                return_layer: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         h = text_enc
-        for block in self.blocks:
+        layer_out = None
+        for i, block in enumerate(self.blocks):
             h = block(h)
-        return self.norm(h)
+            if return_layer is not None and i == return_layer:
+                layer_out = h
+        out = self.norm(h)
+        if return_layer is not None:
+            return out, layer_out
+        return out
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
