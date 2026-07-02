@@ -184,16 +184,19 @@ class SpellingEffectModel(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, text_enc: torch.Tensor,
-                return_layer: int | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+                return_layers: bool = False) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         h = text_enc
-        layer_out = None
-        for i, block in enumerate(self.blocks):
-            h = block(h)
-            if return_layer is not None and i == return_layer:
-                layer_out = h
+        layer_outs = []
+        for block in self.blocks:
+            h = h + block.attn(block.norm1(h))
+            if return_layers:
+                layer_outs.append(h)
+            h = h + block.ff(block.norm2(h))
+            if return_layers:
+                layer_outs.append(h)
         out = self.norm(h)
-        if return_layer is not None:
-            return out, layer_out
+        if return_layers:
+            return out, layer_outs
         return out
 
     def num_params(self) -> int:
@@ -224,14 +227,34 @@ class SEMPredictor(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, context: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def forward(self, context: torch.Tensor, actions: torch.Tensor,
+                return_layers: bool = False) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         context: [B, T, d_model] — output of SpellingEffectModel
         actions: [B, T] long     — next character ids
         returns: [B, T, d_model] — text change latents (predicted text_encoding[i+1])
         """
-        action_e = self.action_emb(actions)                            # [B, T, action_emb_dim]
-        return self.net(torch.cat([context, action_e], dim=-1))       # [B, T, d_model]
+        action_e = self.action_emb(actions)
+        h = torch.cat([context, action_e], dim=-1)
+        if not return_layers:
+            return self.net(h)
+        layer_outs = []
+        for layer in self.net:
+            h = layer(h)
+            layer_outs.append(h)
+        return h, layer_outs
+
+    def forward_soft(self, context: torch.Tensor, soft_action: torch.Tensor,
+                     return_layers: bool = False) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Same as forward but accepts a pre-computed soft action embedding instead of integer ids."""
+        h = torch.cat([context, soft_action], dim=-1)
+        if not return_layers:
+            return self.net(h)
+        layer_outs = []
+        for layer in self.net:
+            h = layer(h)
+            layer_outs.append(h)
+        return h, layer_outs
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

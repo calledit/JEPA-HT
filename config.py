@@ -36,9 +36,9 @@ class Config:
     ar_lr: float = 3e-4
     ar_l1_weight:   float = 1.0
     ar_l2_weight:   float = 1.0
-    ar_l4_weight:          float = 1.0
-    ar_l4_layer_interval:  int   = 25   # steps between random SEM layer resamples for L4
-    ar_l3_weight:          float = 1.0
+    ar_l4_weight:        float = 1.0
+    ar_l4_skip_layers:   int   = 0
+    ar_l3_weight:        float = 1.0
     ar_train_interval:     int   = 10
 
     # Training

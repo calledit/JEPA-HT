@@ -1,5 +1,4 @@
 import csv
-import random
 import glob
 import math
 import os
@@ -94,7 +93,6 @@ def train_step(
     cfg: Config,
     device: torch.device,
     step: int = 0,
-    vic_layer: int = 0,
 ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One joint training step for TextEncoder + SpellingEffectModel.
 
@@ -119,11 +117,11 @@ def train_step(
 
         # ── Spelling Effect Model ─────────────────────────────────────────────
         sem_input = tgt.detach() if step < cfg.sem_warmup_steps else tgt
-        sem_ctx, sem_layer = sem(sem_input, return_layer=vic_layer)
+        sem_ctx = sem(sem_input)
         # VICReg always uses detached tgt so its gradients never reach TextEncoder
         sem_ctx_reg = sem_ctx if step < cfg.sem_warmup_steps else sem(tgt.detach())
-        sem_pred  = sem_predictor(sem_ctx[:, :-1], x[:, 1:])  # [B, T-1, d_model]
-        sem_tgt   = sem_ctx[:, 1:].detach()
+        sem_pred, sem_pred_layers = sem_predictor(sem_ctx[:, :-1], x[:, 1:], return_layers=True)
+        sem_tgt  = sem_ctx[:, 1:].detach()
 
         sem_jepa = F.mse_loss(sem_pred, sem_tgt)
         sem_vvar = _vicreg_var(sem_ctx_reg, cfg.vicreg_gamma)
@@ -195,7 +193,7 @@ def train_step(
         "sem_std":   sem_std,
         "sem_mean":  sem_mean,
     }
-    return metrics, tgt.detach(), sem_ctx.detach(), sem_layer.detach()
+    return metrics, tgt.detach(), sem_ctx.detach(), [l.detach() for l in sem_pred_layers], sem_pred.detach()
 
 
 def ar_step(
@@ -208,8 +206,8 @@ def ar_step(
     sem_tgt: torch.Tensor,       # SEM context generator output       [B, T, d_model]
     cfg: Config,
     device: torch.device,
-    vic_layer: int = 0,
-    te_sem_layer: torch.Tensor = None,  # SEM block[vic_layer] output on te_tgt [B, T, d_model]
+    te_sem_layers: list[torch.Tensor] = None,  # SEM block outputs on te_tgt, one per layer
+    sem_pred_gt: torch.Tensor = None,          # sem_predictor(sem_ctx[:-1], x[1:]) from train_step
 ) -> dict:
     """One training step for the Autoregressive Model.
 
@@ -222,22 +220,26 @@ def ar_step(
         L1 = F.cross_entropy(ar_logits_pred[:, :-1].reshape(-1, cfg.vocab_size), x[:, 1:].reshape(-1))
 
         # L2 — predicted encoding vs ground-truth TE encoding at i+1
-        L2 = F.mse_loss(ar_tepred[:, :-1], te_tgt[:, 1:])
+        #L2 = F.mse_loss(ar_tepred[:, :-1], te_tgt[:, 1:])
 
         # L3 + L4 — run frozen SEM on ar_tepred, capturing both full output (L3)
         # and the intermediate layer vic_layer (L4). te_sem_layer (ground truth at
         # that layer) was already computed in train_step — no second forward needed.
-        sem.requires_grad_(False)
-        sem_predictor.requires_grad_(False)
-        sem_of_ar_tepred, ar_layer = sem(ar_tepred, return_layer=vic_layer)
-        soft_action = ar_logits_pred[:, :-1].softmax(dim=-1) @ sem_predictor.action_emb.weight
-        sem_pred_l3 = sem_predictor.net(torch.cat([sem_of_ar_tepred[:, :-1], soft_action], dim=-1))
-        sem.requires_grad_(True)
-        sem_predictor.requires_grad_(True)
-        L3 = F.mse_loss(sem_of_ar_tepred[:, 1:], sem_pred_l3)
 
-        # L4 — match SEM's internal representation at layer vic_layer
-        L4 = F.mse_loss(ar_layer[:, :-1], te_sem_layer[:, 1:])
+        # L2 + L4 — SEM predictor evaluates AR logits vs GT logits, at every MLP layer
+        sem_predictor.requires_grad_(False)
+        soft_action = ar_logits_pred[:, :-1].softmax(dim=-1) @ sem_predictor.action_emb.weight
+        sem_pred_ar, ar_sem_pred_layers = sem_predictor.forward_soft(sem_tgt[:, :-1], soft_action, return_layers=True)
+        sem_predictor.requires_grad_(True)
+        #L2 = F.mse_loss(sem_pred_ar, sem_pred_gt)
+
+        skip = cfg.ar_l4_skip_layers
+        l4_per_layer = [F.mse_loss(ar_sem_pred_layers[i], te_sem_layers[i])
+                        for i in range(len(ar_sem_pred_layers))]
+        L4 = sum(l4_per_layer[skip:]) / max(len(ar_sem_pred_layers) - skip, 1)
+
+        L2 = torch.zeros(())
+        L3 = torch.zeros(())
 
         total = (cfg.ar_l1_weight   * L1
                + cfg.ar_l2_weight   * L2
@@ -250,11 +252,12 @@ def ar_step(
     ar_optimizer.step()
 
     return {
-        "ar_loss": total.item(),
-        "ar_l1":   L1.item(),
-        "ar_l2":   L2.item(),
-        "ar_l4": L4.item(),
-        "ar_l3":   L3.item(),
+        "ar_loss":      total.item(),
+        "ar_l1":        L1.item(),
+        "ar_l2":        L2.item(),
+        "ar_l4":        L4.item(),
+        "ar_l3":        L3.item(),
+        "ar_l4_layers": [l.item() for l in l4_per_layer],
     }
 
 
@@ -338,6 +341,7 @@ def train():
                "sem_jepa", "sem_vvar", "sem_vcov", "sem_std", "sem_mean"]
     ar_keys = ["ar_loss", "ar_l1", "ar_l2", "ar_l4", "ar_l3"]
     acc      = {k: 0.0 for k in te_keys + ar_keys}
+    acc_l4_layers: list[float] = []
     acc_n    = 0
     acc_ar_n = 0
 
@@ -352,14 +356,9 @@ def train():
     sem_predictor.train()
     ar_model.train()
 
-    vic_layer = random.randint(0, cfg.n_layers - 1)
-
     while True:
         batch = next(dataset_iter).to(device)
         x     = batch[:, :-1]
-
-        if step % cfg.ar_l4_layer_interval == 0:
-            vic_layer = random.randint(0, cfg.n_layers - 1)
 
         lr      = get_lr(step, cfg)
         lr_pred = get_lr(step, cfg, peak=cfg.predictor_lr)
@@ -368,17 +367,22 @@ def train():
         optimizer.param_groups[1]["lr"] = lr_pred
         ar_optimizer.param_groups[0]["lr"] = lr_ar
 
-        result, te_tgt_det, sem_tgt_det, sem_layer_det = train_step(
-            text_encoder, te_predictor, sem, sem_predictor, optimizer, x, cfg, device, step, vic_layer
+        result, te_tgt_det, sem_tgt_det, sem_layers_det, sem_pred_gt_det = train_step(
+            text_encoder, te_predictor, sem, sem_predictor, optimizer, x, cfg, device, step,
         )
 
         if step % cfg.ar_train_interval == 0:
             ar_result = ar_step(
                 ar_model, sem, sem_predictor, ar_optimizer,
-                x, te_tgt_det, sem_tgt_det, cfg, device, vic_layer, sem_layer_det,
+                x, te_tgt_det, sem_tgt_det, cfg, device, sem_layers_det, sem_pred_gt_det,
             )
             for k in ar_keys:
                 acc[k] += ar_result[k]
+            layers = ar_result["ar_l4_layers"]
+            if not acc_l4_layers:
+                acc_l4_layers = [0.0] * len(layers)
+            for i, v in enumerate(layers):
+                acc_l4_layers[i] += v
             acc_ar_n += 1
 
         for k in te_keys:
@@ -396,13 +400,18 @@ def train():
             avg = {k: acc[k] / max(acc_n, 1) for k in te_keys}
             avg.update({k: acc[k] / max(acc_ar_n, 1) for k in ar_keys})
 
+            l4_layer_str = " ".join(
+                f"{'*' if i < cfg.ar_l4_skip_layers else ''}{v / max(acc_ar_n, 1):.3e}"
+                for i, v in enumerate(acc_l4_layers)
+            )
             print(
                 f"step {step:7d} | loss {avg['loss']:.4f} | "
                 f"te jepa {avg['te_jepa']:.4f} vvar {avg['te_vvar']:.4f} vcov {avg['te_vcov']:.4f} "
                 f"std {avg['te_std']:.4f} | "
                 f"sem jepa {avg['sem_jepa']:.4f} vvar {avg['sem_vvar']:.4f} vcov {avg['sem_vcov']:.4f} "
                 f"std {avg['sem_std']:.4f} | "
-                f"ar {avg['ar_loss']:.4f} L1 {avg['ar_l1']:.4f} L2 {avg['ar_l2']:.4f} L4 {avg['ar_l4']:.4f} L3 {avg['ar_l3']:.4f} | "
+                f"ar {avg['ar_loss']:.4f} L1 {avg['ar_l1']:.4f} L2 {avg['ar_l2']:.4e} "
+                f"L4 {avg['ar_l4']:.4f} [{l4_layer_str}] L3 {avg['ar_l3']:.4f} | "
                 f"lr {lr:.2e}  {tok_per_s:.0f} tok/s"
             )
             log_writer.writerow([
@@ -417,9 +426,10 @@ def train():
             ])
             log_file.flush()
 
-            acc      = {k: 0.0 for k in acc}
-            acc_n    = 0
-            acc_ar_n = 0
+            acc          = {k: 0.0 for k in acc}
+            acc_l4_layers = []
+            acc_n         = 0
+            acc_ar_n      = 0
 
         ckpt_interval = step // cfg.checkpoint_interval
         if ckpt_interval > last_ckpt_interval:
